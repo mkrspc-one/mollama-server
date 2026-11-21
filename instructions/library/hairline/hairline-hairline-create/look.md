@@ -44,7 +44,7 @@ These are the eight `look.mjs` takes. Four parameters in the address make them, 
 
 By hand, keep the window at least 800 × 900 for every picture. `?w=240` narrows the page, not the window. A headless Chrome window narrower than 500px still lays the page out 500px wide and keeps only its left part, so the small picture comes out cropped. And wait 1.5 seconds after loading before each picture: strokes fade over 260ms, tweens take 700ms and springs about a second, so a picture taken sooner catches the figure mid-way.
 
-On the sheet, `rest` and `answer` are large; `small` and `small-answer` are at their own size, 240px, beside `dark` and `light`; `low` and `high` close it. Each picture keeps the plate, the controls and the line under the stage, and its label holds the address and the read-out.
+On the sheet, `rest` and `answer` are large; `small` and `small-answer` are at their own size, 240px, beside `dark` and `light`; `low` and `high` close it. Each picture keeps the plate and the controls, and its label holds the address and the read-out.
 
 ## What to see
 

@@ -36,7 +36,7 @@ One figure, one idea. A concept that needs a label to be understood is not a con
 3. Read the example nearer your concept: `examples/terrain.js` for a continuous field, `examples/riffle.js` for discrete items.
 4. Write the figure as `<name>.js` in the person's working directory, in the shape of the examples: take what you need from `HL`, define `mount({ stage, svg, read, controls }, value)` returning `{ set, destroy }` (and `input` when it has controls), and end the file with `hairline({ name, means, rules, range, tour, mount })`, adding `label` and `controls` when the figure has them.
    - `name`: lowercase, one word or hyphenated.
-   - `means`: one sentence, 140 characters at most, saying what the figure shows. It is the line under the stage.
+   - `means`: one sentence, 140 characters at most, saying what the figure shows. It is read to screen readers as the drawing's description; the page shows no text under the controls.
    - `rules`: the numbers of the rules this figure leans on most.
    - `range`: the one number the slider drives, at intensity 0, 0.5 and 1. The middle one is the default, and the three move one way. `mount`'s `value`, and the `value` that `set(value)` gets when the slider moves, is this number: the figure's own, read on `range`, not 0 to 1.
    - `tour`: the three to six viewBox points the unseen pointer visits when the page plays, or `null` to leave; the lap a stranger sees with no hand on the page. Literal `[x, y]` numbers, at least one of them a point. The figure never plays itself: the page's play button and the package do.

@@ -65,8 +65,6 @@
   input[role="switch"]:checked { border-color: var(--ink); }
   input[role="switch"]:checked::after { transform: translateX(12px); background: var(--ink); }
   .physics { border-top: 1px solid var(--line); padding-top: 8px; }
-  #means { margin: 14px 0 0; text-wrap: pretty; }
-  #rules { margin: 6px 0 0; line-height: 1.6; }
   #error { margin: 12px 0 0; padding-left: 10px; border-left: 1px solid var(--ink); }
 </style>
 </head>
@@ -104,8 +102,6 @@
     </span>
     <button id="feel-reset" type="button" title="Put spring, damping and speed back to the figure's own">reset</button>
   </div>
-  <p id="means"></p>
-  <p id="rules" class="label"></p>
   <p id="error" role="alert" hidden></p>
 </main>
 <script id="hl-kernel">/*KERNEL*/</script>
@@ -118,7 +114,6 @@
  * the system's (or ?theme=light / ?theme=dark); there is no switch for it.
  */
 (() => {
-  const RULES = ["hit", "order", "reach", "accent", "rest", "honesty", "cost", "clock", "radius", "quiet"];
   const KINDS = ["switch", "select", "button", "slider"];
   const $ = (id) => document.getElementById(id);
   const root = document.documentElement, params = new URLSearchParams(location.search);
@@ -246,7 +241,6 @@
 
     document.title = "Hairline · " + figure.name;
     $("name").textContent = figure.name;
-    $("means").textContent = figure.means;
     $("intensity-label").textContent = word(figure.label, "intensity");
     if (figure.physics && typeof figure.physics === "object") {
       for (const key of FEEL) {
@@ -255,7 +249,6 @@
       }
       if (!FEEL.some((key) => params.has(key))) setFeel(start);
     }
-    $("rules").textContent = figure.rules.map((n) => String(n).padStart(2, "0") + " " + RULES[n - 1]).join(" · ");
     const show = () => { $("value").textContent = String(at(Number(slider.value))); };
     show();
 

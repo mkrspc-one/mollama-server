@@ -157,7 +157,7 @@ const STATE = () => {
   const $ = (s) => document.querySelector(s), svg = $("#stage > svg"), err = $("#error");
   const b = svg && svg.childElementCount ? svg.getBBox() : null;
   const plate = $(".plate").getBoundingClientRect();
-  const bottom = Math.max(...["#means", "#error"].map((s) => $(s)).filter((el) => !el.hidden).map((el) => el.getBoundingClientRect().bottom));
+  const bottom = Math.max(...[".physics", "#error"].map((s) => $(s)).filter((el) => !el.hidden).map((el) => el.getBoundingClientRect().bottom));
   return {
     box: b && { x: b.x, y: b.y, w: b.width, h: b.height },
     read: $("#read").textContent,
