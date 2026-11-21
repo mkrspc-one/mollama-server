@@ -1073,7 +1073,9 @@ const presentPools = async (userId) => {
 
 // A pooled model: the person's main computer runs it with the lending computers' memory. The pool is a record of its
 // own, so a chat can choose it like a computer; who is in it is worked out each time from the computers' parts.
-const POOL_CONTEXT = 8192;
+// How much a pooled model may read. It is started with this much room, and the chat is told it, so it folds older
+// messages and puts away old tool results before it would overflow (llama.cpp refuses a prompt past its context).
+const POOL_CONTEXT = 16384;
 const poolRecord = (userId) => Device.findOneAndUpdate(
     { service: SERVICE, kind: 'pool', hostname: `${userId}:pool` },
     { $setOnInsert: { name: 'Pool', registeredBy: userId } },
@@ -1149,6 +1151,11 @@ const poolClient = async (poolId) => {
     const runner = createCloudClient({ id: 'pool', type: 'openai', base: `${DEVICE_HOST}/v1`, fetch: deviceGateway.fetcher(parts.main.id, 'pool') }, 'pool');
     return {
         ...main,
+        show: async (name) => {
+            const shown = await main.show(name);
+            const own = Object.fromEntries(Object.entries(shown?.model_info || {}).filter(([key]) => !key.endsWith('.context_length')));
+            return { ...shown, model_info: { ...own, 'pool.context_length': Math.min(contextLength(shown) || POOL_CONTEXT, POOL_CONTEXT) } };
+        },
         running: async () => ({ models: poolStateOf(parts.main.id)?.running ? [{ name: poolStateOf(parts.main.id).running }] : [] }),
         load: async (model) => startPool(parts, model),
         unload: async () => { deviceGateway.order(parts.main.id, { type: 'pool', action: 'stop' }); },
