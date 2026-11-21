@@ -327,7 +327,7 @@ chatSchema.index({ service: 1, owner: 1, updatedAt: -1 });
 
 export const Chat = mongoose.models.Chat || mongoose.model('Chat', chatSchema);
 
-export const TOOL_HEALTH_STATES = ['unchecked', 'healthy', 'signin', 'refused', 'unreachable', 'busy', 'blocked', 'empty', 'offline', 'outdated', 'stopped', 'missing'];
+export const TOOL_HEALTH_STATES = ['unchecked', 'healthy', 'signin', 'refused', 'unreachable', 'busy', 'blocked', 'empty', 'offline', 'outdated', 'stopped', 'missing', 'waiting'];
 
 const toolSchema = new mongoose.Schema({
     name: { type: String, required: true },

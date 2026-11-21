@@ -1712,6 +1712,7 @@ export const TOOL_HEALTH = {
     offline: { label: 'Computer offline', needs: ['That computer has to be on, with the Mollama desktop app open and signed in.'] },
     outdated: { label: 'Desktop app too old', needs: ['Update the Mollama desktop app on that computer, then open it again.'] },
     stopped: { label: 'Not running', needs: ['The tool server could not be started on that computer. The program it runs with has to be installed there.', 'If it controls an app, that app has to be open.'] },
+    waiting: { label: 'App not open', needs: ['The tool server works, but the app it controls did not answer, so its tools are not offered to models yet.', 'Open the app and start its MCP server, then choose Check.'] },
     missing: { label: 'Not on that computer', needs: ['This tool server is no longer set up on that computer. Remove it here and add it again from the desktop app.'] }
 };
 

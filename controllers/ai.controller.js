@@ -1928,6 +1928,16 @@ const readGuide = (file) => {
 // folder named after the skill, beside its page, exactly as their project ships them. Only text files are kept.
 const SKILL_FILE_TYPES = /\.(md|txt|js|mjs|cjs|ts|tsx|jsx|json|html|css|svg|py|rb|sh|ya?ml|csv)$/i;
 const MAX_SKILL_FILE_CHARS = 120000;
+// The files a skill names by path (references/x.md, scripts/run.py and so on), to tell whether all of them are here.
+const namedFiles = (text) => [...new Set([...String(text).matchAll(/\b((?:references?|resources?|assets|templates?|examples?|rules|docs|scripts)\/[\w./-]+\.\w+)/gi)].map((match) => match[1].replace(/[.,)]+$/, '')))];
+// Tool servers a skill relies on, named in its own text (the GitHub MCP, mcp__context7 and so on). A skill counts as
+// ready only when each is connected and ready on the person's account.
+const SKILL_TOOL_SERVERS = [
+    ['GitHub', /GitHub MCP|mcp__github/i], ['Stripe', /Stripe MCP|mcp__stripe/i], ['Context7', /Context7 MCP|mcp__context7/i],
+    ['Playwright', /Playwright MCP|mcp__playwright/i], ['Notion', /Notion MCP|mcp__notion/i], ['Atlassian', /Atlassian MCP|Jira MCP|mcp__atlassian/i],
+    ['Firecrawl', /Firecrawl MCP|mcp__firecrawl/i], ['Exa', /Exa MCP|mcp__exa/i], ['Slack', /Slack MCP|mcp__slack/i], ['Linear', /Linear MCP|mcp__linear/i]
+];
+const toolServersOf = (text) => SKILL_TOOL_SERVERS.filter(([, pattern]) => pattern.test(String(text))).map(([name]) => name);
 const skillFilesIn = (folder, base = '') => (fs.existsSync(folder) ? fs.readdirSync(folder, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name)).flatMap((entry) => {
     if (entry.isDirectory()) return skillFilesIn(path.join(folder, entry.name), `${base}${entry.name}/`);
     return SKILL_FILE_TYPES.test(entry.name) ? [{ path: `${base}${entry.name}`, bytes: fs.statSync(path.join(folder, entry.name)).size }] : [];
@@ -2036,7 +2046,11 @@ const LIBRARY_SKILLS = Object.keys(SKILL_SOURCES).filter((source) => fs.existsSy
     const files = skillFilesIn(path.join(LIBRARY, source, file.slice(0, -3)));
     // The mark a skill was given when it was taken in is kept only where it still holds: its files may be here now.
     const asks = skillNeeds(text.slice(head?.[0].length || 0));
-    const needs = (facts.needs || '').split(',').filter((need) => asks.includes(need) && !(need === 'files' && files.length > 0));
+    // A named file counts as missing only where the skill ships that folder: a path in another folder is usually the
+    // person's own project (docs/..., scripts/... of theirs), not a file of the skill's.
+    const shipped = new Set(files.map((one) => one.path.split('/')[0].toLowerCase()));
+    const missing = namedFiles(text).filter((named) => shipped.has(named.split('/')[0].toLowerCase()) && !files.some((one) => one.path === named || one.path.endsWith(`/${named}`)));
+    const needs = (facts.needs || '').split(',').filter((need) => asks.includes(need) && !(need === 'files' && files.length > 0 && missing.length === 0));
     const name = facts.name || file.slice(0, -3);
     return {
         id: file.slice(0, -3),
@@ -3114,14 +3128,16 @@ const openComponentTool = () => {
 };
 
 // A skill with functions of Mollama's own has its commands: they do what its scripts do.
-const presentSkill = ({ id, name, description, default: on, credit, source, needs, text, files = [] }) => ({ id, name, description, default: on, credit, source, needs: needs.filter((need) => !(SANDBOX_SKILLS[id] && sandboxReady()) && (need !== 'commands' || !(SKILL_FUNCTIONS[id] || []).some((entry) => !entry.ready || entry.ready()))), tokens: estimateTokens(text), suggested: SUGGESTED_SKILLS.includes(id), files: files.map((file) => file.path) });
+const presentSkill = ({ id, name, description, default: on, credit, source, needs, text, files = [] }, servers = []) => ({ id, name, description, default: on, credit, source,
+    toolServers: toolServersOf(text).map((tool) => ({ name: tool, ready: servers.some((server) => server.health === 'healthy' && server.name.toLowerCase().includes(tool.toLowerCase())) })),
+    needs: needs.filter((need) => !(SANDBOX_SKILLS[id] && sandboxReady()) && (need !== 'commands' || !(SKILL_FUNCTIONS[id] || []).some((entry) => !entry.ready || entry.ready()))), tokens: estimateTokens(text), suggested: SUGGESTED_SKILLS.includes(id), files: files.map((file) => file.path) });
 export const listSkills = asyncHandler(async (req, res) => {
     const servers = await ToolServer.find({ service: SERVICE, owner: req.user.id }).sort({ name: 1 });
     const all = [...SKILLS, ...await ownSkillsOf(req.user.id)];
     res.status(200).json({
         success: true,
         webSearch: webSearchReady(),
-        skills: all.map(presentSkill),
+        skills: all.map((skill) => presentSkill(skill, servers)),
         sources: Object.entries(SKILL_SOURCES).map(([id, source]) => ({ id, name: source.name, repo: source.repo, count: all.filter((skill) => skill.source === id).length })).filter((source) => source.count > 0),
         maxSkills: MAX_CHAT_SKILLS,
         maxOwnSkills: MAX_OWN_SKILLS,
@@ -3136,7 +3152,8 @@ export const listSkills = asyncHandler(async (req, res) => {
 export const readSkill = asyncHandler(async (req, res) => {
     const skill = [...SKILLS, ...await ownSkillsOf(req.user.id)].find((one) => one.id === req.params.id);
     if (!skill) return res.status(404).json({ success: false, message: 'Skill not found' });
-    return res.status(200).json({ success: true, skill: { ...presentSkill(skill), text: skill.text, setup: skillSetup(skill) } });
+    const servers = await ToolServer.find({ service: SERVICE, owner: req.user.id });
+    return res.status(200).json({ success: true, skill: { ...presentSkill(skill, servers), text: skill.text, setup: skillSetup(skill) } });
 });
 
 // One of a skill's own files, for the page that shows what a model built with them.
@@ -4465,9 +4482,9 @@ const checkToolServer = async (server) => {
         else {
             try {
                 const answer = await deviceGateway.tools(server.device, { action: 'check', localId: server.localId });
-                state = ['healthy', 'stopped', 'missing', 'empty'].includes(answer?.state) ? answer.state : 'stopped';
+                state = ['healthy', 'stopped', 'missing', 'empty', 'waiting'].includes(answer?.state) ? answer.state : 'stopped';
                 detail = answer?.detail ? String(answer.detail).slice(0, 300) : null;
-                if (state === 'healthy') tools = (Array.isArray(answer.tools) ? answer.tools : []).slice(0, 200);
+                if (state === 'healthy' || state === 'waiting') tools = (Array.isArray(answer.tools) ? answer.tools : []).slice(0, 200);
             } catch (error) {
                 state = error instanceof OllamaError ? 'offline' : 'outdated';
             }
