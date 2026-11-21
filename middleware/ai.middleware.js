@@ -411,6 +411,10 @@ export class DeviceGateway extends EventEmitter {
                 entry.leaving = true;
                 return;
             }
+            if (message.type === 'network') {
+                if (message.data && Array.isArray(message.data.addresses)) this.emit('network', deviceId, { addresses: message.data.addresses.slice(0, 16) });
+                return;
+            }
             if (message.type === 'pool-state') {
                 entry.pool = message.data && typeof message.data === 'object' ? message.data : null;
                 this.emit('pool', deviceId, entry.pool);
@@ -874,7 +878,8 @@ export const poolGroups = (computers) => {
     const pooled = new Set(shared.flatMap((group) => group.computers.map((one) => one.id)));
     const left = computers.filter((computer) => !pooled.has(computer.id)).map((computer) => {
         const reason = reasons.get(computer.id) || 'alone';
-        return { id: computer.id, name: computer.name, reason, message: POOL_REASONS[reason] };
+        const fix = reason === 'public' ? [...new Set((computer.hardware?.network?.addresses || []).filter((entry) => entry.category === 'public' && entry.interface).map((entry) => String(entry.interface).slice(0, 60)))] : [];
+        return { id: computer.id, name: computer.name, reason, message: POOL_REASONS[reason], ...(fix.length > 0 ? { publicNetworks: fix } : {}) };
     });
     return { groups: shared, left };
 };

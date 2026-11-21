@@ -1266,6 +1266,16 @@ deviceGateway.on('offline', (deviceId) => {
     reaches.delete(String(deviceId));
     syncPoolsOf(deviceId);
 });
+// A computer whose network changed (a cable in or out, another Wi-Fi) says so, and its pools are worked out again.
+deviceGateway.on('network', async (deviceId, network) => {
+    const clean = { addresses: network.addresses.filter((entry) => entry && typeof entry.address === 'string').map((entry) => ({
+        address: String(entry.address).slice(0, 45), prefix: Number(entry.prefix) || 24, interface: String(entry.interface || '').slice(0, 60),
+        wired: Boolean(entry.wired), ...(['public', 'private', 'domain'].includes(entry.category) ? { category: entry.category } : {})
+    })) };
+    await Device.updateOne({ _id: deviceId, service: SERVICE, kind: 'companion' }, { $set: { 'hardware.network': clean } }).catch(() => {});
+    await syncPoolsOf(deviceId);
+    announceDevice(true)(deviceId);
+});
 // Whatever a computer says about its part in a pool, and what its main computer found, is shown to its person at once.
 deviceGateway.on('pool', async (deviceId) => {
     await checkReach(deviceId).catch((error) => logger.warn('[Pool] Could not check a lending computer', { deviceId: String(deviceId), error: error.message }));
@@ -1720,8 +1730,22 @@ const poolFor = async (userId, deviceId) => {
     try {
         const computers = await poolComputers(userId);
         const { groups } = poolGroups(computers);
-        const group = groups.find((one) => one.computers.some((entry) => entry.id === String(deviceId))) || groups[0];
-        if (!group) return null;
+        // Only a pool this computer belongs to: one it is grouped in now, or one it has a part in while that pool is off.
+        const group = groups.find((one) => one.computers.some((entry) => entry.id === String(deviceId)));
+        if (!group) {
+            const setUp = computers.filter((entry) => entry.role !== 'off');
+            if (setUp.length < 2 || !setUp.some((entry) => entry.id === String(deviceId))) return null;
+            const left = poolGroups(computers).left.filter((one) => setUp.some((entry) => entry.id === one.id));
+            const hardware = await Promise.all(setUp.map(async (entry) => effectiveHardware(await Device.findById(entry.id))));
+            const main = setUp.find((entry) => entry.role === 'main') || null;
+            return {
+                names: setUp.map((entry) => entry.name).join(' + '),
+                hardware,
+                main: main?.name || null,
+                here: main ? main.id === String(deviceId) : setUp.some((entry) => entry.id === String(deviceId)),
+                off: left.map((one) => `${one.name}: ${one.message}`).join(' ') || 'Your pooling computers cannot reach each other right now.'
+            };
+        }
         const hardware = await Promise.all(group.computers.map(async (entry) => effectiveHardware(await Device.findById(entry.id))));
         // A pooled model runs from the file on the main computer, so that is where it is downloaded.
         const main = computers.find((entry) => entry.role === 'main' && group.computers.some((one) => one.id === entry.id)) || null;
@@ -1764,7 +1788,7 @@ export const getDeviceCatalogue = asyncHandler(async (req, res) => {
         freeDiskMb: disk.diskFreeMb,
         models: live.entries.map((entry) => ({
             ...entry,
-            ...(pooled && entry.fit?.fits === false && fitPool(entry, pooled.hardware)?.fits ? { pool: { names: pooled.names, memoryMb: fitPool(entry, pooled.hardware).memoryMb, main: pooled.main, here: pooled.here } } : {}),
+            ...(pooled && entry.fit?.fits === false && fitPool(entry, pooled.hardware)?.fits ? { pool: { names: pooled.names, memoryMb: fitPool(entry, pooled.hardware).memoryMb, main: pooled.main, here: pooled.here, ...(pooled.off ? { off: pooled.off } : {}) } } : {}),
             installed: installed.has(entry.tag),
             fitsDisk: disk.diskFreeMb === null ? true : entry.sizeMb <= disk.diskFreeMb
         })),
