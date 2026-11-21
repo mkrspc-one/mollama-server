@@ -44,6 +44,7 @@ const deviceSchema = new mongoose.Schema({
     hardware: { type: hardwareSchema, default: null },
     overrides: { type: overridesSchema, default: () => ({}) },
     paused: { type: Boolean, default: false },
+    poolRole: { type: String, enum: ['off', 'lend', 'main'], default: 'off' },
     lastSeenAt: { type: Date, default: Date.now }
 }, { timestamps: true });
 
@@ -129,6 +130,10 @@ export const deviceSchemas = {
             }),
             detectedAt: Joi.date()
         })
+    }),
+
+    pool: Joi.object({
+        role: Joi.string().valid('off', 'lend', 'main').required()
     }),
 
     updateDevice: Joi.object({

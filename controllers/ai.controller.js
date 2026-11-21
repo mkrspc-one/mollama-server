@@ -913,6 +913,7 @@ export const unlinkDevice = asyncHandler(async (req, res) => {
     }
     await Device.deleteOne({ _id: device._id });
     deviceGateway.disconnect(device.id);
+    await syncPools(req.user.id);
     getNotificationService().sendToUser(String(req.user.id), { type: 'device:changed', data: { deviceId: device.id, online: false } });
     logger.info('[Device] Device removed', { deviceId: device.id, userId: req.user.id });
 
@@ -935,23 +936,146 @@ const setPaused = (paused) => asyncHandler(async (req, res) => {
     device.paused = paused;
     await device.save();
     targetOf(device);
+    await syncPools(req.user.id);
     getNotificationService().sendToUser(String(req.user.id), { type: 'device:changed', data: { deviceId: device.id, online: deviceGateway.isOnline(device.id), paused } });
     logger.info(paused ? '[Device] Device paused' : '[Device] Device resumed', { deviceId: device.id, userId: req.user.id });
 
     res.status(200).json({ success: true, device: presentDevice(device, await ollamaOf(device)) });
 });
-// Which of a person's computers can pool, and why the others cannot.
-export const listPools = asyncHandler(async (req, res) => {
-    const computers = (await ownDevices(req.user.id)).map((device) => ({
-        id: device.id,
-        name: shownName(device),
-        online: isOnline(device),
-        paused: Boolean(device.paused),
-        publicAddress: deviceGateway.publicAddress(device.id),
-        hardware: effectiveHardware(device) ? { ...effectiveHardware(device), network: device.hardware?.network } : device.hardware
-    }));
+// Which of a person's computers can pool, and why the others cannot. Each computer has a part: 'lend' lends its memory
+// to the main computer, 'main' runs the pooled model, and a person has one main computer at a time. The server only
+// says who pools with whom: a lending computer's gate is told the main computer's address and admits nothing else.
+const POOL_SETUP = ['none', 'asking', 'downloading', 'ready', 'declined', 'failed', 'unsupported'];
+const reaches = new Map();
+const poolStateOf = (deviceId) => {
+    const state = deviceGateway.poolState(deviceId);
+    if (!state || typeof state !== 'object') return null;
+    return {
+        build: typeof state.build === 'string' ? state.build.slice(0, 20) : null,
+        role: ['off', 'lend', 'main'].includes(state.role) ? state.role : 'off',
+        setup: POOL_SETUP.includes(state.setup) ? state.setup : 'none',
+        progress: Number.isFinite(state.progress) ? Math.max(0, Math.min(1, state.progress)) : null,
+        lending: state.lending === true,
+        address: typeof state.address === 'string' ? state.address.slice(0, 40) : null,
+        port: Number.isInteger(state.port) ? state.port : null,
+        allow: Array.isArray(state.allow) ? state.allow.map(String).slice(0, 8) : [],
+        detail: typeof state.detail === 'string' ? state.detail.slice(0, 300) : null
+    };
+};
+const poolComputers = async (userId) => (await ownDevices(userId)).map((device) => ({
+    id: device.id,
+    name: shownName(device),
+    online: isOnline(device),
+    paused: Boolean(device.paused),
+    publicAddress: deviceGateway.publicAddress(device.id),
+    hardware: effectiveHardware(device) ? { ...effectiveHardware(device), network: device.hardware?.network } : device.hardware,
+    role: device.poolRole || 'off',
+    state: poolStateOf(device.id)
+}));
+const groupOf = (groups, one, other) => groups.find((group) => group.computers.some((entry) => entry.id === one) && group.computers.some((entry) => entry.id === other)) || null;
+const addressIn = (group, id) => group?.computers.find((entry) => entry.id === id)?.address || null;
+
+// What each computer should be doing now. A computer already doing it, or still setting up or waiting for its person
+// to agree, is not told again.
+const orderFor = (computer, main, groups) => {
+    if (computer.role !== 'lend') return { role: computer.role };
+    const group = main ? groupOf(groups, computer.id, main.id) : null;
+    return { role: 'lend', bind: addressIn(group, computer.id), allow: group ? [addressIn(group, main.id)] : [] };
+};
+const settledOn = (state, order) => {
+    if (!state) return order.role === 'off';
+    if (state.role !== order.role) return false;
+    if (['asking', 'downloading', 'declined', 'failed', 'unsupported'].includes(state.setup)) return true;
+    if (order.role !== 'lend') return true;
+    if (order.allow.length === 0) return !state.lending;
+    return state.lending && state.address === order.bind && state.allow.join() === order.allow.join();
+};
+export const syncPools = async (userId) => {
+    const computers = await poolComputers(userId);
+    const { groups } = poolGroups(computers);
+    const main = computers.find((one) => one.role === 'main' && one.online && !one.paused) || null;
+    for (const computer of computers) {
+        if (!computer.online) continue;
+        const order = orderFor(computer, main, groups);
+        if (!settledOn(computer.state, order)) deviceGateway.order(computer.id, { type: 'pool', action: 'apply', ...order });
+    }
+};
+const syncPoolsOf = async (deviceId) => {
+    try {
+        const device = await Device.findOne({ _id: deviceId, service: SERVICE, kind: 'companion' });
+        if (device?.registeredBy) await syncPools(device.registeredBy);
+    } catch (error) {
+        logger.warn('[Pool] Could not update the pool', { deviceId: String(deviceId), error: error.message });
+    }
+};
+
+// Once a computer lends, its main computer checks that the gate lets it in; the answer is kept in memory only.
+const checkReach = async (deviceId) => {
+    const lender = await Device.findOne({ _id: deviceId, service: SERVICE, kind: 'companion' });
+    const state = poolStateOf(deviceId);
+    if (!lender?.registeredBy || !state?.lending || !state.address) return reaches.delete(String(deviceId));
+    const main = (await ownDevices(lender.registeredBy)).find((one) => one.poolRole === 'main' && deviceGateway.isOnline(one.id));
+    if (!main) return reaches.delete(String(deviceId));
+    let answer = null;
+    try {
+        answer = await deviceGateway.probe(main.id, state.address, state.port);
+    } catch {
+        answer = null;
+    }
+    reaches.set(String(deviceId), {
+        main: main.id,
+        address: state.address,
+        reachable: answer ? answer.reachable === true : null,
+        detail: answer ? String(answer.detail || '').slice(0, 200) || null : 'The main computer could not check it: update its desktop app.'
+    });
+    return undefined;
+};
+
+const presentPools = async (userId) => {
+    const computers = await poolComputers(userId);
     const { groups, left } = poolGroups(computers);
-    res.status(200).json({ success: true, groups, left });
+    const byId = new Map(computers.map((one) => [one.id, one]));
+    const main = computers.find((one) => one.role === 'main') || null;
+    const part = (id) => {
+        const computer = byId.get(id);
+        const state = computer?.state || null;
+        const reach = reaches.get(id);
+        const fresh = reach && state?.lending && reach.address === state.address && reach.main === main?.id ? reach : null;
+        const otherBuild = computer?.role === 'lend' && state?.build && main?.state?.build && state.build !== main.state.build;
+        return {
+            role: computer?.role || 'off',
+            setup: state?.setup || null,
+            progress: state?.progress ?? null,
+            lending: Boolean(state?.lending),
+            reachable: fresh ? fresh.reachable : null,
+            detail: otherBuild ? `It has llama.cpp ${state.build} and the main computer has ${main.state.build}. Update the Mollama desktop app on both.` : fresh?.reachable === false ? fresh.detail : state?.detail || null,
+            known: Boolean(state)
+        };
+    };
+    return {
+        groups: groups.map((group) => ({ ...group, computers: group.computers.map((one) => ({ ...one, ...part(one.id) })) })),
+        left: left.map((one) => ({ ...one, role: byId.get(one.id)?.role || 'off' })),
+        main: main?.id || null
+    };
+};
+
+export const listPools = asyncHandler(async (req, res) => {
+    res.status(200).json({ success: true, ...await presentPools(req.user.id) });
+});
+
+export const setPoolRole = asyncHandler(async (req, res) => {
+    const device = await allowedDevice(req, req.params.id);
+    if (!device || device.kind !== 'companion') {
+        return res.status(404).json({ success: false, message: 'Device not found' });
+    }
+    const { role } = req.body;
+    if (role === 'main') await Device.updateMany({ service: SERVICE, kind: 'companion', registeredBy: req.user.id, poolRole: 'main', _id: { $ne: device._id } }, { poolRole: 'off' });
+    device.poolRole = role;
+    await device.save();
+    await syncPools(req.user.id);
+    getNotificationService().sendToUser(String(req.user.id), { type: 'device:changed', data: { deviceId: device.id, online: deviceGateway.isOnline(device.id) } });
+    logger.info('[Pool] Pooling part changed', { deviceId: device.id, userId: req.user.id, role });
+    res.status(200).json({ success: true, ...await presentPools(req.user.id) });
 });
 
 export const pauseDevice = setPaused(true);
@@ -994,8 +1118,18 @@ deviceGateway.on('online', async (deviceId, hello, replaced) => {
     } catch {
         // An app that does not answer keeps the details it last gave.
     }
+    await syncPoolsOf(deviceId);
 });
 deviceGateway.on('offline', announceDevice(false));
+deviceGateway.on('offline', (deviceId) => {
+    reaches.delete(String(deviceId));
+    syncPoolsOf(deviceId);
+});
+// Whatever a computer says about its part in a pool, and what its main computer found, is shown to its person at once.
+deviceGateway.on('pool', async (deviceId) => {
+    await checkReach(deviceId).catch((error) => logger.warn('[Pool] Could not check a lending computer', { deviceId: String(deviceId), error: error.message }));
+    announceDevice(true)(deviceId);
+});
 // Signing out of the desktop app takes that computer off the account.
 deviceGateway.on('goodbye', async (deviceId) => {
     try {

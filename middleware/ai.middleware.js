@@ -396,6 +396,11 @@ export class DeviceGateway extends EventEmitter {
                 entry.leaving = true;
                 return;
             }
+            if (message.type === 'pool-state') {
+                entry.pool = message.data && typeof message.data === 'object' ? message.data : null;
+                this.emit('pool', deviceId, entry.pool);
+                return;
+            }
             entry.pending.get(String(message.id))?.[message.type]?.(message);
         });
         let answered = true;
@@ -427,6 +432,35 @@ export class DeviceGateway extends EventEmitter {
         } catch {
             return false;
         }
+    }
+
+    // What the desktop app last said about its part in a pool, kept in memory only.
+    poolState(deviceId) {
+        return this.devices.get(String(deviceId))?.pool || null;
+    }
+
+    order(deviceId, message) {
+        const entry = this.devices.get(String(deviceId));
+        return entry ? this.send(entry, message) : false;
+    }
+
+    // Asks the main computer whether a lending computer's gate lets it in.
+    probe(deviceId, address, port, ms = 10000) {
+        return new Promise((resolve, reject) => {
+            const entry = this.devices.get(String(deviceId));
+            if (!entry) return reject(new OllamaError('DEVICE_OFFLINE'));
+            const id = String(++this.counter);
+            const timer = setTimeout(() => finish(() => reject(new Error('silent'))), ms);
+            timer.unref?.();
+            const finish = (settle) => { clearTimeout(timer); entry.pending.delete(id); settle(); };
+            entry.pending.set(id, {
+                answer: (message) => finish(() => resolve(message.data)),
+                error: () => finish(() => reject(new Error('silent'))),
+                fail: () => finish(() => reject(new OllamaError('DEVICE_OFFLINE')))
+            });
+            if (!this.send(entry, { id, type: 'pool', action: 'probe', address, port })) entry.pending.get(id)?.fail();
+            return undefined;
+        });
     }
 
     disconnect(deviceId) {

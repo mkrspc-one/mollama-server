@@ -14,6 +14,7 @@ router.validRoutes = [
     '/api/v1/devices/:id/detect',
     '/api/v1/devices/link',
     '/api/v1/devices/pools',
+    '/api/v1/devices/:id/pool',
     '/api/v1/devices/:id/pause',
     '/api/v1/devices/:id/resume',
     '/api/v1/settings',
@@ -85,6 +86,7 @@ router.delete('/devices/:id', ...signedIn, withDeviceId, aiController.unlinkDevi
 router.get('/devices/:id', ...signedIn, withDeviceId, aiController.getDevice);
 router.put('/devices/:id', ...manager, withDeviceId, validateRequest(deviceSchemas.updateDevice), aiController.updateDevice);
 router.post('/devices/:id/detect', ...manager, withDeviceId, aiController.detectDevice);
+router.put('/devices/:id/pool', ...signedIn, withDeviceId, validateRequest(deviceSchemas.pool), aiController.setPoolRole);
 router.post('/devices/:id/pause', ...signedIn, withDeviceId, aiController.pauseDevice);
 router.post('/devices/:id/resume', ...signedIn, withDeviceId, aiController.resumeDevice);
 
