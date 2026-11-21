@@ -771,7 +771,7 @@ export const subnetOf = (address, prefix) => {
 export const POOL_REASONS = {
     offline: 'Not connected right now. Open the Mollama desktop app on it.',
     paused: 'Paused. Resume it to pool it.',
-    update: 'Its desktop app is too old to say which network it is on. Update the Mollama desktop app on it.',
+    update: 'Its desktop app does not say which network it is on yet: pooling comes with the next Mollama desktop app release.',
     public: 'Windows marks its network as Public, so it is never pooled. Pool only on a home network you trust; if this is one, set the network to Private in Windows settings.',
     nonetwork: 'It is not on a home network or a direct cable.',
     alone: 'No other computer of yours is on the same network.',
