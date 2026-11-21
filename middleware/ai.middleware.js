@@ -797,7 +797,10 @@ export const splitBySpeed = (devices, neededMb) => {
 // model runs slower than on one computer, so no speed is promised.
 export const fitPool = (entry, computers) => {
     if (!entry || entry.cloudOnly || !Array.isArray(computers) || computers.length < 2) return null;
-    const memoryMb = computers.reduce((sum, hardware) => sum + poolShareMb(hardware), 0);
+    // Graphics memory everywhere, plus the system memory of the computer that runs the model, which takes the layers that
+    // do not fit graphics memory (llama.cpp's --fit), as one computer does with CPU help. The one with most to spare runs it.
+    const spare = Math.max(0, ...computers.map((hardware) => ((Number(hardware?.gpuMemoryMb) || 0) > 0 && !hardware.gpuShared ? (Number(hardware.memoryMb) || 0) - RAM_RESERVE_MB : 0)));
+    const memoryMb = computers.reduce((sum, hardware) => sum + poolShareMb(hardware), 0) + spare;
     const needed = memoryNeededMb(entry);
     return { fits: needed <= memoryMb, memoryMb, memoryNeededMb: needed };
 };
