@@ -488,7 +488,8 @@ export class DeviceGateway extends EventEmitter {
     }
 
     // Asks the desktop app about the tool servers on its computer. An app too old to know the question stays silent.
-    tools(deviceId, request, ms = request?.action === 'call' ? 70000 : this.askMs) {
+    // A check starts the tool server and may ask its app too, which takes up to about half a minute.
+    tools(deviceId, request, ms = request?.action === 'call' ? 70000 : request?.action === 'check' ? this.askMs * 3 : this.askMs) {
         return new Promise((resolve, reject) => {
             const entry = this.devices.get(String(deviceId));
             if (!entry) return reject(new OllamaError('DEVICE_OFFLINE'));
@@ -1710,7 +1711,7 @@ export const TOOL_HEALTH = {
     blocked: { label: 'Address not allowed', needs: ['Remote tools need a public address that starts with https.', 'For an app on your own computer, add it under Local tools instead.'] },
     empty: { label: 'No tools offered', needs: ['The server answered but offered no tools. Your account there may need a plan or permission that includes them.'] },
     offline: { label: 'Computer offline', needs: ['That computer has to be on, with the Mollama desktop app open and signed in.'] },
-    outdated: { label: 'Desktop app too old', needs: ['Update the Mollama desktop app on that computer, then open it again.'] },
+    outdated: { label: 'No answer in time', needs: ['The desktop app on that computer did not finish the check in time. Choose Check again.', 'If it keeps happening, update the Mollama desktop app there and open it again.'] },
     stopped: { label: 'Not running', needs: ['The tool server could not be started on that computer. The program it runs with has to be installed there.', 'If it controls an app, that app has to be open.'] },
     waiting: { label: 'App not open', needs: ['The tool server works, but the app it controls did not answer, so its tools are not offered to models yet.', 'Open the app and start its MCP server, then choose Check.'] },
     missing: { label: 'Not on that computer', needs: ['This tool server is no longer set up on that computer. Remove it here and add it again from the desktop app.'] }
