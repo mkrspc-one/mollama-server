@@ -1959,7 +1959,16 @@ export const TOOL_CATALOGUE = [
 // tool-server standard, or the community. A part in <angle brackets> is for the person to fill in before adding.
 const NODE = 'Node.js has to be installed on this computer.';
 const UV = 'uv, a small Python tool runner, has to be installed on this computer.';
-const local = (name, by, command, args, does, needs, caution = null, only = null) => ({ name, by, command, args, does, needs, caution, only });
+// What the Tools page can check on a computer before adding: the program a tool server starts with (from its command)
+// and the app it works with, so it ticks off what is there and offers to install what is not. Other steps stay steps.
+const LOCAL_PROGRAM = { npx: 'node', uvx: 'uv', docker: 'docker', xcrun: 'xcode' };
+const LOCAL_APP = { Blender: 'blender', 'Chrome DevTools': 'chrome', Docker: 'dockerdesktop', Xcode: 'xcode', Godot: 'godot', FreeCAD: 'freecad', 'Ableton Live': 'ableton', Git: 'git' };
+const local = (name, by, command, args, does, needs, caution = null, only = null) => ({
+    name, by, command, args, does, needs, caution, only,
+    requires: { program: LOCAL_PROGRAM[command] || null, app: LOCAL_APP[name] || null },
+    folder: /<folder>/.test(args),
+    steps: needs.filter((need) => need !== NODE && need !== UV && !/^Replace <folder>/.test(need))
+});
 export const TOOL_LOCAL_CATALOGUE = [
     local('Blender', 'community', 'uvx', 'mcp-for-blender', 'Inspect and build 3D scenes, and import or generate assets',
         [UV, 'Blender has to be open.', 'Its add-on has to be installed once (run "uvx mcp-for-blender setup" in a terminal) and switched on in Blender.', 'In Blender, press N in the 3D view, open the MCP for Blender tab and choose Start MCP Server.'],
