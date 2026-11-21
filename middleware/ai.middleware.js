@@ -773,6 +773,26 @@ export const fitModel = (entry, hardware) => {
 export const poolShareMb = (hardware) => Math.max(0, (Number(hardware?.gpuMemoryMb) || 0) > 0
     ? Number(hardware.gpuMemoryMb) - GPU_HEADROOM_MB
     : (Number(hardware?.memoryMb) || 0) - RAM_RESERVE_MB);
+// How fast a device reads its share of a model, roughly: a graphics card's own memory, then an Apple chip's shared
+// memory, then a processor's system memory.
+const speedClass = (hardware) => ((Number(hardware?.gpuMemoryMb) || 0) > 0 ? (hardware.gpuShared ? 2 : 3) : 1);
+// The split of a pooled model, in GB per device in llama.cpp's order: the fastest devices are filled first, up to what
+// each can give, so the slow ones hold as little as possible. When the model needs more than they can give together,
+// the split follows what each can give.
+export const splitBySpeed = (devices, neededMb) => {
+    const shares = devices.map((hardware) => poolShareMb(hardware));
+    const total = shares.reduce((sum, mb) => sum + mb, 0);
+    const toGb = (mb) => Math.round((mb / 1024) * 10) / 10;
+    if (!(neededMb > 0) || total < neededMb) return shares.map((mb) => Math.max(0.1, toGb(mb)));
+    const given = shares.map(() => 0);
+    let left = neededMb;
+    for (const index of devices.map((hardware, at) => at).sort((a, b) => speedClass(devices[b]) - speedClass(devices[a]) || shares[b] - shares[a])) {
+        given[index] = Math.min(shares[index], left);
+        left -= given[index];
+    }
+    return given.map((mb) => Math.max(0.1, toGb(mb)));
+};
+
 // Whether a model fits several computers pooled: what they can give together against what the model needs. A pooled
 // model runs slower than on one computer, so no speed is promised.
 export const fitPool = (entry, computers) => {

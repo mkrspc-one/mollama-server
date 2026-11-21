@@ -11,7 +11,7 @@ import { asyncHandler, getNotificationService } from '../middleware/app.middlewa
 import { hasRight, RIGHTS } from '../config/rights.js';
 import { SERVICE, Device, Setting, PersonalModel, Download, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, chatSchemas, ToolServer, Provider, Skill } from '../models/ai.model.js';
 import {
-    OllamaError, mapOllamaError, UNREADABLE_CALL, memoryNeededMb, createOllamaClient, libraryModels, libraryEntries, loadLibrarySizes, librarySizes, friendlyName, cloudTitle, computerName, detectHardware, appleGpus, readDisk, rankCatalogue, fitModel, fitNotes, fitPool, poolShareMb, GPU_HEADROOM_MB, RAM_RESERVE_MB,
+    OllamaError, mapOllamaError, UNREADABLE_CALL, memoryNeededMb, createOllamaClient, libraryModels, libraryEntries, loadLibrarySizes, librarySizes, friendlyName, cloudTitle, computerName, detectHardware, appleGpus, readDisk, rankCatalogue, fitModel, fitNotes, fitPool, poolShareMb, splitBySpeed, GPU_HEADROOM_MB, RAM_RESERVE_MB,
     GenerationQueue, estimateTokens, extractText, createFilesClient, imageTypeOf, MAX_IMAGE_BYTES, MAX_CHAT_IMAGE_BYTES, runInSandbox, sandboxReady, poolGroups, MAX_PROGRAM_SECONDS, MAX_ATTACHMENT_BYTES, fetchRemote, MAX_REMOTE_BYTES,
     searchReady, searchWeb, readPage, deviceGateway,
     CLOUD_PROVIDERS, PROVIDER_HEALTH, createCloudClient, ollamaOnlineNames, runsOnline,
@@ -1097,6 +1097,7 @@ const poolParts = async (userId) => {
     return {
         main,
         lenders,
+        devices: [...lenderHardware, ...(mainHardware.gpuMemoryMb > 0 ? [mainHardware] : [])],
         helpers: lenders.map((one) => `${one.state.address}:${one.state.port}`),
         split,
         name: [main, ...lenders].map((one) => one.name).join(' + '),
@@ -1112,7 +1113,19 @@ const startPool = async (parts, model) => {
     const state = poolStateOf(parts.main.id);
     if (state?.running === model) return;
     if (!poolStarts.has(parts.main.id)) {
-        const start = deviceGateway.query(parts.main.id, { type: 'pool', action: 'run', model, helpers: parts.helpers, split: parts.split, ctx: POOL_CONTEXT }, 35 * 60 * 1000)
+        // The model's real size, from the main computer's Ollama, decides the split. Lean settings shrink the conversation's
+        // working memory so a share near a computer's limit does not crash its helper. Drafting with a small model is not
+        // sent: measured on 2026-11-21 between zero-pc and zero m3 it gained nothing (the desktop app still accepts one).
+        let installed = [];
+        try {
+            installed = (await createOllamaClient(DEVICE_HOST, deviceGateway.fetcher(parts.main.id)).list()).models || [];
+        } catch {
+            installed = [];
+        }
+        const size = installed.find((one) => one.name === model)?.size || 0;
+        const split = size ? splitBySpeed(parts.devices, memoryNeededMb({ sizeMb: size / (1024 * 1024) })) : parts.split;
+        const order = { type: 'pool', action: 'run', model, helpers: parts.helpers, split, ctx: POOL_CONTEXT, lean: true };
+        const start = deviceGateway.query(parts.main.id, order, 35 * 60 * 1000)
             .then((answer) => {
                 if (!answer?.ready) throw new OllamaError('POOL_FAILED', String(answer?.error || '').slice(0, 300));
             }, (error) => {
