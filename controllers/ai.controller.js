@@ -1162,6 +1162,23 @@ export const listPools = asyncHandler(async (req, res) => {
     res.status(200).json({ success: true, ...await presentPools(req.user.id) });
 });
 
+// A network check on demand: every connected computer is read again (a laptop may have changed network or cable),
+// each one is told its part again, and every lending computer is checked again by the one that runs the model.
+export const checkPools = asyncHandler(async (req, res) => {
+    const own = (await ownDevices(req.user.id)).filter((device) => deviceGateway.isOnline(device.id));
+    await Promise.all(own.map(async (device) => {
+        try {
+            const hardware = await deviceGateway.ask(device.id, 'hardware');
+            if (hardware && typeof hardware === 'object') await Device.updateOne({ _id: device.id, service: SERVICE, kind: 'companion' }, { hardware });
+        } catch {
+            // A computer that does not answer keeps the details it last gave.
+        }
+    }));
+    await syncPools(req.user.id);
+    await Promise.all(own.map((device) => checkReach(device.id).catch(() => undefined)));
+    res.status(200).json({ success: true, checkedAt: new Date(), ...await presentPools(req.user.id) });
+});
+
 export const setPoolRole = asyncHandler(async (req, res) => {
     const device = await allowedDevice(req, req.params.id);
     if (!device || device.kind !== 'companion') {
