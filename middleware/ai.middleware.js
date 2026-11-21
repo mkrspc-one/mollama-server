@@ -208,6 +208,21 @@ const ERROR_TABLE = {
         message: 'The online service could not be reached.',
         action: 'Try again shortly, or pick another model.'
     },
+    POOL_NOT_READY: {
+        status: 503,
+        message: 'Your pool is not ready right now.',
+        action: 'Open Pooling on the Devices page: choose a main computer and let another computer lend, both connected.'
+    },
+    POOL_FAILED: {
+        status: 503,
+        message: 'The pool could not start this model.',
+        action: 'Close large apps on the pooled computers and try again, or pick a smaller model.'
+    },
+    POOL_STOPPED: {
+        status: 503,
+        message: 'A computer in the pool stopped answering, so the reply stopped.',
+        action: 'Check that every pooled computer is awake and connected, then try again.'
+    },
     DEVICE_OFFLINE: {
         status: 503,
         message: 'This device is not connected right now.',
@@ -446,6 +461,11 @@ export class DeviceGateway extends EventEmitter {
 
     // Asks the main computer whether a lending computer's gate lets it in.
     probe(deviceId, address, port, ms = 10000) {
+        return this.query(deviceId, { type: 'pool', action: 'probe', address, port }, ms);
+    }
+
+    // Sends a message that the desktop app answers once.
+    query(deviceId, message, ms = this.askMs) {
         return new Promise((resolve, reject) => {
             const entry = this.devices.get(String(deviceId));
             if (!entry) return reject(new OllamaError('DEVICE_OFFLINE'));
@@ -458,7 +478,7 @@ export class DeviceGateway extends EventEmitter {
                 error: () => finish(() => reject(new Error('silent'))),
                 fail: () => finish(() => reject(new OllamaError('DEVICE_OFFLINE')))
             });
-            if (!this.send(entry, { id, type: 'pool', action: 'probe', address, port })) entry.pending.get(id)?.fail();
+            if (!this.send(entry, { id, ...message })) entry.pending.get(id)?.fail();
             return undefined;
         });
     }
@@ -507,7 +527,8 @@ export class DeviceGateway extends EventEmitter {
         });
     }
 
-    fetcher(deviceId) {
+    // 'via' sends the requests to something else the app runs for Mollama: 'pool' is a pooled model on the main computer.
+    fetcher(deviceId, via = null) {
         return (input, init = {}) => new Promise((resolve, reject) => {
             const entry = this.devices.get(String(deviceId));
             if (!entry) return reject(new OllamaError('DEVICE_OFFLINE'));
@@ -555,7 +576,7 @@ export class DeviceGateway extends EventEmitter {
                         controller.close();
                     } catch { /* already closed */ }
                 },
-                error: (message) => drop(message.code === 'OLLAMA_DOWN' ? new OllamaError('OLLAMA_DOWN') : new OllamaError('DEVICE_OFFLINE')),
+                error: (message) => drop(new OllamaError(message.code === 'OLLAMA_DOWN' ? 'OLLAMA_DOWN' : message.code === 'POOL_DOWN' ? 'POOL_STOPPED' : 'DEVICE_OFFLINE')),
                 fail: () => drop(new OllamaError('DEVICE_OFFLINE'))
             });
 
@@ -569,6 +590,7 @@ export class DeviceGateway extends EventEmitter {
             const sent = this.send(entry, {
                 id,
                 type: 'request',
+                ...(via ? { via } : {}),
                 method: init.method || 'GET',
                 path: url.pathname + url.search,
                 headers,
@@ -1983,9 +2005,9 @@ const CLOUD_CONTEXT = 128000;
 const askCloud = async (entry, key, path, init = {}) => {
     let response;
     try {
-        response = await cloudFetch(`${entry.base}${path}`, { ...init, headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', ...(init.headers || {}) } });
+        response = await (entry.fetch || cloudFetch)(`${entry.base}${path}`, { ...init, headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', ...(init.headers || {}) } });
     } catch (error) {
-        if (error?.name === 'AbortError') throw error;
+        if (error?.name === 'AbortError' || error instanceof OllamaError) throw error;
         throw new OllamaError('PROVIDER_DOWN', error?.message);
     }
     if (!response.ok) {

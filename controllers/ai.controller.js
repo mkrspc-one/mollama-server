@@ -234,6 +234,7 @@ const currentTarget = () => deviceScope.getStore() || (localEnabled() ? LOCAL_TA
 // Paused computers stay connected but are given no work. The set follows the saved flag each time a computer is looked up.
 const pausedDevices = new Set();
 const targetOf = (device) => {
+    if (device.kind === 'pool') return { kind: 'pool', id: String(device.id) };
     if (device.kind !== 'companion') return LOCAL_TARGET;
     if (device.paused) pausedDevices.add(String(device.id));
     else pausedDevices.delete(String(device.id));
@@ -244,9 +245,12 @@ const targetPaused = () => {
     return target.kind === 'companion' && pausedDevices.has(target.id);
 };
 
+// Why the computer a request works on cannot take it: a pool that is not ready, a paused computer, or Ollama not answering.
+const downCode = () => (currentTarget().kind === 'pool' ? 'POOL_NOT_READY' : targetPaused() ? 'DEVICE_PAUSED' : 'OLLAMA_DOWN');
+
 const currentLane = () => {
     const target = currentTarget();
-    return target.kind === 'companion' ? target.id : target.kind === 'cloud' ? `cloud:${target.id}` : target.kind;
+    return target.kind === 'companion' ? target.id : ['cloud', 'pool'].includes(target.kind) ? `${target.kind}:${target.id}` : target.kind;
 };
 
 const getOllama = async () => {
@@ -258,6 +262,7 @@ const getOllama = async () => {
         if (!entry || !key) return createOllamaClient(DEVICE_HOST, () => Promise.reject(new OllamaError('KEY_REFUSED')));
         return createCloudClient(entry, key, provider.models);
     }
+    if (target.kind === 'pool') return poolClient(target.id);
     if (target.kind === 'companion' && pausedDevices.has(target.id)) return createOllamaClient(DEVICE_HOST, () => Promise.reject(new OllamaError('DEVICE_PAUSED')));
     if (target.kind === 'companion') return createOllamaClient(DEVICE_HOST, deviceGateway.fetcher(target.id));
     if (target.kind === 'none') return createOllamaClient(DEVICE_HOST, () => Promise.reject(new OllamaError('NO_DEVICE')));
@@ -717,6 +722,10 @@ const getLocalDevice = async ({ redetect = false } = {}) => {
 const getCurrentDevice = async () => {
     const target = currentTarget();
     if (target.kind === 'companion') return Device.findOne({ _id: target.id, service: SERVICE });
+    if (target.kind === 'pool') {
+        const parts = await poolTarget(target.id);
+        return parts ? { id: target.id, kind: 'pool', paused: false, online: true, hardware: parts.hardware, overrides: {} } : null;
+    }
     if (target.kind === 'none' || target.kind === 'cloud') return null;
     return getLocalDevice();
 };
@@ -758,7 +767,7 @@ const readOllama = async (client) => {
 };
 
 const UNREACHED = { available: false, version: null, modelCount: 0, chatCount: 0 };
-const isOnline = (device) => device.kind === 'local' || deviceGateway.isOnline(device.id);
+const isOnline = (device) => device.kind === 'local' || (device.kind === 'pool' ? device.online === true : deviceGateway.isOnline(device.id));
 const ollamaOf = (device) => (device.paused
     ? { ...UNREACHED, paused: true }
     : isOnline(device) ? deviceScope.run(targetOf(device), async () => readOllama(await getOllama())) : UNREACHED);
@@ -777,7 +786,7 @@ const allowedDevice = async (req, id) => {
 const namedTarget = async (userId, wanted) => {
     if (!wanted || !mongoose.isValidObjectId(wanted)) return null;
     const device = await Device.findOne({ _id: wanted, service: SERVICE });
-    if (device?.kind === 'companion' && String(device.registeredBy) === String(userId)) return targetOf(device);
+    if (['companion', 'pool'].includes(device?.kind) && String(device.registeredBy) === String(userId)) return targetOf(device);
     if (device?.kind === 'local' && localEnabled()) return LOCAL_TARGET;
     if (!device && await Provider.exists({ _id: wanted, service: SERVICE, owner: userId })) return { kind: 'cloud', id: String(wanted) };
     return null;
@@ -831,9 +840,10 @@ export const listDevices = asyncHandler(async (req, res) => {
         success: true,
         devices: [
             ...await Promise.all(devices.map(async (device) => presentDevice(device, await ollamaOf(device)))),
+            ...(req.query?.with === 'online' ? [await presentPool(req.user.id)].filter(Boolean) : []),
             ...(req.query?.with === 'online' ? (await Provider.find({ service: SERVICE, owner: req.user.id }).sort({ name: 1 })).map(presentOnlineDevice) : [])
         ],
-        current: target.kind === 'companion' || target.kind === 'cloud' ? target.id : local?.id ?? null,
+        current: ['companion', 'cloud', 'pool'].includes(target.kind) ? target.id : local?.id ?? null,
         permissions: { manage: canManage(req) }
     });
 });
@@ -959,6 +969,8 @@ const poolStateOf = (deviceId) => {
         address: typeof state.address === 'string' ? state.address.slice(0, 40) : null,
         port: Number.isInteger(state.port) ? state.port : null,
         allow: Array.isArray(state.allow) ? state.allow.map(String).slice(0, 8) : [],
+        running: typeof state.running === 'string' ? state.running.slice(0, 200) : null,
+        starting: typeof state.starting === 'string' ? state.starting.slice(0, 200) : null,
         detail: typeof state.detail === 'string' ? state.detail.slice(0, 300) : null
     };
 };
@@ -1056,6 +1068,93 @@ const presentPools = async (userId) => {
         groups: groups.map((group) => ({ ...group, computers: group.computers.map((one) => ({ ...one, ...part(one.id) })) })),
         left: left.map((one) => ({ ...one, role: byId.get(one.id)?.role || 'off' })),
         main: main?.id || null
+    };
+};
+
+// A pooled model: the person's main computer runs it with the lending computers' memory. The pool is a record of its
+// own, so a chat can choose it like a computer; who is in it is worked out each time from the computers' parts.
+const POOL_CONTEXT = 8192;
+const poolRecord = (userId) => Device.findOneAndUpdate(
+    { service: SERVICE, kind: 'pool', hostname: `${userId}:pool` },
+    { $setOnInsert: { name: 'Pool', registeredBy: userId } },
+    { new: true, upsert: true, setDefaultsOnInsert: true }
+);
+// What a computer can give a pooled model, in MB: its graphics memory, or with none, its system memory, less its reserve.
+const poolShare = (hardware) => Math.max(0, (hardware?.gpuMemoryMb || 0) > 0 ? hardware.gpuMemoryMb - GPU_HEADROOM_MB : (hardware?.memoryMb || 0) - RAM_RESERVE_MB);
+// The main computer and the lending computers it reached, or null when no pool is ready.
+const poolParts = async (userId) => {
+    const computers = await poolComputers(userId);
+    const { groups } = poolGroups(computers);
+    const main = computers.find((one) => one.role === 'main' && one.online && !one.paused);
+    if (!main) return null;
+    const lenders = computers.filter((one) => one.role === 'lend' && one.state?.lending && reaches.get(one.id)?.reachable === true && reaches.get(one.id)?.main === main.id)
+        .map((one) => ({ ...one, group: groupOf(groups, one.id, main.id) }))
+        .filter((one) => one.group && one.state.build === main.state?.build);
+    if (lenders.length === 0) return null;
+    const mainHardware = effectiveHardware(await Device.findById(main.id));
+    const lenderHardware = await Promise.all(lenders.map(async (one) => effectiveHardware(await Device.findById(one.id))));
+    // llama.cpp lists the lending computers before the main computer's own graphics, so the split follows that order.
+    const split = [...lenderHardware.map((hardware) => Math.max(1, Math.round(poolShare(hardware) / 1024))), ...(mainHardware.gpuMemoryMb > 0 ? [Math.max(1, Math.round(poolShare(mainHardware) / 1024))] : [])];
+    return {
+        main,
+        lenders,
+        helpers: lenders.map((one) => `${one.state.address}:${one.state.port}`),
+        split,
+        name: [main, ...lenders].map((one) => one.name).join(' + '),
+        hardware: {
+            memoryMb: [mainHardware, ...lenderHardware].reduce((sum, hardware) => sum + (hardware.memoryMb || 0), 0),
+            gpuMemoryMb: [mainHardware, ...lenderHardware].reduce((sum, hardware) => sum + (hardware.gpuMemoryMb || 0), 0)
+        }
+    };
+};
+// Starts the model on the main computer unless it already runs there the same way. One start per pool at a time.
+const poolStarts = new Map();
+const startPool = async (parts, model) => {
+    const state = poolStateOf(parts.main.id);
+    if (state?.running === model) return;
+    if (!poolStarts.has(parts.main.id)) {
+        const start = deviceGateway.query(parts.main.id, { type: 'pool', action: 'run', model, helpers: parts.helpers, split: parts.split, ctx: POOL_CONTEXT }, 35 * 60 * 1000)
+            .then((answer) => {
+                if (!answer?.ready) throw new OllamaError('POOL_FAILED', String(answer?.error || '').slice(0, 300));
+            }, (error) => {
+                throw error instanceof OllamaError && error.code === 'DEVICE_OFFLINE' ? error : new OllamaError('POOL_FAILED', 'The main computer did not answer: update its desktop app.');
+            })
+            .finally(() => poolStarts.delete(parts.main.id));
+        poolStarts.set(parts.main.id, start);
+    }
+    await poolStarts.get(parts.main.id);
+};
+const poolTarget = async (poolId) => {
+    const pool = await Device.findOne({ _id: poolId, service: SERVICE, kind: 'pool' });
+    return pool ? poolParts(pool.registeredBy) : null;
+};
+// Stands where the Ollama client stands: the models and their facts come from the main computer's Ollama, and a chat
+// goes to the pooled model, started first when it is not running yet.
+const poolClient = async (poolId) => {
+    const parts = await poolTarget(poolId);
+    if (!parts) return createOllamaClient(DEVICE_HOST, () => Promise.reject(new OllamaError('POOL_NOT_READY')));
+    const main = createOllamaClient(DEVICE_HOST, deviceGateway.fetcher(parts.main.id));
+    const runner = createCloudClient({ id: 'pool', type: 'openai', base: `${DEVICE_HOST}/v1`, fetch: deviceGateway.fetcher(parts.main.id, 'pool') }, 'pool');
+    return {
+        ...main,
+        running: async () => ({ models: poolStateOf(parts.main.id)?.running ? [{ name: poolStateOf(parts.main.id).running }] : [] }),
+        load: async (model) => startPool(parts, model),
+        unload: async () => { deviceGateway.order(parts.main.id, { type: 'pool', action: 'stop' }); },
+        chat: async (request, signal) => {
+            await startPool(parts, request.model);
+            return runner.chat(request, signal);
+        }
+    };
+};
+// The pool as the chat's computer picker shows it, when one is ready.
+const presentPool = async (userId) => {
+    const parts = await poolParts(userId);
+    if (!parts) return null;
+    const pool = await poolRecord(userId);
+    const ollama = await readOllama(createOllamaClient(DEVICE_HOST, deviceGateway.fetcher(parts.main.id)));
+    return {
+        id: pool.id, name: `Pool: ${parts.name}`, kind: 'pool', service: SERVICE, online: true, lastSeenAt: new Date(), hardware: parts.hardware, detected: null,
+        overrides: {}, paused: false, edited: false, ollama
     };
 };
 
@@ -3376,7 +3475,7 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
     try {
         settings = await applyQueueSettings();
         ollama = await getOllama();
-        if (!(await ollama.status()).available) throw new OllamaError(targetPaused() ? 'DEVICE_PAUSED' : 'OLLAMA_DOWN');
+        if (!(await ollama.status()).available) throw new OllamaError(downCode());
         if (!chat.model) chat.model = await chooseModel(ollama, userId);
         facts = await modelFacts(ollama, chat.model);
 
@@ -3909,7 +4008,7 @@ export const loadModel = asyncHandler(async (req, res) => {
     try {
         const settings = await applyQueueSettings();
         const ollama = await getOllama();
-        if (!(await ollama.status()).available) throw new OllamaError(targetPaused() ? 'DEVICE_PAUSED' : 'OLLAMA_DOWN');
+        if (!(await ollama.status()).available) throw new OllamaError(downCode());
         const model = req.body?.name || await chooseModel(ollama, req.user.id);
         const loaded = (await ollama.running()).models.some((entry) => entry.name === model);
         const busy = queue.busyIn(currentLane());

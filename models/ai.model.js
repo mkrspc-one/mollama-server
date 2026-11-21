@@ -37,7 +37,7 @@ const overridesSchema = new mongoose.Schema({
 const deviceSchema = new mongoose.Schema({
     service: { type: String, default: SERVICE, immutable: true, index: true },
     name: { type: String, required: true, trim: true, maxlength: 80 },
-    kind: { type: String, enum: ['local', 'companion'], required: true },
+    kind: { type: String, enum: ['local', 'companion', 'pool'], required: true },
     hostname: { type: String, required: true },
     registeredBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
     keyHash: { type: String, default: null, select: false },
