@@ -1048,7 +1048,7 @@ const presentPools = async (userId) => {
             progress: state?.progress ?? null,
             lending: Boolean(state?.lending),
             reachable: fresh ? fresh.reachable : null,
-            detail: otherBuild ? `It has llama.cpp ${state.build} and the main computer has ${main.state.build}. Update the Mollama desktop app on both.` : fresh?.reachable === false ? fresh.detail : state?.detail || null,
+            detail: otherBuild ? 'Its desktop app pools a different way from the main computer\'s. Update the Mollama desktop app on both.' : fresh?.reachable === false ? fresh.detail : state?.detail || null,
             known: Boolean(state)
         };
     };
