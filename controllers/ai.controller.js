@@ -11,7 +11,7 @@ import { asyncHandler, getNotificationService } from '../middleware/app.middlewa
 import { hasRight, RIGHTS } from '../config/rights.js';
 import { SERVICE, Device, Setting, PersonalModel, Download, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, chatSchemas, ToolServer, Provider, Skill } from '../models/ai.model.js';
 import {
-    OllamaError, mapOllamaError, UNREADABLE_CALL, memoryNeededMb, createOllamaClient, libraryModels, libraryEntries, loadLibrarySizes, librarySizes, friendlyName, cloudTitle, computerName, detectHardware, appleGpus, readDisk, rankCatalogue, fitModel, fitNotes, GPU_HEADROOM_MB, RAM_RESERVE_MB,
+    OllamaError, mapOllamaError, UNREADABLE_CALL, memoryNeededMb, createOllamaClient, libraryModels, libraryEntries, loadLibrarySizes, librarySizes, friendlyName, cloudTitle, computerName, detectHardware, appleGpus, readDisk, rankCatalogue, fitModel, fitNotes, fitPool, poolShareMb, GPU_HEADROOM_MB, RAM_RESERVE_MB,
     GenerationQueue, estimateTokens, extractText, createFilesClient, imageTypeOf, MAX_IMAGE_BYTES, MAX_CHAT_IMAGE_BYTES, runInSandbox, sandboxReady, poolGroups, MAX_PROGRAM_SECONDS, MAX_ATTACHMENT_BYTES, fetchRemote, MAX_REMOTE_BYTES,
     searchReady, searchWeb, readPage, deviceGateway,
     CLOUD_PROVIDERS, PROVIDER_HEALTH, createCloudClient, ollamaOnlineNames, runsOnline,
@@ -1080,7 +1080,6 @@ const poolRecord = (userId) => Device.findOneAndUpdate(
     { new: true, upsert: true, setDefaultsOnInsert: true }
 );
 // What a computer can give a pooled model, in MB: its graphics memory, or with none, its system memory, less its reserve.
-const poolShare = (hardware) => Math.max(0, (hardware?.gpuMemoryMb || 0) > 0 ? hardware.gpuMemoryMb - GPU_HEADROOM_MB : (hardware?.memoryMb || 0) - RAM_RESERVE_MB);
 // The main computer and the lending computers it reached, or null when no pool is ready.
 const poolParts = async (userId) => {
     const computers = await poolComputers(userId);
@@ -1094,7 +1093,7 @@ const poolParts = async (userId) => {
     const mainHardware = effectiveHardware(await Device.findById(main.id));
     const lenderHardware = await Promise.all(lenders.map(async (one) => effectiveHardware(await Device.findById(one.id))));
     // llama.cpp lists the lending computers before the main computer's own graphics, so the split follows that order.
-    const split = [...lenderHardware.map((hardware) => Math.max(1, Math.round(poolShare(hardware) / 1024))), ...(mainHardware.gpuMemoryMb > 0 ? [Math.max(1, Math.round(poolShare(mainHardware) / 1024))] : [])];
+    const split = [...lenderHardware.map((hardware) => Math.max(1, Math.round(poolShareMb(hardware) / 1024))), ...(mainHardware.gpuMemoryMb > 0 ? [Math.max(1, Math.round(poolShareMb(mainHardware) / 1024))] : [])];
     return {
         main,
         lenders,
@@ -1678,9 +1677,26 @@ export const getPublicCatalogue = asyncHandler(async (req, res) => {
         hardware: hasSpecs ? hardware : null,
         reserved: { gpuMemoryMb: GPU_HEADROOM_MB, memoryMb: RAM_RESERVE_MB },
         notes: hasSpecs ? fitNotes(live.local, hardware) : [],
-        models: live.entries
+        models: live.entries.map((entry) => {
+            if (!hasSpecs || entry.fit?.fits !== false || entry.cloudOnly) return entry;
+            const copies = [2, 3].find((count) => fitPool(entry, Array(count).fill(hardware))?.fits);
+            return copies ? { ...entry, pool: { copies } } : entry;
+        })
     });
 });
+
+// The computers a person could pool with this one: those sharing its network (or, when it shares none, the first group).
+const poolFor = async (userId, deviceId) => {
+    try {
+        const { groups } = poolGroups(await poolComputers(userId));
+        const group = groups.find((one) => one.computers.some((entry) => entry.id === String(deviceId))) || groups[0];
+        if (!group) return null;
+        const hardware = await Promise.all(group.computers.map(async (entry) => effectiveHardware(await Device.findById(entry.id))));
+        return { names: group.computers.map((entry) => entry.name).join(' + '), hardware };
+    } catch {
+        return null;
+    }
+};
 
 export const getDeviceCatalogue = asyncHandler(async (req, res) => {
     const device = await allowedDevice(req, req.params.id);
@@ -1697,6 +1713,7 @@ export const getDeviceCatalogue = asyncHandler(async (req, res) => {
     }
     const installed = await installedNames();
     const disk = await diskNow();
+    const pooled = await poolFor(req.user.id, device.id);
 
     res.status(200).json({
         success: true,
@@ -1714,6 +1731,7 @@ export const getDeviceCatalogue = asyncHandler(async (req, res) => {
         freeDiskMb: disk.diskFreeMb,
         models: live.entries.map((entry) => ({
             ...entry,
+            ...(pooled && entry.fit?.fits === false && fitPool(entry, pooled.hardware)?.fits ? { pool: { names: pooled.names, memoryMb: fitPool(entry, pooled.hardware).memoryMb } } : {}),
             installed: installed.has(entry.tag),
             fitsDisk: disk.diskFreeMb === null ? true : entry.sizeMb <= disk.diskFreeMb
         })),

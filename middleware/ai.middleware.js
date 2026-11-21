@@ -769,6 +769,19 @@ export const fitModel = (entry, hardware) => {
     };
 };
 
+// What a computer can give a pooled model, in MB: its graphics memory, or with none, its system memory, less its reserve.
+export const poolShareMb = (hardware) => Math.max(0, (Number(hardware?.gpuMemoryMb) || 0) > 0
+    ? Number(hardware.gpuMemoryMb) - GPU_HEADROOM_MB
+    : (Number(hardware?.memoryMb) || 0) - RAM_RESERVE_MB);
+// Whether a model fits several computers pooled: what they can give together against what the model needs. A pooled
+// model runs slower than on one computer, so no speed is promised.
+export const fitPool = (entry, computers) => {
+    if (!entry || entry.cloudOnly || !Array.isArray(computers) || computers.length < 2) return null;
+    const memoryMb = computers.reduce((sum, hardware) => sum + poolShareMb(hardware), 0);
+    const needed = memoryNeededMb(entry);
+    return { fits: needed <= memoryMb, memoryMb, memoryNeededMb: needed };
+};
+
 // Pooling: computers that can share one model are those on the same home network, found from what each desktop app
 // reports (its private addresses, never its public one) and the address its link arrives from. A direct cable between
 // two computers gives both a 169.254 address. Nothing is pooled on a network Windows marks Public.
