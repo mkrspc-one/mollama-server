@@ -211,7 +211,7 @@ const ERROR_TABLE = {
     POOL_NOT_READY: {
         status: 503,
         message: 'Your pool is not ready right now.',
-        action: 'Open Pooling on the Devices page: choose a main computer and let another computer lend, both connected.'
+        action: 'Open Pooling on the Devices page: choose which computer runs the model and let another lend its memory, both connected.'
     },
     POOL_FAILED: {
         status: 503,

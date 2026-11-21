@@ -1038,7 +1038,7 @@ const checkReach = async (deviceId) => {
         main: main.id,
         address: state.address,
         reachable: answer ? answer.reachable === true : null,
-        detail: answer ? String(answer.detail || '').slice(0, 200) || null : 'The main computer could not check it: update its desktop app.'
+        detail: answer ? String(answer.detail || '').slice(0, 200) || null : 'The computer that runs the model could not check it: update its desktop app.'
     });
     return undefined;
 };
@@ -1060,7 +1060,7 @@ const presentPools = async (userId) => {
             progress: state?.progress ?? null,
             lending: Boolean(state?.lending),
             reachable: fresh ? fresh.reachable : null,
-            detail: otherBuild ? 'Its desktop app pools a different way from the main computer\'s. Update the Mollama desktop app on both.' : fresh?.reachable === false ? fresh.detail : state?.detail || null,
+            detail: otherBuild ? 'Its desktop app pools a different way from the one that runs the model. Update the Mollama desktop app on both.' : fresh?.reachable === false ? fresh.detail : state?.detail || null,
             known: Boolean(state)
         };
     };
@@ -1117,7 +1117,7 @@ const startPool = async (parts, model) => {
             .then((answer) => {
                 if (!answer?.ready) throw new OllamaError('POOL_FAILED', String(answer?.error || '').slice(0, 300));
             }, (error) => {
-                throw error instanceof OllamaError && error.code === 'DEVICE_OFFLINE' ? error : new OllamaError('POOL_FAILED', 'The main computer did not answer: update its desktop app.');
+                throw error instanceof OllamaError && error.code === 'DEVICE_OFFLINE' ? error : new OllamaError('POOL_FAILED', 'The computer that runs the model did not answer: update its desktop app.');
             })
             .finally(() => poolStarts.delete(parts.main.id));
         poolStarts.set(parts.main.id, start);
