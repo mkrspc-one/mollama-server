@@ -493,8 +493,13 @@ class DownloadManager extends EventEmitter {
 
         const freeAtStartMb = await this.freeMb();
         let hardware = null;
+        // On the main computer of a pool, a model that fits the pool may be downloaded though it is too large alone.
+        let poolHardware = null;
         try {
-            hardware = effectiveHardware(await getCurrentDevice());
+            const current = await getCurrentDevice();
+            hardware = effectiveHardware(current);
+            const pooled = current && doc.requestedBy ? await poolFor(doc.requestedBy, current.id) : null;
+            if (pooled?.here) poolHardware = pooled.hardware;
         } catch {
             hardware = null;
         }
@@ -522,7 +527,8 @@ class DownloadManager extends EventEmitter {
                     state.totalBytes = Math.max(state.totalBytes, total);
                     state.completedBytes = completed;
 
-                    if (hardware && !fitModel({ sizeMb: state.totalBytes / MB, parameters: 0, moe: false }, hardware).fits) {
+                    const sized = { sizeMb: state.totalBytes / MB, parameters: 0, moe: false };
+                    if (hardware && !fitModel(sized, hardware).fits && !(poolHardware && fitPool(sized, poolHardware)?.fits)) {
                         throw new OllamaError('MODEL_TOO_LARGE');
                     }
                     if (freeAtStartMb !== null && (state.totalBytes - completed) / MB > freeAtStartMb) {
