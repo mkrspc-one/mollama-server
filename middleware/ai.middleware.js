@@ -65,8 +65,8 @@ const ERROR_TABLE = {
     },
     TOO_LONG: {
         status: 422,
-        message: 'The conversation is too long for this model.',
-        action: 'Start a new chat, or pick a model that can read more.'
+        message: 'This message is too long for this model, even with the earlier messages compressed.',
+        action: 'Shorten the message or send it in parts, or pick a model that can read more.'
     },
     NO_MODELS: {
         status: 409,

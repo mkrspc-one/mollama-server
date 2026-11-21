@@ -1607,9 +1607,13 @@ export const startDownload = asyncHandler(async (req, res) => {
     const known = await findModel(req.body.name);
     try {
         if (known) {
-            const hardware = effectiveHardware(await getCurrentDevice());
+            const current = await getCurrentDevice();
+            const hardware = effectiveHardware(current);
             const fit = fitModel(known, hardware);
-            if (!fit.fits) {
+            // Too large for this computer alone is still fine when it fits the pool this computer runs.
+            const pooled = !fit.fits && current ? await poolFor(req.user.id, current.id) : null;
+            const fitsPool = Boolean(pooled?.here && fitPool(known, pooled.hardware)?.fits);
+            if (!fit.fits && !fitsPool) {
                 const error = new OllamaError('MODEL_TOO_LARGE');
                 error.detail = `${known.name} needs about ${Math.ceil(fit.memoryNeededMb / 1024)} GB of memory. This device has ${Math.floor((hardware.gpuMemoryMb || 0) / 1024)} GB of graphics memory and ${Math.floor((hardware.memoryMb || 0) / 1024)} GB of system memory.`;
                 return res.status(error.status).json({ success: false, ...error.toJSON(), message: error.detail });
@@ -1708,11 +1712,14 @@ export const getPublicCatalogue = asyncHandler(async (req, res) => {
 // The computers a person could pool with this one: those sharing its network (or, when it shares none, the first group).
 const poolFor = async (userId, deviceId) => {
     try {
-        const { groups } = poolGroups(await poolComputers(userId));
+        const computers = await poolComputers(userId);
+        const { groups } = poolGroups(computers);
         const group = groups.find((one) => one.computers.some((entry) => entry.id === String(deviceId))) || groups[0];
         if (!group) return null;
         const hardware = await Promise.all(group.computers.map(async (entry) => effectiveHardware(await Device.findById(entry.id))));
-        return { names: group.computers.map((entry) => entry.name).join(' + '), hardware };
+        // A pooled model runs from the file on the main computer, so that is where it is downloaded.
+        const main = computers.find((entry) => entry.role === 'main' && group.computers.some((one) => one.id === entry.id)) || null;
+        return { names: group.computers.map((entry) => entry.name).join(' + '), hardware, main: main?.name || null, here: main ? main.id === String(deviceId) : group.computers.some((one) => one.id === String(deviceId)) };
     } catch {
         return null;
     }
@@ -1751,7 +1758,7 @@ export const getDeviceCatalogue = asyncHandler(async (req, res) => {
         freeDiskMb: disk.diskFreeMb,
         models: live.entries.map((entry) => ({
             ...entry,
-            ...(pooled && entry.fit?.fits === false && fitPool(entry, pooled.hardware)?.fits ? { pool: { names: pooled.names, memoryMb: fitPool(entry, pooled.hardware).memoryMb } } : {}),
+            ...(pooled && entry.fit?.fits === false && fitPool(entry, pooled.hardware)?.fits ? { pool: { names: pooled.names, memoryMb: fitPool(entry, pooled.hardware).memoryMb, main: pooled.main, here: pooled.here } } : {}),
             installed: installed.has(entry.tag),
             fitsDisk: disk.diskFreeMb === null ? true : entry.sizeMb <= disk.diskFreeMb
         })),
@@ -3552,6 +3559,15 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
         facts = await modelFacts(ollama, chat.model);
 
         prompt = buildMessages(chat, facts.capabilities.includes('tools'), facts.capabilities.includes('vision'));
+        // Too long for the model: older messages are compressed into the chat's memory now, so the chat carries on here.
+        if (promptTokens(prompt) + REPLY_RESERVE > capacityFor(chat, facts)) {
+            const folded = await foldMemory({ chat, facts, ollama, settings, userId, now: true });
+            if (folded) {
+                chat.memory = folded.memory;
+                chat.memoryThrough = folded.to;
+                prompt = buildMessages(chat, facts.capabilities.includes('tools'), facts.capabilities.includes('vision'));
+            }
+        }
         const needed = promptTokens(prompt) + REPLY_RESERVE;
         if (needed > capacityFor(chat, facts)) {
             const lastUser = chat.messages[chat.messages.length - 1];
@@ -3913,14 +3929,16 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
 
 const MEMORY_ASK = 'Rewrite the memory of this conversation so that it can go on without the messages it covers. Keep the user\'s goals, wishes and constraints, the facts that were established, the decisions and conclusions reached, what each reply delivered (figures, tables, files, pages, and what they showed), and the questions still open. Leave out greetings, filler and anything later replaced. Write short bullet points, newest last. Add nothing that was not said.';
 const MAX_MEMORY_CHARS = 12000;
-const foldMemory = async ({ chat, facts, ollama, settings, userId }) => {
+// With `now`, for a message that would not fit otherwise: it runs ahead of other work and gives back the memory for
+// the chat being sent, which saves it with the reply.
+const foldMemory = async ({ chat, facts, ollama, settings, userId, now = false }) => {
     try {
         const capacity = capacityFor(chat, facts);
-        if (promptTokens(buildMessages(chat, facts.capabilities.includes('tools'))) * 100 < capacity * ROLL_PERCENT) return;
+        if (!now && promptTokens(buildMessages(chat, facts.capabilities.includes('tools'))) * 100 < capacity * ROLL_PERCENT) return null;
         const from = memoryStart(chat);
         let to = chat.messages.length - KEEP_MESSAGES;
         while (to > from && chat.messages[to]?.role !== 'user') to -= 1;
-        if (to <= from) return;
+        if (to <= from) return null;
         const folded = chat.messages.slice(from, to).filter((message) => message.content);
         const room = Math.max(1000, capacity - 2 * REPLY_RESERVE - estimateTokens(chat.memory) - 400);
         const each = Math.max(400, Math.floor((room * 4) / Math.max(1, folded.length)));
@@ -3929,7 +3947,7 @@ const foldMemory = async ({ chat, facts, ollama, settings, userId }) => {
         const job = queue.add({
             userId,
             lane: currentLane(),
-            priority: 'background',
+            priority: now ? 'interactive' : 'background',
             run: () => ollama.chat({
                 model: chat.model,
                 messages: ask,
@@ -3940,14 +3958,17 @@ const foldMemory = async ({ chat, facts, ollama, settings, userId }) => {
             })
         });
         const memory = String((await job.done)?.message?.content || '').replace(/<think>[\s\S]*?<\/think>/g, '').trim();
-        if (!memory) return;
+        if (!memory) return null;
+        if (now) return { memory: clip(memory, MAX_MEMORY_CHARS), to };
         // Saved only if nothing moved meanwhile: the memory still starts where it did and the messages are still there.
         await Chat.updateOne(
             { _id: chat._id, memoryThrough: chat.memoryThrough || 0, $expr: { $gte: [{ $size: '$messages' }, to] } },
             { $set: { memory: clip(memory, MAX_MEMORY_CHARS), memoryThrough: to } }
         );
+        return null;
     } catch (error) {
         logger.warn('[Chat] The memory could not be updated', { chatId: chat.id, code: mapOllamaError(error).code });
+        return null;
     }
 };
 
@@ -4096,65 +4117,6 @@ export const loadModel = asyncHandler(async (req, res) => {
     } catch (error) {
         sendOllamaError(res, mapOllamaError(error));
     }
-});
-
-export const summariseChat = asyncHandler(async (req, res) => {
-    const chat = await findChat(req, res);
-    if (!chat) return;
-    deviceScope.enterWith(await chatTarget(req, chat));
-    if (chat.messages.length === 0) {
-        return res.status(400).json({ success: false, message: 'There is nothing to summarise yet.' });
-    }
-    req.setTimeout(0);
-    res.setTimeout(0);
-
-    let summary;
-    try {
-        const settings = await applyQueueSettings();
-        const ollama = await getOllama();
-        const facts = await modelFacts(ollama, chat.model);
-        const capacity = capacityFor(chat, facts);
-        const ask = {
-            role: 'user',
-            content: 'Summarise this conversation so that it can be continued in a new chat. Include the goal, the key facts, decisions made and open questions. Use short bullet points. Do not add anything that was not said.'
-        };
-        const prompt = buildMessages(chat);
-        const first = prompt[0]?.role === 'system' ? 1 : 0;
-        while (prompt.length > first + 1 && promptTokens(prompt) + REPLY_RESERVE + 100 > capacity) prompt.splice(first, 1);
-        prompt.push(ask);
-
-        const job = queue.add({
-            userId: req.user.id,
-            lane: currentLane(),
-            priority: 'interactive',
-            run: () => ollama.chat({
-                model: chat.model,
-                messages: prompt,
-                stream: false,
-                options: { ...(chat.options || {}), num_ctx: capacity },
-                keep_alive: `${settings.keepAliveMinutes}m`
-            })
-        });
-        summary = String((await job.done)?.message?.content || '').replace(/<think>[\s\S]*?<\/think>/g, '').trim();
-        if (!summary) throw new OllamaError('UNKNOWN');
-    } catch (error) {
-        return sendOllamaError(res, mapOllamaError(error));
-    }
-
-    const next = await Chat.create({
-        owner: req.user.id,
-        title: `${chat.title} (continued)`.slice(0, 120),
-        titled: true,
-        model: chat.model,
-        device: chat.device,
-        system: chat.system,
-        systemSource: chat.systemSource,
-        instructions: chat.instructions,
-        options: chat.options,
-        summary,
-        continuedFrom: chat._id
-    });
-    res.status(201).json({ success: true, chat: presentChat(next, await factsOrNull(next)) });
 });
 
 const readUpload = express.raw({ type: 'application/octet-stream', limit: MAX_ATTACHMENT_BYTES });

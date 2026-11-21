@@ -45,7 +45,6 @@ router.validRoutes = [
     '/api/v1/chats/:id/reply',
     '/api/v1/chats/:id/live',
     '/api/v1/chats/:id/stop',
-    '/api/v1/chats/:id/summary',
     '/api/v1/chats/:id/attachments',
     '/api/v1/chats/:id/attachments/:attachmentId',
     '/api/v1/chats/:id/export',
@@ -134,7 +133,6 @@ router.post('/chats/:id/permission', ...signedIn, withChatId, validateRequest(ch
 router.get('/chats/:id/reply', ...signedIn, withChatId, aiController.rejoinReply);
 router.get('/chats/:id/live', ...signedIn, withChatId, aiController.liveReply);
 router.post('/chats/:id/stop', ...signedIn, withChatId, aiController.stopReply);
-router.post('/chats/:id/summary', ...signedIn, withChatId, aiController.summariseChat);
 router.post('/chats/:id/attachments', ...signedIn, withChatId, aiController.receiveUpload, aiController.addAttachment);
 router.delete('/chats/:id/attachments/:attachmentId', ...signedIn, validateRequest(chatSchemas.attachmentId, 'params'), aiController.removeAttachment);
 router.get('/chats/:id/export', ...signedIn, withChatId, validateRequest(chatSchemas.exportQuery, 'query'), aiController.exportChat);
