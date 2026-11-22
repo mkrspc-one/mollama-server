@@ -3735,23 +3735,54 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
         const marks = [];
         const awayKeys = new Set();
         let round = 0;
+        const away = (mark) => {
+            const held = messages[mark.index];
+            delete held.images;
+            held.content = `[Put away to save room: what ${mark.fn} returned for ${clip(JSON.stringify(mark.given ?? {}), 300)}, ${String(held.content).length.toLocaleString('en-GB')} characters, read ${round - mark.round} steps ago. Call ${mark.fn} again with exactly the same input to see it again, or keep what you need with save_note.]`;
+            mark.away = true;
+            awayKeys.add(mark.key);
+        };
         const putAway = () => {
             for (const mark of marks) {
                 if (mark.away || KEPT_RESULTS.has(mark.fn) || round - mark.round < 2) continue;
-                const held = messages[mark.index];
-                if (String(held.content || '').length < PUT_AWAY_MIN_CHARS) continue;
+                if (String(messages[mark.index].content || '').length < PUT_AWAY_MIN_CHARS) continue;
                 if (round - mark.round < PUT_AWAY_AFTER && promptTokens(messages) * 2 <= capacity) continue;
-                delete held.images;
-                held.content = `[Put away to save room: what ${mark.fn} returned for ${clip(JSON.stringify(mark.given ?? {}), 300)}, ${String(held.content).length.toLocaleString('en-GB')} characters, read ${round - mark.round} steps ago. Call ${mark.fn} again with exactly the same input to see it again, or keep what you need with save_note.]`;
-                mark.away = true;
-                awayKeys.add(mark.key);
+                away(mark);
+            }
+        };
+        // What the model counted beyond Mollama's own estimate (the functions it is offered, its template), learnt from
+        // its first answer in this reply.
+        let uncounted = 0;
+        // A reply never sends more than the model can read: Ollama would drop the start of the conversation without
+        // saying so, and a pooled model refuses the request. Results already read go first, oldest first, skill pages
+        // and files last; then what has not been read yet is cut to what fits.
+        const makeRoom = () => {
+            const limit = capacity - REPLY_RESERVE * 2 - uncounted;
+            const over = () => promptTokens(messages) - limit;
+            for (const pages of [false, true]) {
+                for (const mark of marks) {
+                    if (over() <= 0) return;
+                    if (mark.away || mark.round >= round || KEPT_RESULTS.has(mark.fn) !== pages) continue;
+                    if (String(messages[mark.index].content || '').length >= PUT_AWAY_MIN_CHARS) away(mark);
+                }
+            }
+            const unread = marks.filter((mark) => !mark.away && mark.round >= round).sort((a, b) => String(messages[b.index].content || '').length - String(messages[a.index].content || '').length);
+            for (const mark of unread) {
+                if (over() <= 0) return;
+                const held = messages[mark.index];
+                const text = String(held.content || '');
+                const cut = Math.min(text.length - PUT_AWAY_MIN_CHARS, over() * 4 + 400);
+                if (cut <= 0) continue;
+                held.content = `${text.slice(0, text.length - cut)}\n\n[Cut here: the last ${cut.toLocaleString('en-GB')} characters are more than this model can read at once. Ask for a smaller part, and keep what you need with save_note.]`;
             }
         };
 
         try {
             while (!gone) {
                 putAway();
+                makeRoom();
                 round += 1;
+                const counted = promptTokens(messages);
                 const request = {
                     model: chat.model,
                     messages,
@@ -3762,7 +3793,7 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
                 if (facts.capabilities.includes('thinking')) request.think = true;
                 if (searching || chatTools.length > 0) request.tools = [...(searching ? SEARCH_TOOLS : []), ...chatTools.map((tool) => tool.definition)];
 
-                room = Math.max(room, sizeFor(messages, thinkRoom));
+                room = Math.max(room, sizeFor(messages, thinkRoom + uncounted));
                 const calls = [];
                 let said = '';
                 let endedBy = null;
@@ -3797,6 +3828,7 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
                         // The first request of a reply holds the conversation alone. Later ones also hold what its tools
                         // returned, which is gone once the reply is written, so they are not what the chat is measured by.
                         promptEvalCount = promptEvalCount || part.prompt_eval_count || null;
+                        if (part.prompt_eval_count > counted) uncounted = Math.max(uncounted, Math.min(part.prompt_eval_count - counted, Math.floor(capacity / 2)));
                     }
                 }
                 } catch (error) {

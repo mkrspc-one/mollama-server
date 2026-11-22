@@ -584,7 +584,7 @@ export class DeviceGateway extends EventEmitter {
                         controller.close();
                     } catch { /* already closed */ }
                 },
-                error: (message) => drop(new OllamaError(message.code === 'OLLAMA_DOWN' ? 'OLLAMA_DOWN' : message.code === 'POOL_DOWN' ? 'POOL_STOPPED' : 'DEVICE_OFFLINE')),
+                error: (message) => drop(message.code === 'POOL_DOWN' ? new OllamaError('POOL_STOPPED', typeof message.detail === 'string' ? message.detail : null) : new OllamaError(message.code === 'OLLAMA_DOWN' ? 'OLLAMA_DOWN' : 'DEVICE_OFFLINE')),
                 fail: () => drop(new OllamaError('DEVICE_OFFLINE'))
             });
 
