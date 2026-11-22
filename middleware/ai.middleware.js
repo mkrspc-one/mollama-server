@@ -58,6 +58,11 @@ const ERROR_TABLE = {
         message: 'The model ran out of room before it finished, so this reply is incomplete.',
         action: 'Ask again in a new chat, turn off a long skill, or pick a model that can read more.'
     },
+    SERVER_RESTARTED: {
+        status: 503,
+        message: 'Mollama restarted while this reply was being written, so it is incomplete.',
+        action: 'Ask again to get the whole reply.'
+    },
     CALL_UNREADABLE: {
         status: 502,
         message: 'The model tried to use a function but wrote the request so that it could not be read.',

@@ -1279,9 +1279,14 @@ deviceGateway.on('online', async (deviceId, hello, replaced) => {
     await syncPoolsOf(deviceId);
 });
 deviceGateway.on('offline', announceDevice(false));
+// A computer whose link drops usually returns in seconds and keeps its part in a pool for two minutes (its desktop app
+// does the same), so the others are only told it has gone if it is still away then.
+const POOL_GRACE_MS = process.env.NODE_ENV === 'test' ? 0 : 2 * 60 * 1000;
 deviceGateway.on('offline', (deviceId) => {
     reaches.delete(String(deviceId));
-    syncPoolsOf(deviceId);
+    if (POOL_GRACE_MS === 0) return syncPoolsOf(deviceId);
+    setTimeout(() => { if (!deviceGateway.isOnline(deviceId)) syncPoolsOf(deviceId); }, POOL_GRACE_MS).unref();
+    return undefined;
 });
 // A computer whose network changed (a cable in or out, another Wi-Fi) says so, and its pools are worked out again.
 deviceGateway.on('network', async (deviceId, network) => {
@@ -1937,6 +1942,7 @@ const IMAGE_TOKENS = 1000;
 const AUTO_CONTEXT_LIMIT = 32768;
 const CONTEXT_STEPS = [8192, 16384, AUTO_CONTEXT_LIMIT];
 const REPLY_RESERVE = 1024;
+const DRAFT_MS = 8000;
 // A model that thinks before it answers spends room on the thinking too, often several thousand tokens of it.
 const THINK_RESERVE = 6144;
 const CONTEXT_WARN_PERCENT = 75;
@@ -3684,6 +3690,12 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
     write({ type: 'accepted', chat: { id: chat.id, title: chat.title, model: chat.model }, messageCount: chat.messages.length });
 
     const reply = { content: '', thinking: '', stats: {}, errorCode: null, stopped: false, steps: [], unverified: [] };
+    // What the reply holds so far is written down every few seconds, so a server that stops without warning loses little.
+    let drafting = Promise.resolve();
+    const draft = setInterval(() => {
+        drafting = Chat.updateOne({ _id: chat._id }, { $set: { draft: { content: reply.content, thinking: reply.thinking, steps: reply.steps, model: chat.model, at: new Date() } } }).catch(() => {});
+    }, DRAFT_MS);
+    draft.unref?.();
     const lane = currentLane();
     const run = async () => {
         if (gone) return;
@@ -3985,11 +3997,19 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
         queue.off('moved', reportPlace);
     }
 
+    // A reply ended because the server is stopping is kept as far as it got, and says so.
+    if (live.restarting) {
+        reply.stopped = false;
+        reply.errorCode = 'SERVER_RESTARTED';
+    }
     if (reply.content || reply.errorCode) {
         chat.messages.push({ role: 'assistant', model: chat.model, ...reply });
     }
+    clearInterval(draft);
     try {
         await chat.save();
+        await drafting;
+        await Chat.updateOne({ _id: chat._id }, { $unset: { draft: 1 } });
     } catch (error) {
         logger.error('[Chat] Reply could not be saved', { chatId: chat.id, message: error.message });
     }
@@ -4054,6 +4074,34 @@ const foldMemory = async ({ chat, facts, ollama, settings, userId, now = false }
     }
 };
 
+// When the server is told to stop (a deploy), every reply being written is ended and saved as far as it got.
+let closing = false;
+export const stopReplies = async (ms = 8000) => {
+    closing = true;
+    for (const live of liveReplies.values()) {
+        live.restarting = true;
+        live.stopped = true;
+        live.stop?.();
+    }
+    for (const until = Date.now() + ms; busyChats.size > 0 && Date.now() < until;) await new Promise((resolve) => setTimeout(resolve, 50));
+    closing = false;
+};
+// A reply whose server stopped without warning left only its draft: it becomes the reply, marked incomplete. A draft
+// still being written is fresh, so only one that has gone quiet is taken (another server may be finishing it).
+export const recoverReplies = async (quietMs = 45000) => {
+    const left = await Chat.find({ service: SERVICE, 'draft.at': { $lt: new Date(Date.now() - quietMs) } }).select('_id draft');
+    for (const found of left) {
+        if (liveReplies.has(found.id)) continue;
+        const chat = await Chat.findOne({ _id: found._id, 'draft.at': found.draft.at });
+        if (!chat) continue;
+        chat.messages.push({ role: 'assistant', model: chat.draft.model || chat.model, content: chat.draft.content || '', thinking: chat.draft.thinking || '', steps: chat.draft.steps || [], errorCode: 'SERVER_RESTARTED' });
+        chat.draft = undefined;
+        await chat.save();
+        getNotificationService().sendToUser(String(chat.owner), { type: 'chat:changed', data: { id: chat.id, removed: false } });
+    }
+    return left.length;
+};
+
 const openLive = (id) => {
     const live = { events: [], listeners: new Set(), stop: null, stopped: false, seq: 0 };
     liveReplies.set(id, live);
@@ -4078,7 +4126,7 @@ const takeTurns = async (chat, body, userId, res) => {
             }
             getNotificationService().sendToUser(String(userId), { type: 'chat:reply', data: { chatId: id, seq: turn.live.seq + 1, event: { type: 'end' } } });
             getNotificationService().sendToUser(String(userId), { type: 'chat:changed', data: { id, removed: false } });
-            const content = queuedTurns.get(id)?.shift();
+            const content = closing ? undefined : queuedTurns.get(id)?.shift();
             if (content === undefined) break;
             const live = openLive(id);
             const next = await Chat.findOne({ _id: id, service: SERVICE, owner: userId }).catch(() => null);

@@ -316,6 +316,7 @@ const chatSchema = new mongoose.Schema({
     // A long chat's earlier messages folded into a memory: the model is sent the memory and the messages after it.
     memory: { type: String, default: '' },
     memoryThrough: { type: Number, default: 0 },
+    draft: { type: new mongoose.Schema({ content: String, thinking: String, model: String, steps: { type: [mongoose.Schema.Types.Mixed], default: undefined }, at: Date }, { _id: false }) },
     // Notes a model kept with save_note, sent with every message of the chat.
     notes: { type: [noteSchema], default: [] },
     continuedFrom: { type: mongoose.Schema.Types.ObjectId, default: null },

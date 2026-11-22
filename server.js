@@ -241,8 +241,9 @@ class Server {
             const {seedPresetThemes} = await import('./config/preset.themes.js');
             await seedPresetThemes();
 
-            const {downloads} = await import('./controllers/ai.controller.js');
+            const {downloads, recoverReplies} = await import('./controllers/ai.controller.js');
             await downloads.recover();
+            if (process.env.NODE_ENV !== 'test') setInterval(() => recoverReplies().catch(() => {}), 60000).unref();
 
             return this.dbConnection;
         } catch (error) {
@@ -477,6 +478,7 @@ class Server {
      */
     async shutdown(exitCode = 0) {
         try {
+            await (await import('./controllers/ai.controller.js')).stopReplies().catch(() => {});
             await this.stop();
             process.exit(exitCode);
         } catch (error) {
