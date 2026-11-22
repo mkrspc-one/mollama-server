@@ -801,6 +801,14 @@ export const splitBySpeed = (devices, neededMb) => {
     return given.map((mb) => Math.max(0.1, toGb(mb)));
 };
 
+// The split sent to the main computer. A model larger than the devices' graphics memory together gets none: llama.cpp's
+// --fit, which puts the layers that do not fit in the main computer's system memory, gives up when a split is set
+// (measured 2026-11-22: ErrorOutOfDeviceMemory with one, loaded without).
+export const poolSplit = (devices, neededMb) => {
+    const graphics = devices.reduce((sum, hardware) => sum + poolShareMb(hardware), 0);
+    return neededMb > 0 && graphics >= neededMb ? splitBySpeed(devices, neededMb) : [];
+};
+
 // Whether a model fits several computers pooled: what they can give together against what the model needs. A pooled
 // model runs slower than on one computer, so no speed is promised.
 export const fitPool = (entry, computers) => {

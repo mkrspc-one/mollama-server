@@ -11,7 +11,7 @@ import { asyncHandler, getNotificationService } from '../middleware/app.middlewa
 import { hasRight, RIGHTS } from '../config/rights.js';
 import { SERVICE, Device, Setting, PersonalModel, Download, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, chatSchemas, ToolServer, Provider, Skill } from '../models/ai.model.js';
 import {
-    OllamaError, mapOllamaError, UNREADABLE_CALL, memoryNeededMb, createOllamaClient, libraryModels, libraryEntries, loadLibrarySizes, librarySizes, friendlyName, cloudTitle, computerName, detectHardware, appleGpus, readDisk, rankCatalogue, fitModel, fitNotes, fitPool, poolShareMb, splitBySpeed, GPU_HEADROOM_MB, RAM_RESERVE_MB,
+    OllamaError, mapOllamaError, UNREADABLE_CALL, memoryNeededMb, createOllamaClient, libraryModels, libraryEntries, loadLibrarySizes, librarySizes, friendlyName, cloudTitle, computerName, detectHardware, appleGpus, readDisk, rankCatalogue, fitModel, fitNotes, fitPool, poolShareMb, poolSplit, GPU_HEADROOM_MB, RAM_RESERVE_MB,
     GenerationQueue, estimateTokens, extractText, createFilesClient, imageTypeOf, MAX_IMAGE_BYTES, MAX_CHAT_IMAGE_BYTES, runInSandbox, sandboxReady, poolGroups, MAX_PROGRAM_SECONDS, MAX_ATTACHMENT_BYTES, fetchRemote, MAX_REMOTE_BYTES,
     searchReady, searchWeb, readPage, deviceGateway,
     CLOUD_PROVIDERS, PROVIDER_HEALTH, createCloudClient, ollamaOnlineNames, runsOnline,
@@ -1141,7 +1141,7 @@ const startPool = async (parts, model) => {
             const gb = (mb) => Math.round(mb / 1024);
             throw new OllamaError('POOL_FAILED', `${model} needs about ${gb(fit.memoryNeededMb)} GB, and with ${parts.computers[0].name} running the model the pool gives ${gb(fit.memoryMb)} GB. ${better > 0 ? `Set ${parts.computers[better].name} to Runs the model, which has system memory to spare, and download the model there.` : 'Pick a smaller model.'}`);
         }
-        const split = size ? splitBySpeed(parts.devices, memoryNeededMb({ sizeMb: size / (1024 * 1024) })) : parts.split;
+        const split = size ? poolSplit(parts.devices, memoryNeededMb({ sizeMb: size / (1024 * 1024) })) : [];
         const order = { type: 'pool', action: 'run', model, helpers: parts.helpers, split, ctx: POOL_CONTEXT, lean: true };
         const start = deviceGateway.query(parts.main.id, order, 35 * 60 * 1000)
             .then((answer) => {
