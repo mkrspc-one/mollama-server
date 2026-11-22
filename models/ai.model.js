@@ -245,6 +245,7 @@ const chatMessageSchema = new mongoose.Schema({
         tokensPerSecond: { type: Number, default: null }
     },
     errorCode: { type: String, default: null },
+    errorDetail: { type: String, default: null },
     stopped: { type: Boolean, default: false },
     steps: { type: [new mongoose.Schema({ tool: String, input: String, failed: String, answer: String }, { _id: false })], default: [] },
     unverified: { type: [String], default: [] },

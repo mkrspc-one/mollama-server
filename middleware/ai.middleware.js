@@ -249,6 +249,8 @@ const RULES = [
     ['CALL_UNREADABLE', UNREADABLE_CALL]
 ];
 
+// Codes whose detail is written by Mollama's own desktop app, so the person is shown it: why a pool did not start.
+const SHOWN_DETAIL = new Set(['POOL_FAILED', 'POOL_STOPPED']);
 export class OllamaError extends Error {
     constructor(code, detail = null) {
         const entry = ERROR_TABLE[code] || ERROR_TABLE.UNKNOWN;
@@ -261,7 +263,8 @@ export class OllamaError extends Error {
     }
 
     toJSON() {
-        return { code: this.code, message: this.message, action: this.action };
+        const shown = SHOWN_DETAIL.has(this.code) && typeof this.detail === 'string' && this.detail.trim() ? { detail: this.detail.trim().slice(0, 300) } : {};
+        return { code: this.code, message: this.message, action: this.action, ...shown };
     }
 }
 

@@ -1166,7 +1166,14 @@ const poolClient = async (poolId) => {
         load: async (model) => startPool(parts, model),
         unload: async () => { deviceGateway.order(parts.main.id, { type: 'pool', action: 'stop' }); },
         chat: async (request, signal) => {
-            await startPool(parts, request.model);
+            // Stop ends the wait at once while the model is still starting; the start itself carries on for the next message.
+            const stopped = new Promise((resolve, reject) => {
+                const quit = () => reject(Object.assign(new Error('Stopped'), { name: 'AbortError' }));
+                if (signal?.aborted) quit();
+                signal?.addEventListener('abort', quit, { once: true });
+            });
+            stopped.catch(() => {});
+            await Promise.race([startPool(parts, request.model), stopped]);
             return runner.chat(request, signal);
         }
     };
@@ -3371,7 +3378,7 @@ const presentMessage = (chat, message, index) => ({
     thinking: message.thinking,
     model: message.model,
     stats: message.stats?.evalCount ? message.stats : null,
-    error: message.errorCode ? new OllamaError(message.errorCode).toJSON() : null,
+    error: message.errorCode ? new OllamaError(message.errorCode, message.errorDetail).toJSON() : null,
     stopped: message.stopped,
     steps: (message.steps || []).map((step) => ({ tool: step.tool, input: step.input, failed: step.failed || null, ...(step.answer != null ? { answer: step.answer } : {}) })),
     unverified: message.unverified || [],
@@ -3607,7 +3614,7 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
     } catch (error) {
         const failure = mapOllamaError(error);
         if (res) return sendOllamaError(res, failure);
-        chat.messages.push({ role: 'assistant', model: chat.model, content: '', errorCode: failure.code });
+        chat.messages.push({ role: 'assistant', model: chat.model, content: '', errorCode: failure.code, errorDetail: failure.toJSON().detail || null });
         await chat.save();
         return;
     }
@@ -3910,6 +3917,7 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
             else {
                 const failure = mapOllamaError(error);
                 reply.errorCode = failure.code;
+                reply.errorDetail = failure.toJSON().detail || null;
                 // A failure Mollama has no name for is written down, or it could never be given one.
                 if (failure.code === 'UNKNOWN') logger.warn('[Chat] A reply failed for a reason with no name yet', { chatId: chat.id, model: chat.model, detail: String(failure.detail || error?.stack || '').slice(0, 600) });
             }
@@ -3928,7 +3936,9 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
         queue.on('moved', reportPlace);
         await job.done;
     } catch (error) {
-        reply.errorCode = mapOllamaError(error).code;
+        const failure = mapOllamaError(error);
+        reply.errorCode = failure.code;
+        reply.errorDetail = failure.toJSON().detail || null;
     } finally {
         queue.off('moved', reportPlace);
     }
@@ -3949,7 +3959,7 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
     }
     write({
         type: reply.errorCode ? 'error' : 'done',
-        ...(reply.errorCode ? new OllamaError(reply.errorCode).toJSON() : {}),
+        ...(reply.errorCode ? new OllamaError(reply.errorCode, reply.errorDetail).toJSON() : {}),
         reply: message,
         title: chat.title,
         context: contextUse(chat, facts)
