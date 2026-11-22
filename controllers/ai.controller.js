@@ -1106,6 +1106,7 @@ const poolParts = async (userId) => {
         main,
         lenders,
         devices: [...lenderHardware, ...(mainHardware.gpuMemoryMb > 0 ? [mainHardware] : [])],
+        computers: [{ name: main.name, hardware: mainHardware }, ...lenders.map((one, at) => ({ name: one.name, hardware: lenderHardware[at] }))],
         helpers: lenders.map((one) => `${one.state.address}:${one.state.port}`),
         split,
         name: [main, ...lenders].map((one) => one.name).join(' + '),
@@ -1131,6 +1132,15 @@ const startPool = async (parts, model) => {
             installed = [];
         }
         const size = installed.find((one) => one.name === model)?.size || 0;
+        // A model the pool cannot hold with this main computer is not started: it would only fail after minutes of loading.
+        const sized = { sizeMb: size / (1024 * 1024), parameters: 0 };
+        const fitWith = (runs) => fitPool(sized, parts.computers.map((one, at) => ({ ...one.hardware, runs: at === runs })));
+        const fit = size ? fitWith(0) : null;
+        if (fit && !fit.fits) {
+            const better = parts.computers.findIndex((one, at) => at > 0 && fitWith(at).fits);
+            const gb = (mb) => Math.round(mb / 1024);
+            throw new OllamaError('POOL_FAILED', `${model} needs about ${gb(fit.memoryNeededMb)} GB, and with ${parts.computers[0].name} running the model the pool gives ${gb(fit.memoryMb)} GB. ${better > 0 ? `Set ${parts.computers[better].name} to Runs the model, which has system memory to spare, and download the model there.` : 'Pick a smaller model.'}`);
+        }
         const split = size ? splitBySpeed(parts.devices, memoryNeededMb({ sizeMb: size / (1024 * 1024) })) : parts.split;
         const order = { type: 'pool', action: 'run', model, helpers: parts.helpers, split, ctx: POOL_CONTEXT, lean: true };
         const start = deviceGateway.query(parts.main.id, order, 35 * 60 * 1000)
@@ -1743,7 +1753,7 @@ const poolFor = async (userId, deviceId) => {
             const setUp = computers.filter((entry) => entry.role !== 'off');
             if (setUp.length < 2 || !setUp.some((entry) => entry.id === String(deviceId))) return null;
             const left = poolGroups(computers).left.filter((one) => setUp.some((entry) => entry.id === one.id));
-            const hardware = await Promise.all(setUp.map(async (entry) => effectiveHardware(await Device.findById(entry.id))));
+            const hardware = await Promise.all(setUp.map(async (entry) => ({ ...effectiveHardware(await Device.findById(entry.id)), runs: entry.role === 'main' })));
             const main = setUp.find((entry) => entry.role === 'main') || null;
             return {
                 names: setUp.map((entry) => entry.name).join(' + '),
@@ -1753,9 +1763,9 @@ const poolFor = async (userId, deviceId) => {
                 off: left.map((one) => `${one.name}: ${one.message}`).join(' ') || 'Your pooling computers cannot reach each other right now.'
             };
         }
-        const hardware = await Promise.all(group.computers.map(async (entry) => effectiveHardware(await Device.findById(entry.id))));
         // A pooled model runs from the file on the main computer, so that is where it is downloaded.
         const main = computers.find((entry) => entry.role === 'main' && group.computers.some((one) => one.id === entry.id)) || null;
+        const hardware = await Promise.all(group.computers.map(async (entry) => ({ ...effectiveHardware(await Device.findById(entry.id)), runs: entry.id === main?.id })));
         return { names: group.computers.map((entry) => entry.name).join(' + '), hardware, main: main?.name || null, here: main ? main.id === String(deviceId) : group.computers.some((one) => one.id === String(deviceId)) };
     } catch {
         return null;

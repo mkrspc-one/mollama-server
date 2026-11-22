@@ -806,8 +806,11 @@ export const splitBySpeed = (devices, neededMb) => {
 export const fitPool = (entry, computers) => {
     if (!entry || entry.cloudOnly || !Array.isArray(computers) || computers.length < 2) return null;
     // Graphics memory everywhere, plus the system memory of the computer that runs the model, which takes the layers that
-    // do not fit graphics memory (llama.cpp's --fit), as one computer does with CPU help. The one with most to spare runs it.
-    const spare = Math.max(0, ...computers.map((hardware) => ((Number(hardware?.gpuMemoryMb) || 0) > 0 && !hardware.gpuShared ? (Number(hardware.memoryMb) || 0) - RAM_RESERVE_MB : 0)));
+    // do not fit graphics memory (llama.cpp's --fit), as one computer does with CPU help. That is the one marked 'runs'
+    // (the main computer chosen), or with none chosen yet, the one with most to spare. A lending computer gives only its
+    // graphics memory, and an Apple chip's memory is its graphics memory, so neither adds system memory.
+    const runner = computers.some((hardware) => hardware?.runs) ? computers.filter((hardware) => hardware?.runs) : computers;
+    const spare = Math.max(0, ...runner.map((hardware) => ((Number(hardware?.gpuMemoryMb) || 0) > 0 && !hardware.gpuShared ? (Number(hardware.memoryMb) || 0) - RAM_RESERVE_MB : 0)));
     const memoryMb = computers.reduce((sum, hardware) => sum + poolShareMb(hardware), 0) + spare;
     const needed = memoryNeededMb(entry);
     return { fits: needed <= memoryMb, memoryMb, memoryNeededMb: needed };
