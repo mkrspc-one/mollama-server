@@ -1044,7 +1044,7 @@ const checkReach = async (deviceId) => {
         main: main.id,
         address: state.address,
         reachable: answer ? answer.reachable === true : null,
-        detail: answer ? String(answer.detail || '').slice(0, 200) || null : 'The computer that runs the model could not check it: update its desktop app.'
+        detail: answer ? String(answer.detail || '').slice(0, 200) || null : 'The primary computer could not check it: update its desktop app.'
     });
     return undefined;
 };
@@ -1066,7 +1066,7 @@ const presentPools = async (userId) => {
             progress: state?.progress ?? null,
             lending: Boolean(state?.lending),
             reachable: fresh ? fresh.reachable : null,
-            detail: otherBuild ? 'Its desktop app pools a different way from the one that runs the model. Update the Mollama desktop app on both.' : fresh?.reachable === false ? fresh.detail : state?.detail || null,
+            detail: otherBuild ? 'Its desktop app pools a different way from the primary computer. Update the Mollama desktop app on both.' : fresh?.reachable === false ? fresh.detail : state?.detail || null,
             known: Boolean(state)
         };
     };
@@ -1139,7 +1139,7 @@ const startPool = async (parts, model) => {
         if (fit && !fit.fits) {
             const better = parts.computers.findIndex((one, at) => at > 0 && fitWith(at).fits);
             const gb = (mb) => Math.round(mb / 1024);
-            throw new OllamaError('POOL_FAILED', `${model} needs about ${gb(fit.memoryNeededMb)} GB, and with ${parts.computers[0].name} running the model the pool gives ${gb(fit.memoryMb)} GB. ${better > 0 ? `Set ${parts.computers[better].name} to Runs the model, which has system memory to spare, and download the model there.` : 'Pick a smaller model.'}`);
+            throw new OllamaError('POOL_FAILED', `${model} needs about ${gb(fit.memoryNeededMb)} GB, and with ${parts.computers[0].name} as the primary computer the pool gives ${gb(fit.memoryMb)} GB. ${better > 0 ? `Make ${parts.computers[better].name} the primary computer, which has system memory to spare, and download the model there.` : 'Pick a smaller model.'}`);
         }
         const split = size ? poolSplit(parts.devices, memoryNeededMb({ sizeMb: size / (1024 * 1024) })) : [];
         const order = { type: 'pool', action: 'run', model, helpers: parts.helpers, split, ctx: POOL_CONTEXT, lean: true };
@@ -1147,7 +1147,7 @@ const startPool = async (parts, model) => {
             .then((answer) => {
                 if (!answer?.ready) throw new OllamaError('POOL_FAILED', String(answer?.error || '').slice(0, 300));
             }, (error) => {
-                throw error instanceof OllamaError && error.code === 'DEVICE_OFFLINE' ? error : new OllamaError('POOL_FAILED', 'The computer that runs the model did not answer: update its desktop app.');
+                throw error instanceof OllamaError && error.code === 'DEVICE_OFFLINE' ? error : new OllamaError('POOL_FAILED', 'The primary computer did not answer: update its desktop app.');
             })
             .finally(() => poolStarts.delete(parts.main.id));
         poolStarts.set(parts.main.id, start);
