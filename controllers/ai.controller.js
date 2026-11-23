@@ -303,13 +303,12 @@ const endPooled = async (pooled) => {
     await waitUntil(() => !poolStateOf(pooled.main)?.running);
     await new Promise((resolve) => setTimeout(resolve, 1500));
 };
-const endLoaded = async (deviceId) => {
-    if (queue.busyIn(deviceId)) return;
-    const ollama = createOllamaClient(DEVICE_HOST, deviceGateway.fetcher(deviceId));
+const endLoaded = async (lane, ollama = createOllamaClient(DEVICE_HOST, deviceGateway.fetcher(lane))) => {
+    if (queue.busyIn(lane)) return false;
     const loaded = (await ollama.running().catch(() => ({ models: [] }))).models;
-    if (loaded.length === 0) return;
+    if (loaded.length === 0) return true;
     await Promise.all(loaded.map((entry) => ollama.unload(entry.name).catch(() => {})));
-    await waitUntil(() => ollama.running().then(({ models }) => models.length === 0, () => true));
+    return waitUntil(() => ollama.running().then(({ models }) => models.length === 0, () => true));
 };
 
 // What loading a model would take from the computer it runs on. A model past the computer's memory makes the whole
@@ -354,10 +353,12 @@ const loadCost = async (ollama, model, { sending = false, anyway = false } = {})
     const fit = fitModel(entry, hardware);
     const usableGpu = (mb) => Math.max(0, mb - GPU_HEADROOM_MB);
     const inGpu = running.reduce((sum, one) => sum + (one.size_vram || 0), 0) / MB;
-    const ahead = !pooled && (fit.verdict === 'gpu' ? inGpu + fit.memoryNeededMb <= usableGpu(whole.gpuMemoryMb)
-        : fit.verdict === 'cpu' && running.length === 0 && fit.memoryNeededMb * 2 <= whole.memoryMb);
+    const light = (one) => one.verdict === 'gpu' || (one.verdict === 'cpu' && one.memoryNeededMb * 2 <= whole.memoryMb);
+    const ahead = !pooled && light(fit) && (running.length === 0 || (fit.verdict === 'gpu' && inGpu + fit.memoryNeededMb <= usableGpu(whole.gpuMemoryMb)));
+    // It would fit in place of what is loaded, which no reply may be using (endLoaded leaves one that is).
+    const inPlace = !ahead && !pooled && running.length > 0 && light(fitModel(entry, target.kind === 'companion' ? await freeOf(target.id, whole, running) : whole));
     const hasMb = usableGpu(hardware.gpuMemoryMb) + Math.max(0, hardware.memoryMb - (hardware.gpuShared ? hardware.gpuMemoryMb : 0) - RAM_RESERVE_MB);
-    return { loaded: false, ahead, tight: !fit.fits, neededMb: fit.memoryNeededMb, hasMb, measured, pooled: pooled?.model || null, name: device ? shownName(device) : 'This computer' };
+    return { loaded: false, ahead, inPlace, tight: !fit.fits, neededMb: fit.memoryNeededMb, hasMb, measured, pooled: pooled?.model || null, name: device ? shownName(device) : 'This computer' };
 };
 const memoryRefusal = (model, cost) => {
     const gb = (mb) => Math.round(mb / 1024);
@@ -4398,8 +4399,11 @@ export const loadModel = asyncHandler(async (req, res) => {
         const loaded = (await ollama.running()).models.some((entry) => entry.name === model);
         const busy = queue.busyIn(currentLane());
         // Loaded ahead only where it fits beside everything else; a pooled model is never started before a message is sent.
-        const safe = currentTarget().kind === 'cloud' || Boolean((await loadCost(ollama, model).catch(() => null))?.ahead);
-        const loading = !loaded && !busy && safe && settings.keepAliveMinutes > 0;
+        // A chat that stays open asks again with 'swap': an idle model already loaded then goes for this one.
+        const cost = currentTarget().kind === 'cloud' ? { ahead: true } : await loadCost(ollama, model).catch(() => null);
+        const able = !loaded && !busy && settings.keepAliveMinutes > 0;
+        const swap = able && Boolean(cost?.inPlace) && req.body?.swap === true;
+        const loading = able && (Boolean(cost?.ahead) || (swap && await endLoaded(currentLane(), ollama)));
         if (loading) {
             const facts = await modelFacts(ollama, model);
             const numCtx = Math.min(facts.contextLength, AUTO_CONTEXT_LIMIT, webSearchReady() ? SEARCH_CONTEXT : CONTEXT_STEPS[0]);
@@ -4407,7 +4411,7 @@ export const loadModel = asyncHandler(async (req, res) => {
                 logger.warn('[Models] Model could not be loaded ahead of time', { model, code: mapOllamaError(error).code });
             });
         }
-        res.status(202).json({ success: true, model, ready: loaded, loading });
+        res.status(202).json({ success: true, model, ready: loaded, loading, inPlace: able && !loading && Boolean(cost?.inPlace) });
     } catch (error) {
         sendOllamaError(res, mapOllamaError(error));
     }

@@ -168,7 +168,8 @@ export const modelSchemas = {
     }),
 
     load: Joi.object({
-        name: modelName.allow(null, '')
+        name: modelName.allow(null, ''),
+        swap: Joi.boolean()
     }),
 
     create: Joi.object({
