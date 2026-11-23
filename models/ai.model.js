@@ -469,6 +469,7 @@ export const chatSchemas = {
         content: Joi.string().min(1).max(100000),
         regenerate: Joi.boolean(),
         live: Joi.boolean(),
+        anyway: Joi.boolean(),
         editIndex: Joi.number().integer().min(0).max(199)
     }).or('content', 'regenerate').without('regenerate', ['content', 'editIndex']).with('editIndex', 'content'),
     attachUpload: Joi.object({ name: Joi.string().trim().min(1).max(255).required() }),

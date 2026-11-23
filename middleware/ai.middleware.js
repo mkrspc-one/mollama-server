@@ -33,6 +33,11 @@ const ERROR_TABLE = {
         message: 'This model is too large for this device.',
         action: 'Pick a smaller model. The Discover tab shows which ones fit.'
     },
+    NOT_ENOUGH_MEMORY: {
+        status: 409,
+        message: 'This model needs more memory than this computer has free, and loading it could freeze the whole computer.',
+        action: 'Pick a smaller model, or close large apps and unload other models first.'
+    },
     OUT_OF_MEMORY: {
         status: 422,
         message: 'This model needs more memory than this device has free.',
@@ -254,8 +259,9 @@ const RULES = [
     ['CALL_UNREADABLE', UNREADABLE_CALL]
 ];
 
-// Codes whose detail is written by Mollama's own desktop app, so the person is shown it: why a pool did not start.
-const SHOWN_DETAIL = new Set(['POOL_FAILED', 'POOL_STOPPED']);
+// Codes whose detail is written by Mollama itself, so the person is shown it: why a pool did not start, or how much
+// memory a model needs.
+const SHOWN_DETAIL = new Set(['POOL_FAILED', 'POOL_STOPPED', 'NOT_ENOUGH_MEMORY']);
 export class OllamaError extends Error {
     constructor(code, detail = null) {
         const entry = ERROR_TABLE[code] || ERROR_TABLE.UNKNOWN;
@@ -791,6 +797,20 @@ export const fitModel = (entry, hardware) => {
         place,
         tokensPerSecond: speedRange(verdict, entry)
     };
+};
+
+// The computer as it is right now, in the same shape, so the same fit can be asked of it: no more than what is free,
+// keeping a little back so other apps carry on. A desktop app too old to say leaves the computer's own sizes.
+export const MEMORY_SPARE_MB = 2048;
+export const freeHardware = (hardware, free) => {
+    if (!(Number(free?.freeMb) > 0)) return hardware;
+    const memory = Math.max(0, Number(free.freeMb) - MEMORY_SPARE_MB);
+    const total = Number(hardware?.memoryMb) || 0;
+    const gpuTotal = Number(hardware?.gpuMemoryMb) || 0;
+    // An Apple chip's graphics use the same memory, so what is free is free to both, once.
+    if (hardware.gpuShared) return { ...hardware, memoryMb: Math.min(total, memory + RAM_RESERVE_MB + GPU_HEADROOM_MB), gpuMemoryMb: Math.min(gpuTotal, memory + GPU_HEADROOM_MB) };
+    const gpuFree = free.gpuFreeMb === null || free.gpuFreeMb === undefined ? NaN : Number(free.gpuFreeMb);
+    return { ...hardware, memoryMb: Math.min(total, memory + RAM_RESERVE_MB), gpuMemoryMb: Number.isFinite(gpuFree) ? Math.min(gpuTotal, Math.max(0, gpuFree) + GPU_HEADROOM_MB) : gpuTotal };
 };
 
 // What a computer can give a pooled model, in MB: its graphics memory, or with none, its system memory, less its reserve.

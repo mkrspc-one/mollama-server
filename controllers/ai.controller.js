@@ -11,7 +11,7 @@ import { asyncHandler, getNotificationService } from '../middleware/app.middlewa
 import { hasRight, RIGHTS } from '../config/rights.js';
 import { SERVICE, Device, Setting, PersonalModel, Download, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, chatSchemas, ToolServer, Provider, Skill } from '../models/ai.model.js';
 import {
-    OllamaError, mapOllamaError, UNREADABLE_CALL, memoryNeededMb, createOllamaClient, libraryModels, libraryEntries, loadLibrarySizes, librarySizes, friendlyName, cloudTitle, computerName, detectHardware, appleGpus, readDisk, rankCatalogue, fitModel, fitNotes, fitPool, poolShareMb, poolSplit, GPU_HEADROOM_MB, RAM_RESERVE_MB,
+    OllamaError, mapOllamaError, UNREADABLE_CALL, memoryNeededMb, createOllamaClient, libraryModels, libraryEntries, loadLibrarySizes, librarySizes, friendlyName, cloudTitle, computerName, detectHardware, appleGpus, readDisk, rankCatalogue, fitModel, fitNotes, fitPool, freeHardware, poolShareMb, poolSplit, GPU_HEADROOM_MB, RAM_RESERVE_MB,
     GenerationQueue, estimateTokens, extractText, createFilesClient, imageTypeOf, MAX_IMAGE_BYTES, MAX_CHAT_IMAGE_BYTES, runInSandbox, letSandboxGo, sandboxReady, poolGroups, MAX_PROGRAM_SECONDS, MAX_ATTACHMENT_BYTES, fetchRemote, MAX_REMOTE_BYTES,
     searchReady, searchWeb, readPage, deviceGateway,
     CLOUD_PROVIDERS, PROVIDER_HEALTH, createCloudClient, ollamaOnlineNames, runsOnline,
@@ -269,6 +269,99 @@ const getOllama = async () => {
     if (target.kind === 'companion') return createOllamaClient(DEVICE_HOST, deviceGateway.fetcher(target.id));
     if (target.kind === 'none') return createOllamaClient(DEVICE_HOST, () => Promise.reject(new OllamaError('NO_DEVICE')));
     return createOllamaClient(await resolveOllamaHost());
+};
+
+// What a computer has free right now, less what it keeps back. The models listed are ones Ollama would unload.
+const freeOf = async (deviceId, hardware, unloading = []) => {
+    const said = await deviceGateway.ask(deviceId, 'memory').catch(() => null);
+    const inGpu = unloading.reduce((sum, entry) => sum + (entry.size_vram || 0), 0) / MB;
+    const whole = unloading.reduce((sum, entry) => sum + (entry.size || 0), 0) / MB;
+    return freeHardware(hardware, {
+        freeMb: Number(said?.freeMb) > 0 ? Number(said.freeMb) + (hardware.gpuShared ? whole : Math.max(0, whole - inGpu)) : null,
+        gpuFreeMb: Number.isFinite(said?.gpuFreeMb) ? said.gpuFreeMb + inGpu : null
+    });
+};
+// The pooled model a computer runs or lends memory to, if any, and whether a reply is using it.
+const pooledOn = async (device) => {
+    if (device?.kind !== 'companion' || !['main', 'lend'].includes(device.poolRole)) return null;
+    const main = device.poolRole === 'main' ? device : (await ownDevices(device.registeredBy)).find((one) => one.poolRole === 'main' && deviceGateway.isOnline(one.id));
+    const state = main && poolStateOf(main.id);
+    const model = state?.running || state?.starting;
+    if (!model) return null;
+    const pool = await poolRecord(device.registeredBy);
+    return { model, main: String(main.id), idle: !poolStarts.has(main.id) && !queue.busyIn(`pool:${pool.id}`) };
+};
+// A computer holds a pooled model or Ollama's, not both: each makes room for the other while no reply uses it.
+const waitUntil = async (check, ms = 5000) => {
+    for (const end = Date.now() + ms; Date.now() < end; await new Promise((resolve) => setTimeout(resolve, 100))) {
+        if (await check()) return true;
+    }
+    return false;
+};
+const endPooled = async (pooled) => {
+    deviceGateway.order(pooled.main, { type: 'pool', action: 'stop' });
+    await waitUntil(() => !poolStateOf(pooled.main)?.running);
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+};
+const endLoaded = async (deviceId) => {
+    if (queue.busyIn(deviceId)) return;
+    const ollama = createOllamaClient(DEVICE_HOST, deviceGateway.fetcher(deviceId));
+    const loaded = (await ollama.running().catch(() => ({ models: [] }))).models;
+    if (loaded.length === 0) return;
+    await Promise.all(loaded.map((entry) => ollama.unload(entry.name).catch(() => {})));
+    await waitUntil(() => ollama.running().then(({ models }) => models.length === 0, () => true));
+};
+
+// What loading a model would take from the computer it runs on. A model past the computer's memory makes the whole
+// computer swap to disk and freeze, so it is never loaded ahead, and a message to it is only sent on the person's word.
+// Null when the model is not loaded on a computer of theirs, or the computer's memory is not known. For a message
+// ('sending'), an idle pooled model on the computer makes way first.
+const loadCost = async (ollama, model, { sending = false, anyway = false } = {}) => {
+    const target = currentTarget();
+    if (!['companion', 'local', 'pool'].includes(target.kind)) return null;
+    const [{ models: running }, { models: installed }] = await Promise.all([ollama.running(), ollama.list()]);
+    if (running.some((entry) => entry.name === model)) return { loaded: true };
+    const sizeMb = (installed.find((entry) => entry.name === model)?.size || 0) / MB;
+    if (!sizeMb) return null;
+    const entry = { sizeMb, parameters: 0 };
+
+    if (target.kind === 'pool') {
+        const parts = await poolTarget(target.id);
+        // Replacing another pooled model, or one too large for the pool altogether, is for startPool to judge.
+        if (!parts || running.length > 0) return null;
+        const computers = parts.computers.map((one, at) => ({ ...one.hardware, runs: at === 0 }));
+        if (!fitPool(entry, computers)?.fits) return null;
+        const now = await Promise.all([parts.main, ...parts.lenders].map(async (one, at) => {
+            const loaded = queue.busyIn(one.id) ? [] : (await createOllamaClient(DEVICE_HOST, deviceGateway.fetcher(one.id)).running().catch(() => ({ models: [] }))).models;
+            return freeOf(one.id, computers[at], loaded);
+        }));
+        const fit = fitPool(entry, now);
+        return { loaded: false, ahead: false, tight: !fit.fits, neededMb: fit.memoryNeededMb, hasMb: fit.memoryMb, measured: true, name: parts.name };
+    }
+
+    const device = await getCurrentDevice();
+    const whole = effectiveHardware(device);
+    if (!whole.memoryMb) return null;
+    let pooled = await pooledOn(device);
+    if (sending && pooled?.idle && (anyway || fitModel(entry, whole).fits)) {
+        await endPooled(pooled);
+        pooled = null;
+    }
+    let hardware = target.kind === 'companion' ? await freeOf(target.id, whole, sending ? running : []) : whole;
+    const measured = hardware !== whole;
+    // Without a measure, a pooled model in use has the graphics memory.
+    if (!measured && pooled) hardware = { ...whole, memoryMb: whole.memoryMb - (whole.gpuShared ? whole.gpuMemoryMb : 0), gpuMemoryMb: 0, gpuShared: false };
+    const fit = fitModel(entry, hardware);
+    const usableGpu = (mb) => Math.max(0, mb - GPU_HEADROOM_MB);
+    const inGpu = running.reduce((sum, one) => sum + (one.size_vram || 0), 0) / MB;
+    const ahead = !pooled && (fit.verdict === 'gpu' ? inGpu + fit.memoryNeededMb <= usableGpu(whole.gpuMemoryMb)
+        : fit.verdict === 'cpu' && running.length === 0 && fit.memoryNeededMb * 2 <= whole.memoryMb);
+    const hasMb = usableGpu(hardware.gpuMemoryMb) + Math.max(0, hardware.memoryMb - (hardware.gpuShared ? hardware.gpuMemoryMb : 0) - RAM_RESERVE_MB);
+    return { loaded: false, ahead, tight: !fit.fits, neededMb: fit.memoryNeededMb, hasMb, measured, pooled: pooled?.model || null, name: device ? shownName(device) : 'This computer' };
+};
+const memoryRefusal = (model, cost) => {
+    const gb = (mb) => Math.round(mb / 1024);
+    return new OllamaError('NOT_ENOUGH_MEMORY', `${model} needs about ${gb(cost.neededMb)} GB and ${cost.name} has about ${gb(cost.hasMb)} GB ${cost.measured ? 'free' : 'for models'}${cost.pooled ? `, with ${cost.pooled} running in your pool` : ''}. Loading it could freeze the whole computer.`);
 };
 
 const diskNow = async () => {
@@ -1146,7 +1239,8 @@ const startPool = async (parts, model) => {
         }
         const split = size ? poolSplit(parts.devices, memoryNeededMb({ sizeMb: size / (1024 * 1024) })) : [];
         const order = { type: 'pool', action: 'run', model, helpers: parts.helpers, split, ctx: POOL_CONTEXT, lean: true };
-        const start = deviceGateway.query(parts.main.id, order, 35 * 60 * 1000)
+        const start = Promise.all([parts.main, ...parts.lenders].map((one) => endLoaded(one.id)))
+            .then(() => deviceGateway.query(parts.main.id, order, 35 * 60 * 1000))
             .then((answer) => {
                 if (!answer?.ready) throw new OllamaError('POOL_FAILED', String(answer?.error || '').slice(0, 300));
             }, (error) => {
@@ -3668,6 +3762,10 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
         if (!(await ollama.status()).available) throw new OllamaError(downCode());
         if (!chat.model) chat.model = await chooseModel(ollama, userId);
         facts = await modelFacts(ollama, chat.model);
+        if (!facts.online) {
+            const cost = await loadCost(ollama, chat.model, { sending: true, anyway: body.anyway === true }).catch(() => null);
+            if (cost?.tight && !body.anyway) throw memoryRefusal(chat.model, cost);
+        }
 
         prompt = buildMessages(chat, facts.capabilities.includes('tools'), facts.capabilities.includes('vision'));
         // Too long for the model: older messages are compressed into the chat's memory now, so the chat carries on here.
@@ -4299,7 +4397,9 @@ export const loadModel = asyncHandler(async (req, res) => {
         const model = req.body?.name || await chooseModel(ollama, req.user.id);
         const loaded = (await ollama.running()).models.some((entry) => entry.name === model);
         const busy = queue.busyIn(currentLane());
-        const loading = !loaded && !busy && settings.keepAliveMinutes > 0;
+        // Loaded ahead only where it fits beside everything else; a pooled model is never started before a message is sent.
+        const safe = currentTarget().kind === 'cloud' || Boolean((await loadCost(ollama, model).catch(() => null))?.ahead);
+        const loading = !loaded && !busy && safe && settings.keepAliveMinutes > 0;
         if (loading) {
             const facts = await modelFacts(ollama, model);
             const numCtx = Math.min(facts.contextLength, AUTO_CONTEXT_LIMIT, webSearchReady() ? SEARCH_CONTEXT : CONTEXT_STEPS[0]);
