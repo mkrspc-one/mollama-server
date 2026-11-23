@@ -4,11 +4,11 @@ A piece of text with its own size, weight and colour. Only plain text goes insid
 
 Written as `<Typography>text</Typography>`. In a block layout several of them flow side by side like words; use as="p" to put one on its own line.
 
-Sizes below are for a desktop-width window; every step is a little smaller on tablets and phones.
+Sizes below hold at every window width from a tablet up; the steps from md up are smaller on a phone.
 
 | Attribute | Values | What it does on screen |
 |---|---|---|
-| size | xxs, xs, sm, md, lg, xl, 2xl, 3xl, 4xl | Text height: 12, 16, 19, 22, 26, 31, 40, 56 and 72px. Default xs. |
+| size | xxs, xs, sm, md, lg, xl, 2xl, 3xl, 4xl | Text height: 13, 14, 16, 18, 22, 28, 36, 48 and 64px. Default sm. |
 | weight | thin, extralight, light, normal, medium, semibold, bold, extrabold, black | How heavy the letters are, from 100 to 900. Default normal. |
 | color | default, muted, contrast, neutral, primary, secondary, tertiary (the theme's three colours), success, warning, error (usually green, amber and red, but each theme sets them) | Colour of the text. default is the normal text colour. muted is the same colour at 65%. contrast is for text on a filled box. |
 | font | primary, secondary, monospace | The theme's main typeface, its second one, or one with letters of equal width. |

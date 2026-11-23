@@ -1,6 +1,6 @@
 COMPONENT: Card
 
-A panel: filled with the panel colour, with a thin border and rounded corners. Like a Container it arranges the components inside it.
+A panel: white (the theme's panel colour), with a thin border and rounded corners, flat on the page. Like a Container it arranges the components inside it.
 
 Written as `<Card> ... </Card>`.
 
@@ -11,7 +11,7 @@ Written as `<Card> ... </Card>`.
 | borderStrength | normal, soft | soft makes the border fainter. |
 | radius | sm, md, lg, xl | Corner rounding: 8px, 14px, 20px or 28px. Without it the theme decides. |
 | shadow | true, false | true adds a soft shadow under the panel. Default false. |
-| hover | true, false | With shadow="true", the shadow deepens while the mouse is over the panel. On its own it shows nothing. |
+| hover | true, false | The border darkens while the mouse is over the panel, and with shadow="true" the shadow deepens. |
 | layout | block, flex, flex-column, grid | How the components inside are arranged. **block** (the default): each Card, Container, Button, Divider, ProgressBar, Input, Select and Switch takes a full line, while Typography, Badge, Icon and CircularProgress flow side by side like words. **flex**: side by side in a row that wraps. **flex-column**: stacked top to bottom. **grid**: equal-width columns. |
 | columns | 1 to 6, or auto, auto-sm, auto-lg | For grid. A number gives that many equal columns. auto fits as many columns of at least 250px as there is room for (auto-sm 200px, auto-lg 300px). In a Container, numbered columns reduce on narrow windows: one column at 640px wide or less, at most two up to 900px, at most three up to 1200px. In a Card they never reduce. |
 | gap | none 0, xs 4px, sm 8px, md 12px, lg 16px, xl 24px | Space between the components inside. It only has an effect in flex, flex-column and grid, not in block. Default sm. |
