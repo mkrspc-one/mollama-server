@@ -35,6 +35,7 @@ router.validRoutes = [
     '/api/v1/models/downloads/cancel',
     '/api/v1/catalogue',
     '/api/v1/devices/:id/catalogue',
+    '/api/v1/devices/:id/recommended',
     '/api/v1/skills',
     '/api/v1/skills/:id',
     '/api/v1/skills/:id/file',
@@ -115,6 +116,7 @@ router.post('/models/downloads/cancel', ...manager, validateRequest(modelSchemas
 
 router.get('/catalogue', noCacheResponse(), validateRequest(modelSchemas.catalogueQuery, 'query'), aiController.getPublicCatalogue);
 router.get('/devices/:id/catalogue', ...signedIn, withDeviceId, validateRequest(modelSchemas.catalogueQuery, 'query'), aiController.getDeviceCatalogue);
+router.get('/devices/:id/recommended', ...signedIn, withDeviceId, aiController.getDeviceRecommended);
 
 const withChatId = validateRequest(chatSchemas.chatId, 'params');
 

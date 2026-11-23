@@ -68,7 +68,8 @@ const searchScore = (model, words, loose = false) => {
 
 // The whole library, searched and ordered on the server and handed out a page at a time.
 // Recommendations come only from the most downloaded models, so an obscure model is never the suggestion.
-const liveCatalogue = async (query, hardware) => {
+// With picks off the list is only the list: nothing in it is marked or moved to the front.
+const liveCatalogue = async (query, hardware, { picks = true } = {}) => {
     const models = await libraryModels();
     const words = String(query?.q || '').toLowerCase().split(/[\s:]+/).filter(Boolean);
     // A word such as 7b asks for that size of a model, unless it is part of a model's name.
@@ -121,6 +122,7 @@ const liveCatalogue = async (query, hardware) => {
         const all = hardware
             ? [...rankCatalogue(entries.filter(isPopular), hardware), ...entries.filter((entry) => !isPopular(entry)).map((entry) => ({ ...entry, fit: entry.cloudOnly ? CLOUD_FIT : fitModel(entry, hardware), pick: null }))]
             : entries.map((entry) => ({ ...entry, fit: null, pick: null }));
+        if (!picks) all.forEach((entry) => { entry.pick = null; delete entry.pickLabel; delete entry.pickWhy; });
         return all.filter((entry) => (!fitting || entry.fit.fits) && inRange(entry)).sort((a, b) => (PICK_ORDER[a.pick] ?? 9) - (PICK_ORDER[b.pick] ?? 9)
             || (chosenOrder ? chosenOrder(a, b) || a.parameters - b.parameters : 0)
             || (terms.length > 0 ? scoreOf(b) - scoreOf(a) : 0)
@@ -1467,9 +1469,13 @@ export const listModels = asyncHandler(async (req, res) => {
     } catch {
         loaded = new Set();
     }
+    const pooledHere = currentTarget().id ? await poolFor(req.user.id, currentTarget().id) : null;
     for (const model of models) {
-        const fit = fitModel(knownModels.get(model.name) || { sizeMb: model.sizeBytes / MB, parameters: parseFloat(model.parameterSize) || 0 }, hardware);
-        model.fit = { verdict: fit.verdict, label: fit.label, fits: fit.fits };
+        const sized = knownModels.get(model.name) || { sizeMb: model.sizeBytes / MB, parameters: parseFloat(model.parameterSize) || 0 };
+        const fit = fitModel(sized, hardware);
+        model.fit = { verdict: fit.verdict, label: fit.label, fits: fit.fits, memoryNeededMb: fit.memoryNeededMb, place: fit.place };
+        const together = pooledHere ? fitPool(sized, pooledHere.hardware) : null;
+        if (together?.fits) model.pooled = { names: pooledHere.names, place: together.place };
         model.ready = loaded.has(model.name);
         model.canChat = !model.capabilities.includes('embedding') || model.capabilities.includes('completion');
         model.usedBy = personal.filter((entry) => entry.from === model.name).map((entry) => entry.displayName);
@@ -1777,6 +1783,40 @@ const poolFor = async (userId, deviceId) => {
     }
 };
 
+// What a computer adds to each model of the list: whether it is there already, fits its disk and fits its pool.
+const onDevice = async (req, device, entries) => {
+    const installed = await installedNames();
+    const disk = await diskNow();
+    const pooled = await poolFor(req.user.id, device.id);
+    return {
+        freeDiskMb: disk.diskFreeMb,
+        models: entries.map((entry) => ({
+            ...entry,
+            ...(pooled && !entry.cloudOnly && fitPool(entry, pooled.hardware)?.fits ? { pooled: { names: pooled.names, place: fitPool(entry, pooled.hardware).place } } : {}),
+            ...(pooled && entry.fit?.fits === false && fitPool(entry, pooled.hardware)?.fits ? { pool: { names: pooled.names, memoryMb: fitPool(entry, pooled.hardware).memoryMb, main: pooled.main, here: pooled.here, ...(pooled.off ? { off: pooled.off } : {}) } } : {}),
+            installed: installed.has(entry.tag),
+            fitsDisk: disk.diskFreeMb === null ? true : entry.sizeMb <= disk.diskFreeMb
+        }))
+    };
+};
+
+// The few models recommended for a computer, chosen from the whole library: no search or filter changes them.
+export const getDeviceRecommended = asyncHandler(async (req, res) => {
+    const device = await allowedDevice(req, req.params.id);
+    if (!device) {
+        return res.status(404).json({ success: false, message: 'Device not found' });
+    }
+    deviceScope.enterWith(targetOf(device));
+    let live;
+    try {
+        live = await liveCatalogue({ size: 4 }, effectiveHardware(device));
+    } catch (error) {
+        return sendOllamaError(res, error);
+    }
+    const { models } = await onDevice(req, device, live.entries.filter((entry) => entry.pick));
+    res.status(200).json({ success: true, models });
+});
+
 export const getDeviceCatalogue = asyncHandler(async (req, res) => {
     const device = await allowedDevice(req, req.params.id);
     if (!device) {
@@ -1786,13 +1826,11 @@ export const getDeviceCatalogue = asyncHandler(async (req, res) => {
     const hardware = effectiveHardware(device);
     let live;
     try {
-        live = await liveCatalogue(req.query, hardware);
+        live = await liveCatalogue(req.query, hardware, { picks: false });
     } catch (error) {
         return sendOllamaError(res, error);
     }
-    const installed = await installedNames();
-    const disk = await diskNow();
-    const pooled = await poolFor(req.user.id, device.id);
+    const { freeDiskMb, models } = await onDevice(req, device, live.entries);
 
     res.status(200).json({
         success: true,
@@ -1807,13 +1845,8 @@ export const getDeviceCatalogue = asyncHandler(async (req, res) => {
         library: live.library,
         fitting: live.fitting,
         hardware,
-        freeDiskMb: disk.diskFreeMb,
-        models: live.entries.map((entry) => ({
-            ...entry,
-            ...(pooled && entry.fit?.fits === false && fitPool(entry, pooled.hardware)?.fits ? { pool: { names: pooled.names, memoryMb: fitPool(entry, pooled.hardware).memoryMb, main: pooled.main, here: pooled.here, ...(pooled.off ? { off: pooled.off } : {}) } } : {}),
-            installed: installed.has(entry.tag),
-            fitsDisk: disk.diskFreeMb === null ? true : entry.sizeMb <= disk.diskFreeMb
-        })),
+        freeDiskMb,
+        models,
         permissions: { manage: canManage(req) }
     });
 });
@@ -3765,11 +3798,14 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
         // What the model counted beyond Mollama's own estimate (the functions it is offered, its template), learnt from
         // its first answer in this reply.
         let uncounted = 0;
+        // The room kept free for what the model writes. It grows when a reply is cut short with no more room to give
+        // (see below), so a long function call, such as a whole figure, has somewhere to go.
+        let reserve = REPLY_RESERVE * 2;
         // A reply never sends more than the model can read: Ollama would drop the start of the conversation without
         // saying so, and a pooled model refuses the request. Results already read go first, oldest first, skill pages
         // and files last; then what has not been read yet is cut to what fits.
         const makeRoom = () => {
-            const limit = capacity - REPLY_RESERVE * 2 - uncounted;
+            const limit = capacity - reserve - uncounted;
             const over = () => promptTokens(messages) - limit;
             for (const pages of [false, true]) {
                 for (const mark of marks) {
@@ -3880,9 +3916,21 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
                         correcting = true;
                         continue;
                     }
+                    // No more room to give: what the model has already read is put away to leave more for writing, up to
+                    // half of what it can read. A function call cut short is never run, so without this a long one
+                    // could never be written.
+                    const before = promptTokens(messages);
+                    reserve = Math.min(Math.floor(capacity / 2), reserve * 2);
+                    makeRoom();
+                    const freed = promptTokens(messages) < before;
                     if (!said.trim()) {
-                        reply.errorCode = 'REPLY_CUT';
-                        break;
+                        if (!freed) {
+                            reply.errorCode = 'REPLY_CUT';
+                            break;
+                        }
+                        write({ type: 'note', text: 'Making room for a longer reply and trying again…' });
+                        correcting = true;
+                        continue;
                     }
                     messages.push({ role: 'assistant', content: said }, { role: 'user', content: CARRY_ON });
                     write({ type: 'note', text: 'The model ran out of room. Asking it to go on…' });

@@ -773,11 +773,22 @@ export const fitModel = (entry, hardware) => {
     else if (hasGpu && needed <= usableGpu + usableRam) verdict = 'mixed';
     else if (!hasGpu && needed <= usableRam) verdict = 'cpu';
 
+    // Where the model sits once running, and what each memory has left of its whole. On a chip whose graphics share
+    // the system memory, all of it comes out of that one memory.
+    const gpuMb = hasGpu ? Math.min(needed, usableGpu) : 0;
+    const place = verdict === 'too_large' ? null : {
+        gpuMb,
+        ramMb: needed - gpuMb,
+        gpuLeftMb: hasGpu ? gpuMemoryMb - gpuMb : null,
+        ramLeftMb: Math.max(0, memoryMb - (hardware?.gpuShared ? needed : needed - gpuMb))
+    };
+
     return {
         verdict,
         label: VERDICTS[verdict],
         fits: verdict !== 'too_large',
         memoryNeededMb: needed,
+        place,
         tokensPerSecond: speedRange(verdict, entry)
     };
 };
@@ -824,9 +835,14 @@ export const fitPool = (entry, computers) => {
     // graphics memory, and an Apple chip's memory is its graphics memory, so neither adds system memory.
     const runner = computers.some((hardware) => hardware?.runs) ? computers.filter((hardware) => hardware?.runs) : computers;
     const spare = Math.max(0, ...runner.map((hardware) => ((Number(hardware?.gpuMemoryMb) || 0) > 0 && !hardware.gpuShared ? (Number(hardware.memoryMb) || 0) - RAM_RESERVE_MB : 0)));
-    const memoryMb = computers.reduce((sum, hardware) => sum + poolShareMb(hardware), 0) + spare;
+    const shared = computers.reduce((sum, hardware) => sum + poolShareMb(hardware), 0);
+    const memoryMb = shared + spare;
     const needed = memoryNeededMb(entry);
-    return { fits: needed <= memoryMb, memoryMb, memoryNeededMb: needed };
+    // Where it sits pooled: what the computers lend first, the rest in the primary computer's system memory.
+    const gpuMb = Math.min(needed, shared);
+    const lent = computers.reduce((sum, hardware) => sum + ((Number(hardware?.gpuMemoryMb) || 0) > 0 ? Number(hardware.gpuMemoryMb) : Number(hardware?.memoryMb) || 0), 0);
+    const place = needed > memoryMb ? null : { gpuMb, ramMb: needed - gpuMb, gpuLeftMb: lent - gpuMb, ramLeftMb: spare > 0 ? spare + RAM_RESERVE_MB - (needed - gpuMb) : null };
+    return { fits: needed <= memoryMb, memoryMb, memoryNeededMb: needed, place };
 };
 
 // Pooling: computers that can share one model are those on the same home network, found from what each desktop app
