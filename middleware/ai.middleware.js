@@ -1176,7 +1176,7 @@ let keepIdleMs = 10 * 60 * 1000;
 const KEEP_LIFE_SECONDS = 2 * 60 * 60;
 export const MAX_PROGRAM_SECONDS = 30 * 60;
 const keptSandboxes = new Map();
-const letSandboxGo = async (key) => {
+export const letSandboxGo = async (key) => {
     const held = keptSandboxes.get(key);
     if (!held) return;
     keptSandboxes.delete(key);

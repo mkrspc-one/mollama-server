@@ -12,7 +12,7 @@ import { hasRight, RIGHTS } from '../config/rights.js';
 import { SERVICE, Device, Setting, PersonalModel, Download, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, chatSchemas, ToolServer, Provider, Skill } from '../models/ai.model.js';
 import {
     OllamaError, mapOllamaError, UNREADABLE_CALL, memoryNeededMb, createOllamaClient, libraryModels, libraryEntries, loadLibrarySizes, librarySizes, friendlyName, cloudTitle, computerName, detectHardware, appleGpus, readDisk, rankCatalogue, fitModel, fitNotes, fitPool, poolShareMb, poolSplit, GPU_HEADROOM_MB, RAM_RESERVE_MB,
-    GenerationQueue, estimateTokens, extractText, createFilesClient, imageTypeOf, MAX_IMAGE_BYTES, MAX_CHAT_IMAGE_BYTES, runInSandbox, sandboxReady, poolGroups, MAX_PROGRAM_SECONDS, MAX_ATTACHMENT_BYTES, fetchRemote, MAX_REMOTE_BYTES,
+    GenerationQueue, estimateTokens, extractText, createFilesClient, imageTypeOf, MAX_IMAGE_BYTES, MAX_CHAT_IMAGE_BYTES, runInSandbox, letSandboxGo, sandboxReady, poolGroups, MAX_PROGRAM_SECONDS, MAX_ATTACHMENT_BYTES, fetchRemote, MAX_REMOTE_BYTES,
     searchReady, searchWeb, readPage, deviceGateway,
     CLOUD_PROVIDERS, PROVIDER_HEALTH, createCloudClient, ollamaOnlineNames, runsOnline,
     TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, toolKeyNeeded, listedTool, seal, unseal, accountKeeper, withToolServer, finishToolSignIn, readTools, toolFault, ToolSignInError
@@ -929,6 +929,7 @@ export const unlinkDevice = asyncHandler(async (req, res) => {
     if (!device || device.kind !== 'companion') {
         return res.status(404).json({ success: false, message: 'Device not found' });
     }
+    await endReplies(repliesOn(device.id));
     await Device.deleteOne({ _id: device._id });
     deviceGateway.disconnect(device.id);
     await syncPools(req.user.id);
@@ -1308,6 +1309,7 @@ deviceGateway.on('pool', async (deviceId) => {
 // Signing out of the desktop app takes that computer off the account.
 deviceGateway.on('goodbye', async (deviceId) => {
     try {
+        await endReplies(repliesOn(deviceId));
         const device = await Device.findOneAndDelete({ _id: deviceId, service: SERVICE, kind: 'companion' });
         if (device?.registeredBy) getNotificationService().sendToUser(String(device.registeredBy), { type: 'device:changed', data: { deviceId: String(deviceId), online: false } });
     } catch (error) {
@@ -1550,6 +1552,7 @@ export const showModel = asyncHandler(async (req, res) => {
 export const deleteModel = asyncHandler(async (req, res) => {
     const ollama = await getOllama();
     try {
+        await endReplies(repliesOn(currentTarget()?.id, req.body.name), { wait: 3000 });
         await ollama.remove(req.body.name);
     } catch (error) {
         return sendOllamaError(res, error);
@@ -1984,6 +1987,26 @@ export const queue = new GenerationQueue();
 const busyChats = new Set();
 const liveReplies = new Map();
 const queuedTurns = new Map();
+// The one way a reply is ended before it finishes. Stop, a chat being deleted, its computer or its model being
+// removed, and the server closing all come here, so none of them can leave a model working for nobody. With `wait`
+// it also gives the reply that long to save what it had written.
+const endReplies = async (chatIds, { restarting = false, wait = 0 } = {}) => {
+    const ids = [...chatIds].map(String);
+    let ended = 0;
+    for (const id of ids) {
+        queuedTurns.delete(id);
+        const live = liveReplies.get(id);
+        if (!live) continue;
+        if (restarting) live.restarting = true;
+        live.stopped = true;
+        live.stop?.();
+        ended += 1;
+    }
+    for (const until = Date.now() + wait; Date.now() < until && ids.some((id) => busyChats.has(id));) await new Promise((resolve) => setTimeout(resolve, 50));
+    return ended;
+};
+// The chats whose reply is being written on one computer, or by one model on it.
+const repliesOn = (targetId, model = null) => [...liveReplies].filter(([, live]) => String(live.target) === String(targetId) && (!model || live.model === model)).map(([id]) => id);
 const MAX_QUEUED_TURNS = 5;
 
 const applyQueueSettings = async () => {
@@ -3580,6 +3603,8 @@ export const updateChat = asyncHandler(async (req, res) => {
 export const deleteChat = asyncHandler(async (req, res) => {
     const chat = await findChat(req, res);
     if (!chat) return;
+    await endReplies([chat.id], { wait: 5000 });
+    await letSandboxGo(`${req.user.id}:${chat.id}`);
     await chat.deleteOne();
     logger.info('[Chat] Chat deleted', { chatId: chat.id, userId: req.user.id });
     res.status(200).json({ success: true, message: 'Chat deleted.' });
@@ -4126,12 +4151,7 @@ const foldMemory = async ({ chat, facts, ollama, settings, userId, now = false }
 let closing = false;
 export const stopReplies = async (ms = 8000) => {
     closing = true;
-    for (const live of liveReplies.values()) {
-        live.restarting = true;
-        live.stopped = true;
-        live.stop?.();
-    }
-    for (const until = Date.now() + ms; busyChats.size > 0 && Date.now() < until;) await new Promise((resolve) => setTimeout(resolve, 50));
+    await endReplies(new Set([...busyChats, ...liveReplies.keys()]), { restarting: true, wait: ms });
     closing = false;
 };
 // A reply whose server stopped without warning left only its draft: it becomes the reply, marked incomplete. A draft
@@ -4150,8 +4170,8 @@ export const recoverReplies = async (quietMs = 45000) => {
     return left.length;
 };
 
-const openLive = (id) => {
-    const live = { events: [], listeners: new Set(), stop: null, stopped: false, seq: 0 };
+const openLive = (id, model = null) => {
+    const live = { events: [], listeners: new Set(), stop: null, stopped: false, seq: 0, target: currentTarget()?.id ?? null, model };
     liveReplies.set(id, live);
     return live;
 };
@@ -4159,7 +4179,7 @@ const openLive = (id) => {
 const takeTurns = async (chat, body, userId, res) => {
     const id = chat.id;
     busyChats.add(id);
-    let turn = { chat, body, res, live: openLive(id) };
+    let turn = { chat, body, res, live: openLive(id, chat.model) };
     getNotificationService().notify(userId, 'activity:changed');
     try {
         while (turn) {
@@ -4176,8 +4196,9 @@ const takeTurns = async (chat, body, userId, res) => {
             getNotificationService().sendToUser(String(userId), { type: 'chat:changed', data: { id, removed: false } });
             const content = closing ? undefined : queuedTurns.get(id)?.shift();
             if (content === undefined) break;
-            const live = openLive(id);
             const next = await Chat.findOne({ _id: id, service: SERVICE, owner: userId }).catch(() => null);
+            if (!next) break;
+            const live = openLive(id, next.model);
             turn = { chat: next, body: { content }, res: null, live };
         }
     } finally {
@@ -4266,13 +4287,8 @@ export const rejoinReply = asyncHandler(async (req, res) => {
 export const stopReply = asyncHandler(async (req, res) => {
     const chat = await findChat(req, res);
     if (!chat) return;
-    const live = liveReplies.get(chat.id);
-    queuedTurns.delete(chat.id);
-    if (live) {
-        live.stopped = true;
-        live.stop?.();
-    }
-    res.status(200).json({ success: true, stopped: Boolean(live) });
+    const ended = await endReplies([chat.id]);
+    res.status(200).json({ success: true, stopped: ended > 0 });
 });
 
 export const loadModel = asyncHandler(async (req, res) => {
