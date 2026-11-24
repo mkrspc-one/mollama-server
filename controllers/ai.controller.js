@@ -2573,6 +2573,31 @@ const SKILL_STEP = 'Skill';
 // A skill that would take more than a sixth of what the model can read is opened in parts, word for word: its start and
 // the first sections that fit, then the rest by their headings, each opened when it is needed. A model with a large
 // room is given every skill whole.
+// The page a skill says to read before anything is built with it, given with the skill when it fits: a small model opens
+// the skill and goes straight to building. One too long for the room is named instead.
+const FIRST_PAGES = {
+    'hairline-hairline-create': [{ file: 'kernel.js', until: 'var HL' }],
+    'cadsmith-make-model': [{ file: 'references/build123d-guide.md' }],
+    'cadsmith-make-mechanism': [{ file: 'references/mech-api.md' }],
+    'anatomy-anatomy': [{ file: 'examples/dial-indicator/build.mjs' }]
+};
+const firstPages = (skill, capacity, kept) => {
+    const lines = [];
+    for (const { file, until } of FIRST_PAGES[skill.id] || []) {
+        const key = `file:${skill.id}/${file}`;
+        const whole = skillFileText(skill, file);
+        if (!whole || kept?.has(key)) continue;
+        const end = until ? whole.indexOf(until) : -1;
+        const text = (end > 0 ? whole.slice(0, end) : whole).trim();
+        if (estimateTokens(text) > skillRoom(capacity)) {
+            lines.push(`${file} (about ${estimateTokens(text).toLocaleString('en-GB')} tokens): read it with open_skill_file before you build.`);
+            continue;
+        }
+        kept?.set(key, true);
+        lines.push(`${file}:\n\n${text}`);
+    }
+    return lines.length > 0 ? `\n\nREAD BEFORE YOU BUILD\n${lines.join('\n\n')}` : '';
+};
 const skillRoom = (capacity) => Math.max(1500, Math.floor(capacity / 6));
 export const skillParts = (text) => {
     const parts = [];
@@ -2654,13 +2679,13 @@ const openSkillTool = (listed, others = [], capacity = Infinity) => {
                 parameters: { type: 'object', properties: { skill: { type: 'string', enum: listed.map((skill) => skill.name), description: 'The name of the skill to open' }, part: { type: 'string', description: 'Only for a long skill you have opened: the number of one of its parts' } }, required: ['skill'] }
             }
         },
-        run: async (input) => {
+        run: async (input, { kept } = {}) => {
             const skill = find(input);
             if (skill && isLong(skill, capacity)) {
                 const answer = skillInParts(skill, capacity, input?.part);
-                return String(input?.part ?? '').trim() ? answer : { ...answer, content: `${answer.content}${companionsOf(skill, others)}` };
+                return String(input?.part ?? '').trim() ? answer : { ...answer, content: `${answer.content}${firstPages(skill, capacity, kept)}${companionsOf(skill, others)}` };
             }
-            return skill ? { content: `${skill.text}${companionsOf(skill, others)}` } : { content: `There is no skill by that name in this chat. The skills are: ${listed.map((one) => one.name).join(', ')}.`, failed: 'failed' };
+            return skill ? { content: `${skill.text}${firstPages(skill, capacity, kept)}${companionsOf(skill, others)}` } : { content: `There is no skill by that name in this chat. The skills are: ${listed.map((one) => one.name).join(', ')}.`, failed: 'failed' };
         }
     };
 };
@@ -2758,17 +2783,17 @@ const saveToFilesTool = () => ({
     fn: 'save_to_files',
     label: SAVE_STEP,
     doing: 'Saving to your files…',
-    changes: true,
+    changes: false,
     shown: (input) => clip(`${inHome(input?.folder)}/${String(input?.name ?? '')}`, 160),
     definition: {
         type: 'function',
         function: {
             name: 'save_to_files',
-            description: "Save a file to the user's FilesystemOne: a page, a figure, a diagram's text, a table as CSV, code or notes you made (give content), or a picture, video or document you found on the web (give address). The user is asked first. A name already taken in that folder is not overwritten; the file is given a new name.",
+            description: "Save a file to the user's FilesystemOne: a page, a figure, a diagram's text, a table as CSV, code or notes you made (give content), or a picture, video or document you found on the web (give address). The user is asked whether to save it, without holding you up. A name already taken in that folder is not overwritten; the file is given a new name.",
             parameters: { type: 'object', properties: { folder: { type: 'string', description: "The folder, such as /Drawings. It is put inside the user's own folder; the result says the full path to tell them." }, name: { type: 'string', description: 'The file name with its extension, such as engine.html' }, content: { type: 'string', description: 'The whole text of the file, when you made it' }, address: { type: 'string', description: 'The https address of a file on the web, when you found it' } }, required: ['folder', 'name'] }
         }
     },
-    run: async (input) => {
+    run: async (input, context = {}) => {
         const name = String(input?.name ?? '').trim();
         const content = typeof input?.content === 'string' ? input.content : '';
         const address = String(input?.address ?? '').trim();
@@ -2777,6 +2802,11 @@ const saveToFilesTool = () => ({
         const folder = inHome(input.folder);
         const files = personFiles();
         try {
+            if (context.offer && !(context.chat?.allowedTools || []).includes('save_to_files')) {
+                const made = [{ path: name, buffer: address ? await readAddress(address) : Buffer.from(content) }];
+                await saveOrOffer({ fn: 'save_to_files', folder, made, context });
+                return { content: `${folder}/${name} is ready. The user is being asked whether to save it; you need not wait. Go on, and do not say it is saved.` };
+            }
             if (address) {
                 await files.upload(folder, [{ path: name, buffer: await readAddress(address) }]);
                 return { content: `Saved the file from ${clip(address, 200)} to ${folder}/${name}. If that name was taken, it was given a new one.` };
@@ -3108,34 +3138,29 @@ const hairlineFaults = (() => {
         return out;
     };
 })();
+const CHANGES = { type: 'array', items: { type: 'object', properties: { find: { type: 'string', description: 'Text in it, copied exactly, that occurs once' }, replace: { type: 'string', description: 'What takes its place' } }, required: ['find', 'replace'] }, description: 'The pieces to replace, in order' };
 const SKILL_FUNCTIONS = {
     'hairline-hairline-create': [{
         name: 'hairline_build',
         label: 'Hairline build',
         doing: 'Building the figure…',
-        description: 'Does what `node build.mjs <name>.js` and `node validate.mjs` do in the Hairline skill, without Node: makes the checks validate.mjs makes on your figure and returns what it would print, then puts the figure on the bench (bench.html with kernel.js and the figure in their two slots, nothing else changed) and shows the finished page to the user in the chat. Give the whole figure file. When it returns things to fix, fix them in the figure and call it again. Use this instead of asking the user to run anything. The look (look.mjs) needs a browser, which you do not have here: when you are done, say in one sentence that you have not seen the figure drawn.',
+        description: 'Does what `node build.mjs <name>.js` and `node validate.mjs` do in the Hairline skill, without Node: makes the checks validate.mjs makes on your figure and returns what it would print, then puts the figure on the bench (bench.html with kernel.js and the figure in their two slots, nothing else changed) and shows the finished page to the user in the chat. Give the whole figure file. When it returns things to fix, mend them with hairline_change. Use this instead of asking the user to run anything. The look (look.mjs) needs a browser, which you do not have here: when you are done, say in one sentence that you have not seen the figure drawn.',
         parameters: { type: 'object', properties: { code: { type: 'string', description: 'The whole figure file as you would save it in <name>.js, ending with its hairline({ ... }) call' } }, required: ['code'] },
-        run: async (input, { show, kept }) => {
-            const code = String(input?.code ?? '').replace(/\r\n/g, '\n').trim();
-            const call = [...code.matchAll(/\bhairline\s*\(\s*\{/g)].at(-1);
-            if (!call) return { content: 'Nothing was built. A figure file ends with hairline({ name, means, rules, range, tour, mount }).', failed: 'failed' };
-            if (code.includes('```')) return { content: 'Nothing was built. The figure must not contain three backticks in a row.', failed: 'failed' };
-            const name = /\bname:\s*["'`]([a-z][a-z0-9-]*)["'`]/.exec(code.slice(call.index))?.[1] || 'figure';
-            // A figure with something to fix is sent back once before it is shown, as the skill has it fixed before the
-            // look. A second build is shown whatever is left, so the person is never left with nothing.
-            const faults = await hairlineChecks(code);
-            const before = kept?.get('hairline_build') || 0;
-            kept?.set('hairline_build', before + 1);
-            const block = ['```component', `<Frame template="hairline-hairline-create/bench.html" height="640px" title="Hairline ${name}" palette="ground:background, ink:text, muted:text 65%, line:border, hairline-plate:background, hairline-hi:text, hairline-edge:text 55%, hairline-mid:text 32%, hairline-lo:border">`, '<Part name="KERNEL" file="hairline-hairline-create/kernel.js" />', '<Part name="FIGURE">', code, '</Part>', '</Frame>', '```'].join('\n');
-            if (faults.length > 0 && before === 0) {
-                kept?.set('unshown', block);
-                return { content: [`Not shown yet. validate found ${faults.length} to fix in hairline-${name}.html:`, ...faults, 'Fix these in the figure and call hairline_build again with the whole file.'].join('\n'), failed: 'failed' };
-            }
-            kept?.delete('unshown');
-            show(block);
-            return { content: faults.length > 0
-                ? [`Built hairline-${name}.html and showed it to the user in the chat, with ${faults.length} still to fix:`, ...faults, 'Tell the user what is still wrong. You cannot see the page from here.'].join('\n')
-                : `Built hairline-${name}.html and showed it to the user in the chat. validate: ok, the figure passes the static checks. You cannot see the page from here, so the look has not been done.` };
+        run: async (input, context) => buildFigure(String(input?.code ?? ''), context)
+    }, {
+        name: 'hairline_change',
+        label: 'Hairline build',
+        doing: 'Mending the figure…',
+        description: 'Changes the last figure given to hairline_build in this chat, then checks and shows it as hairline_build does. Use it to mend or improve a figure instead of sending the whole of it again: give only the pieces that change.',
+        parameters: { type: 'object', properties: { change: CHANGES, show: { type: 'string', description: 'Lines of the figure to read, such as 40-80. Nothing is built.' } } },
+        run: async (input, context) => {
+            const key = programKey(context.userId, context.chat);
+            const code = chatFigures.get(key);
+            if (!code) return { content: 'There is no figure in this chat to change. Build one with hairline_build.', failed: 'failed' };
+            if (String(input?.show ?? '').trim()) return { content: shownLines(code, input.show) };
+            const edited = applyChanges(code, input?.change);
+            if (edited.problem) return { content: `Nothing was changed or built. ${edited.problem}`, failed: 'failed' };
+            return buildFigure(edited.code, context);
         }
     }],
     'explainer-visual-explainer': [{
@@ -3167,7 +3192,7 @@ const SKILL_FUNCTIONS = {
             const before = kept?.get('visual_explainer_render') || 0;
             kept?.set('visual_explainer_render', before + 1);
             if (problems && before === 0) return { content: `Not shown yet. The render found something to fix:\n${clip(report, 4000)}\nFix these and call visual_explainer_render again with the whole page.`, failed: 'failed' };
-            show(explainerBlock(built.buffer.toString('utf8'), title));
+            show(explainerBlock(built.buffer.toString('utf8'), title), `Visual explainer ${title}`);
             return { content: `Rendered and showed "${title}" to the user in the chat, in the app's theme.${problems ? ' Still to fix:' : ' Report:'}\n${clip(report, 3000)}\nYou cannot see the page from here.` };
         }
     }]
@@ -3176,26 +3201,131 @@ const SKILL_FUNCTIONS = {
 // the skill writes them: build.mjs puts the figure on the bench and validate.mjs checks that page. A figure should not
 // wait long on a sandbox starting, so when sandboxes are not set up, the job takes longer than HAIRLINE_WAIT or it fails,
 // the checks kept here (hairlineFaults) are made instead.
-const HAIRLINE_WAIT = 30000;
-const HAIRLINE_JOB = 'node /root/skills/hairline-create/build.mjs figure.js page.html >/dev/null 2>&1 || exit 3\nnode /root/skills/hairline-create/validate.mjs page.html';
+const HAIRLINE_WAIT = 75000;
+// A figure that passes the checks may still not run, so the page is opened in the sandbox's browser as well: errors are
+// collected while the pointer is taken across the stage and the slider is moved, and what was drawn is counted.
+export const FIGURE_PROBE = String.raw`
+const errors = [];
+const say = (text) => { const line = String(text || '').split('\n')[0].slice(0, 200); if (line && !errors.includes(line)) errors.push(line); };
+addEventListener('error', (event) => say(event.message));
+addEventListener('unhandledrejection', (event) => say(event.reason && event.reason.message || event.reason));
+addEventListener('load', async () => {
+  const wait = (ms) => new Promise((done) => setTimeout(done, ms));
+  await wait(900);
+  const stage = document.getElementById('stage');
+  const shapes = [...stage.querySelectorAll('path,circle,ellipse,line,rect,polygon,polyline')];
+  const drawn = shapes.filter((one) => one.tagName !== 'path' || (one.getAttribute('d') || '').length > 4).length;
+  const bad = /NaN|undefined|Infinity/.test(stage.innerHTML.replace(/aria-[a-z]+="[^"]*"/g, ''));
+  const box = stage.getBoundingClientRect();
+  for (let y = 1; y < 8; y += 1) {
+    for (let x = 1; x < 8; x += 1) {
+      const target = stage.querySelector('svg') || stage;
+      target.dispatchEvent(new PointerEvent('pointermove', { pointerType: 'mouse', pointerId: 1, bubbles: true, clientX: box.left + box.width * x / 8, clientY: box.top + box.height * y / 8 }));
+    }
+    await wait(60);
+  }
+  stage.dispatchEvent(new PointerEvent('pointerleave', { pointerType: 'mouse', pointerId: 1, bubbles: true }));
+  await wait(900);
+  const slider = document.getElementById('intensity');
+  slider.value = '1';
+  slider.dispatchEvent(new Event('input', { bubbles: true }));
+  await wait(900);
+  const shown = document.getElementById('error');
+  if (shown && !shown.hidden) say(shown.textContent);
+  const out = document.createElement('pre');
+  out.id = 'figure-probe';
+  out.textContent = JSON.stringify({ errors: errors.slice(0, 4), drawn, bad });
+  document.body.append(out);
+});
+`;
+const HAIRLINE_JOB = String.raw`node /root/skills/hairline-create/build.mjs figure.js page.html >/dev/null 2>&1 || exit 3
+node /root/skills/hairline-create/validate.mjs page.html
+said=$?
+node -e 'const fs=require("fs");const p=fs.readFileSync("page.html","utf8");fs.writeFileSync("check.html",p.replace("<script id=\"hl-kernel\">",()=>"<script>"+fs.readFileSync("probe.js","utf8")+"</script><script id=\"hl-kernel\">"))'
+timeout 40 chromium --headless --no-sandbox --disable-gpu --window-size=900,900 --virtual-time-budget=9000 --dump-dom "file://$PWD/check.html" 2>/dev/null | node -e 'let t="";process.stdin.on("data",(d)=>t+=d).on("end",()=>{const m=t.match(/<pre id="figure-probe">([^<]*)<\/pre>/);console.log("PROBE "+(m?m[1].replace(/&quot;/g,"\"").replace(/&lt;/g,"<").replace(/&gt;/g,">").replace(/&amp;/g,"&"):"none"))})'
+rm -f probe.js check.html page.html
+exit $said`;
+// What the browser found wrong, in the words the model is told.
+export const probeFaults = (probe) => {
+    if (!probe) return [];
+    if (probe.errors?.length > 0) return [`run: the figure fails when it is opened in a browser: ${probe.errors.join('; ')}`];
+    if (probe.drawn < 3) return ['run: the figure draws nothing on the stage when it is opened in a browser.'];
+    return probe.bad ? ['run: something is drawn at NaN, undefined or Infinity.'] : [];
+};
+const cannotShow = (faults) => faults.some((fault) => /^run: the figure (fails|draws nothing)/.test(fault));
 let hairlineWait = HAIRLINE_WAIT;
 export const setHairlineWait = (ms) => {
     hairlineWait = ms ?? HAIRLINE_WAIT;
 };
 const hairlineChecks = async (code) => {
-    if (!sandboxReady()) return hairlineFaults(code);
+    const local = () => ({ faults: hairlineFaults(code), ran: false });
+    if (!sandboxReady()) return local();
     try {
-        const job = runInSandbox({ language: 'bash', seconds: 60, files: [{ path: 'figure.js', buffer: Buffer.from(`${code}\n`) }], code: HAIRLINE_JOB });
+        const job = runInSandbox({ language: 'bash', seconds: 90, files: [{ path: 'figure.js', buffer: Buffer.from(`${code}\n`) }, { path: 'probe.js', buffer: Buffer.from(FIGURE_PROBE) }], code: HAIRLINE_JOB });
         job.catch(() => {});
         const checked = await Promise.race([job, new Promise((resolve) => { setTimeout(() => resolve(null), hairlineWait).unref?.(); })]);
-        if (!checked || checked.timedOut || ![0, 1].includes(checked.exitCode)) return hairlineFaults(code);
+        if (!checked || checked.timedOut || ![0, 1].includes(checked.exitCode)) return local();
         // It prints one line for each thing to fix and then a count, as errors, or a single line starting "ok".
-        if (checked.exitCode === 0) return [];
-        const said = `${checked.stderr || ''}\n${checked.stdout || ''}`.split('\n').map((line) => line.trim()).filter((line) => line && !/^\d+ to fix in /.test(line));
-        return said.length > 0 ? said : hairlineFaults(code);
+        const lines = `${checked.stderr || ''}\n${checked.stdout || ''}`.split('\n').map((line) => line.trim()).filter(Boolean);
+        let probe = null;
+        try {
+            probe = JSON.parse(lines.find((line) => line.startsWith('PROBE {'))?.slice(6) || 'null');
+        } catch {
+            probe = null;
+        }
+        const said = lines.filter((line) => !line.startsWith('PROBE ') && !/^\d+ to fix in /.test(line));
+        if (checked.exitCode === 1 && said.length === 0) return local();
+        return { faults: [...probeFaults(probe), ...(checked.exitCode === 0 ? [] : said)], ran: Boolean(probe) };
     } catch {
-        return hairlineFaults(code);
+        return local();
     }
+};
+
+// The last figure of each chat, so it is mended without being written again.
+const chatFigures = new Map();
+const keepFigure = (userId, chat, code) => {
+    const key = programKey(userId, chat);
+    chatFigures.delete(key);
+    chatFigures.set(key, code);
+    if (chatFigures.size > MAX_KEPT_PROGRAMS) chatFigures.delete(chatFigures.keys().next().value);
+};
+// What a figure may call, for a model that got its figure wrong without having read it.
+const kernelIndex = (kept) => {
+    if (kept?.has('file:hairline-hairline-create/kernel.js')) return '';
+    const text = skillFileText(SKILL_BY_ID.get('hairline-hairline-create'), 'kernel.js') || '';
+    const end = text.indexOf('var HL');
+    if (end < 0) return '';
+    kept?.set('file:hairline-hairline-create/kernel.js', true);
+    return `\n\nWhat a figure may call, from kernel.js (nothing else exists):\n${text.slice(0, end).trim()}`;
+};
+const buildFigure = async (given, { show, kept, chat, userId }) => {
+    const code = given.replace(/\r\n/g, '\n').trim();
+    const call = [...code.matchAll(/\bhairline\s*\(\s*\{/g)].at(-1);
+    if (code.startsWith(PROGRAM_AWAY)) return { content: 'Nothing was built. Give the whole figure, or mend the last one with hairline_change.', failed: 'failed' };
+    if (!call) return { content: 'Nothing was built. A figure file ends with hairline({ name, means, rules, range, tour, mount }).', failed: 'failed' };
+    if (code.includes('```')) return { content: 'Nothing was built. The figure must not contain three backticks in a row.', failed: 'failed' };
+    if (code.length > MAX_PROGRAM_CHARS) return { content: 'Nothing was built. The figure is too long.', failed: 'failed' };
+    const name = /\bname:\s*["'`]([a-z][a-z0-9-]*)["'`]/.exec(code.slice(call.index))?.[1] || 'figure';
+    keepFigure(userId, chat, code);
+    // A figure with something to fix is sent back once before it is shown, as the skill has it fixed before the
+    // look. A second build is shown whatever is left, so the person is never left with nothing; one that does not run
+    // or draws nothing is never shown.
+    const { faults, ran } = await hairlineChecks(code);
+    const before = kept?.get('hairline_build') || 0;
+    kept?.set('hairline_build', before + 1);
+    const block = ['```component', `<Frame template="hairline-hairline-create/bench.html" height="640px" title="Hairline ${name}" palette="ground:background, ink:text, muted:text 65%, line:border, hairline-plate:background, hairline-hi:text, hairline-edge:text 55%, hairline-mid:text 32%, hairline-lo:border">`, '<Part name="KERNEL" file="hairline-hairline-create/kernel.js" />', '<Part name="FIGURE">', code, '</Part>', '</Frame>', '```'].join('\n');
+    const broken = cannotShow(faults);
+    const showing = `Hairline ${name}`;
+    if (faults.length > 0 && (before === 0 || broken)) {
+        kept?.set('unshown', broken ? { block: `_The figure “${name}” is not shown: it did not work when it was opened._`, key: showing } : { block, key: showing });
+        return { content: [`Not shown yet. ${faults.length} to fix in hairline-${name}.html:`, ...faults, `Mend these with hairline_change, sending only the lines that change.${kernelIndex(kept)}`].join('\n'), failed: 'failed' };
+    }
+    kept?.delete('unshown');
+    show(block, showing);
+    const seen = ran ? 'It was opened in a browser, the pointer and the slider were moved, and it ran without errors.' : 'It was not opened in a browser here.';
+    return { content: faults.length > 0
+        ? [`Built hairline-${name}.html and showed it to the user in the chat, with ${faults.length} still to fix:`, ...faults, `Tell the user what is still wrong, or mend it with hairline_change. You cannot see the page from here.${kernelIndex(kept)}`].join('\n')
+        : `Built hairline-${name}.html and showed it to the user in the chat. validate: ok, the figure passes the static checks. ${seen} You cannot see the page from here, so the look has not been done.` };
 };
 
 // A built Visual Explainer page holds the kit's styles and scripts word for word. In the reply they are named, as Parts
@@ -3255,6 +3385,57 @@ const readPersonFiles = async (files, paths) => {
     return read;
 };
 // What a script or program made is saved beside the person's files, never over one of them.
+// Files a model made and wants saved wait here for the person, who is asked without the reply being held up. They are
+// kept in memory for two hours, up to SAVES_BYTES in all.
+const SAVES_MS = 2 * 60 * 60 * 1000;
+const SAVES_BYTES = 300 * 1024 * 1024;
+const pendingSaves = new Map();
+const tidySaves = () => {
+    for (const [id, one] of pendingSaves) if (Date.now() - one.at > SAVES_MS) pendingSaves.delete(id);
+    let bytes = [...pendingSaves.values()].reduce((sum, one) => sum + one.bytes, 0);
+    for (const [id, one] of pendingSaves) {
+        if (bytes <= SAVES_BYTES) break;
+        bytes -= one.bytes;
+        pendingSaves.delete(id);
+    }
+};
+// What has the person's word already in this chat is saved at once; the rest is offered to them on the step.
+const saveOrOffer = async ({ fn, folder, made, context }) => {
+    const { chat, userId, offer } = context;
+    if (made.length === 0) return '';
+    if (!folder || !chat || !offer || (chat.allowedTools || []).includes(fn)) return savePersonFiles(personFiles(), folder, made);
+    const id = crypto.randomBytes(8).toString('hex');
+    const save = { id, folder, names: made.map((file) => file.path).slice(0, 40), state: 'waiting' };
+    pendingSaves.set(id, { userId: String(userId), chatId: String(chat.id), chat, fn, folder, files: made, at: Date.now(), bytes: made.reduce((sum, file) => sum + file.buffer.length, 0), step: offer(save) });
+    tidySaves();
+    return `It made ${made.map((file) => file.path).join(', ')}. The user is being asked whether to save them in ${folder}; you need not wait. Go on, and do not say they are saved.`;
+};
+export const answerSave = asyncHandler(async (req, res) => {
+    const chat = await Chat.exists({ _id: req.params.id, service: SERVICE, owner: req.user.id });
+    const held = pendingSaves.get(req.params.saveId);
+    if (!chat || !held || held.chatId !== req.params.id || held.userId !== String(req.user.id)) return res.status(404).json({ success: false, message: 'These files are no longer kept. Ask for them again.' });
+    const { answer } = req.body;
+    let message = 'Not saved.';
+    if (answer !== 'no') {
+        try {
+            await createFilesClient({ baseUrl: process.env.FILESYSTEM_ONE_URL, accessToken: req.cookies?.accessToken }).upload(held.folder, held.files);
+        } catch (error) {
+            return sendOllamaError(res, error instanceof OllamaError ? error : new OllamaError('FILE_NOT_SAVED', error.message));
+        }
+        message = `Saved in ${held.folder}.`;
+    }
+    const state = answer === 'no' ? 'dropped' : 'saved';
+    pendingSaves.delete(req.params.saveId);
+    if (held.step?.save) held.step.save.state = state;
+    const allow = answer === 'always' ? (PROGRAM_CALLS.has(held.fn) ? [...PROGRAM_CALLS] : [held.fn]) : [];
+    if (allow.length > 0) held.chat.allowedTools = [...new Set([...(held.chat.allowedTools || []), ...allow])];
+    await Chat.updateOne({ _id: req.params.id }, {
+        $set: { 'messages.$[message].steps.$[step].save.state': state },
+        ...(allow.length > 0 ? { $addToSet: { allowedTools: { $each: allow } } } : {})
+    }, { arrayFilters: [{ 'message.steps.save.id': req.params.saveId }, { 'step.save.id': req.params.saveId }] });
+    getNotificationService().sendToUser(String(req.user.id), { type: 'chat:changed', data: { id: req.params.id, removed: false } });
+    res.status(200).json({ success: true, state, message });
+});
 const savePersonFiles = async (files, folder, made) => {
     if (made.length === 0) return '';
     const names = made.map((file) => file.path).join(', ');
@@ -3282,7 +3463,8 @@ const saveFolder = (input, paths) => {
     if (named) return inHome(named, paths);
     return paths[0] ? path.posix.dirname(paths[0]) : '';
 };
-const touchesFiles = (input) => (Array.isArray(input?.files) && input.files.some((one) => String(one).trim())) || Boolean(String(input?.save_to ?? '').trim());
+// Only reading the person's files needs their word before a program runs; what it makes is offered to them afterwards.
+const touchesFiles = (input) => Array.isArray(input?.files) && input.files.some((one) => String(one).trim());
 const filesParameter = { type: 'array', items: { type: 'string' }, description: 'FilesystemOne paths of the files it works on, such as /docs/report.docx' };
 const saveParameter = { type: 'string', description: 'The FilesystemOne folder for the files it makes. Left out, the folder of the first file.' };
 // A program the model writes, run in a sandbox: what most skills' commands come to, and what a skill that has the model
@@ -3296,7 +3478,7 @@ const programFunction = () => ({
     label: 'Program',
     doing: 'Running the program…',
     changes: touchesFiles,
-    description: `Runs a program you write in a computer of its own that has no network, and saves the files it makes to the user's FilesystemOne. It has Python 3 with python-docx, python-pptx, openpyxl, pandas, markitdown, pypdf, pdfplumber, pdf2image, pytesseract, reportlab and Pillow; Node with docx, pptxgenjs, react, react-dom, react-icons and sharp; and soffice (LibreOffice), chromium, pdftoppm, qpdf, pandoc and tesseract. A skill's own files are there: ${Object.entries(SANDBOX_SKILLS).map(([id, folder]) => `${SKILLS.find((skill) => skill.id === id)?.name || id} in /root/skills/${folder}`).join(', ')}. The program starts in an empty folder holding the files named in files, each under its own file name. Every file it makes or changes in that folder is saved to save_to, or beside the first file. The user is asked first only when it is given files or save_to; a program with neither, such as one that looks around or checks something, runs straight away. To see what you built, have the program take screenshots (chromium --headless --screenshot, or Playwright) and name them in look: they come back to you as pictures. The computer is kept for this chat between calls for ten minutes, so files a run leaves in its folder are there for the next run (you are told when a run had to start on a fresh one); only files made or changed in a run are saved or returned. A program runs for up to five minutes, or up to thirty when you set minutes.`,
+    description: `Runs a program you write in a computer of its own that has no network, and saves the files it makes to the user's FilesystemOne. It has Python 3 with python-docx, python-pptx, openpyxl, pandas, markitdown, pypdf, pdfplumber, pdf2image, pytesseract, reportlab and Pillow; Node with docx, pptxgenjs, react, react-dom, react-icons and sharp; and soffice (LibreOffice), chromium, pdftoppm, qpdf, pandoc and tesseract. A skill's own files are there: ${Object.entries(SANDBOX_SKILLS).map(([id, folder]) => `${SKILLS.find((skill) => skill.id === id)?.name || id} in /root/skills/${folder}`).join(', ')}. The program starts in an empty folder holding the files named in files, each under its own file name. Every file it makes or changes in that folder can be saved to save_to, or beside the first file. The user is asked first only when it is given files to read; what it makes is offered to the user to save, without holding you up. To see what you built, have the program take screenshots (chromium --headless --screenshot, or Playwright) and name them in look: they come back to you as pictures. The computer is kept for this chat between calls for ten minutes, so files a run leaves in its folder are there for the next run (you are told when a run had to start on a fresh one); only files made or changed in a run are saved or returned. A program runs for up to five minutes, or up to thirty when you set minutes.`,
     parameters: {
         type: 'object',
         properties: {
@@ -3310,7 +3492,7 @@ const programFunction = () => ({
         },
         required: ['language', 'code']
     },
-    run: async (input, { chat, userId, kept } = {}) => {
+    run: async (input, { chat, userId, kept, offer } = {}) => {
         const language = languageOf(input);
         const code = String(input?.code ?? '');
         if (!language) return { content: 'Nothing was run. Say what the program is written in: python, node or bash.', failed: 'failed' };
@@ -3318,7 +3500,7 @@ const programFunction = () => ({
         if (code.length > MAX_PROGRAM_CHARS) return { content: TOO_LONG, failed: 'failed' };
         keepProgram(userId, chat, { language, code });
         if (input?.unfinished === true) return { content: keptSoFar(code) };
-        return runProgram({ language, code, input, chat, userId, kept });
+        return runProgram({ fn: 'run_program', language, code, input, context: { chat, userId, kept, offer } });
     }
 });
 const keptSoFar = (code) => `Kept, not run yet. The program has ${linesOf(code).length} lines so far. Go on with add in change_program, and leave unfinished out with the last part.`;
@@ -3341,7 +3523,8 @@ const guideLine = (chat, code, errors, kept) => {
     })).filter((page) => page.score >= 5).sort((a, b) => b.score - a.score)[0];
     return found ? ` The skill ${found.skill.name} has a page on ${found.library} that you have not read in this reply: call open_skill_file with skill "${found.skill.id}" and file "${found.path}" before trying again.` : '';
 };
-const runProgram = async ({ language, code, input, chat, userId, kept }) => {
+const runProgram = async ({ fn, language, code, input, context }) => {
+    const { chat, userId, kept } = context;
     const minutes = Number.isFinite(Number(input?.minutes)) ? Math.min(Math.max(Math.round(Number(input.minutes)), 1), MAX_PROGRAM_SECONDS / 60) : 5;
     const paths = (Array.isArray(input?.files) ? input.files.map(String) : []).slice(0, 10);
     const folder = saveFolder(input, paths);
@@ -3361,7 +3544,8 @@ const runProgram = async ({ language, code, input, chat, userId, kept }) => {
     // Pictures named in look come back to the model to see; the rest is saved as usual.
     const look = (Array.isArray(input?.look) ? input.look.map((one) => String(one).trim().replace(/^\.?\//, '')) : []).filter(Boolean);
     const shots = (answer.files || []).filter((file) => look.includes(file.path) && LOOK_TYPES.test(file.path) && file.buffer.length <= MAX_LOOK_BYTES).slice(0, MAX_LOOKS);
-    const report = reportRun(`The ${language} program`, answer, await savePersonFiles(files, folder, (answer.files || []).filter((file) => !look.includes(file.path))));
+    const toSave = (answer.files || []).filter((file) => !look.includes(file.path));
+    const report = reportRun(`The ${language} program`, answer, await (paths.length > 0 ? savePersonFiles(files, folder, toSave) : saveOrOffer({ fn, folder, made: toSave, context })));
     if (answer.fresh) report.content = `This run started on a fresh computer: the files earlier runs left are gone.\n\n${report.content}`;
     if (report.failed && chat) report.content += `\n\nThe program is kept. To mend it, send only what changes with change_program.${guideLine(chat, code, answer.stderr, kept)}`;
     if (look.length === 0) return report;
@@ -3382,6 +3566,24 @@ const keepProgram = (userId, chat, program) => {
 };
 const linesOf = (code) => code.replace(/\n$/, '').split('\n');
 const SHOWN_LINES = 120;
+const shownLines = (code, wanted) => {
+    const lines = linesOf(code);
+    const [first, last = first] = String(wanted).match(/\d+/g)?.map(Number) || [1, SHOWN_LINES];
+    const from = Math.min(Math.max(first, 1), lines.length);
+    const to = Math.min(Math.max(last, from), from + SHOWN_LINES - 1, lines.length);
+    return `Lines ${from} to ${to} of ${lines.length}:\n${lines.slice(from - 1, to).join('\n')}`;
+};
+const applyChanges = (given, change) => {
+    let code = given;
+    const edits = (Array.isArray(change) ? change : change ? [change] : []).filter((one) => one && typeof one === 'object');
+    for (const [at, one] of edits.entries()) {
+        const find = String(one.find ?? '');
+        const times = find ? code.split(find).length - 1 : 0;
+        if (times !== 1) return { problem: times === 0 ? `The find text of change ${at + 1} is not in it. Copy it exactly; show returns its lines.` : `The find text of change ${at + 1} occurs ${times} times. Give more of the lines around it, so it occurs once.` };
+        code = code.replace(find, () => String(one.replace ?? ''));
+    }
+    return { code };
+};
 const changeFunction = () => ({
     name: 'change_program',
     label: 'Program',
@@ -3391,7 +3593,7 @@ const changeFunction = () => ({
     parameters: {
         type: 'object',
         properties: {
-            change: { type: 'array', items: { type: 'object', properties: { find: { type: 'string', description: 'Text in the program, copied exactly, that occurs once' }, replace: { type: 'string', description: 'What takes its place' } }, required: ['find', 'replace'] }, description: 'The pieces to replace, in order' },
+            change: CHANGES,
             add: { type: 'string', description: 'Text put after the last line of the program' },
             unfinished: { type: 'boolean', description: 'True when more is still to come, so the program is kept and not run yet' },
             show: { type: 'string', description: 'Lines to read, such as 150-190. Nothing is run.' },
@@ -3403,37 +3605,24 @@ const changeFunction = () => ({
             look: { type: 'array', items: { type: 'string' }, description: 'Pictures the program makes that you want to see, as in run_program' }
         }
     },
-    run: async (input, { chat, userId, kept } = {}) => {
+    run: async (input, { chat, userId, kept, offer } = {}) => {
         const wanted = (Array.isArray(input?.save) ? input.save : []).map((one) => String(one).trim().replace(/^(\.\/|\/root\/work\/)/, '')).filter((one) => one && !one.startsWith('/') && !one.split('/').includes('..')).slice(0, 40);
         if (wanted.length > 0) {
             const folder = String(input?.save_to ?? '').trim();
             if (!folder) return { content: 'Nothing was saved. Say which folder of the user\'s FilesystemOne in save_to.', failed: 'failed' };
             const taken = await takeFromSandbox(programKey(userId, chat), wanted);
             if (!taken) return { content: 'Nothing was saved: the computer those files were on is gone. Run the program again with save_to.', failed: 'failed' };
-            const saved = taken.files.length > 0 ? await savePersonFiles(personFiles(), inHome(folder), taken.files) : '';
+            const saved = await saveOrOffer({ fn: 'change_program', folder: inHome(folder), made: taken.files, context: { chat, userId, offer } });
             const lost = taken.missing.length > 0 ? `Not there: ${taken.missing.join(', ')}.` : '';
             return { content: [saved, lost].filter(Boolean).join(' '), ...(taken.files.length === 0 ? { failed: 'failed' } : {}) };
         }
         const program = chatPrograms.get(programKey(userId, chat));
         if (!program) return { content: 'There is no program in this chat to change. Write one with run_program.', failed: 'failed' };
         let { code } = program;
-        const lines = linesOf(code);
-        if (String(input?.show ?? '').trim()) {
-            const [first, last = first] = String(input.show).match(/\d+/g)?.map(Number) || [1, SHOWN_LINES];
-            const from = Math.min(Math.max(first, 1), lines.length);
-            const to = Math.min(Math.max(last, from), from + SHOWN_LINES - 1, lines.length);
-            return { content: `Lines ${from} to ${to} of ${lines.length}:\n${lines.slice(from - 1, to).join('\n')}` };
-        }
-        const edits = (Array.isArray(input?.change) ? input.change : input?.change ? [input.change] : []).filter((one) => one && typeof one === 'object');
-        for (const [at, one] of edits.entries()) {
-            const find = String(one.find ?? '');
-            const times = find ? code.split(find).length - 1 : 0;
-            if (times === 1) {
-                code = code.replace(find, () => String(one.replace ?? ''));
-                continue;
-            }
-            return { content: `Nothing was changed or run. ${times === 0 ? `The find text of change ${at + 1} is not in the program. Copy it exactly; show returns the program's lines.` : `The find text of change ${at + 1} occurs ${times} times. Give more of the lines around it, so it occurs once.`}`, failed: 'failed' };
-        }
+        if (String(input?.show ?? '').trim()) return { content: shownLines(code, input.show) };
+        const edited = applyChanges(code, input?.change);
+        if (edited.problem) return { content: `Nothing was changed or run. ${edited.problem}`, failed: 'failed' };
+        code = edited.code;
         const add = String(input?.add ?? '');
         if (add.trim()) code = `${code}${!code || code.endsWith('\n') ? '' : '\n'}${add}`;
         if (code.length > MAX_PROGRAM_CHARS) return { content: TOO_LONG, failed: 'failed' };
@@ -3442,7 +3631,7 @@ const changeFunction = () => ({
         if (input?.unfinished === true) return { content: keptSoFar(code) };
         if (!language) return { content: 'The change is kept, and nothing was run. Say what the program is written in: call change_program with language.', failed: 'failed' };
         if (!code.trim()) return { content: 'Nothing was run: the program is empty.', failed: 'failed' };
-        return runProgram({ language, code, input, chat, userId, kept });
+        return runProgram({ fn: 'change_program', language, code, input, context: { chat, userId, kept, offer } });
     }
 });
 // The text of one input of a call that was cut off before its end, as far as it got.
@@ -3457,6 +3646,7 @@ export const cutInput = (text, name) => {
     }
 };
 const PROGRAM_CALLS = new Set(['run_program', 'change_program']);
+const FIGURE_CALLS = new Set(['hairline_build', 'hairline_change']);
 // A call cut off before its end was not run. What there is of a program is kept, up to its last whole line, and the
 // model is told where to go on; any other call has to be written again, shorter.
 const keepCut = (cut, { chat, userId, ranOut }) => {
@@ -3977,7 +4167,7 @@ const presentMessage = (chat, message, index) => ({
     stats: message.stats?.evalCount ? message.stats : null,
     error: message.errorCode ? new OllamaError(message.errorCode, message.errorDetail).toJSON() : null,
     stopped: message.stopped,
-    steps: (message.steps || []).map((step) => ({ tool: step.tool, input: step.input, failed: step.failed || null, ...(step.sent ? { sent: step.sent } : {}), ...(step.answer != null ? { answer: step.answer } : {}) })),
+    steps: (message.steps || []).map((step) => ({ tool: step.tool, input: step.input, failed: step.failed || null, ...(step.sent ? { sent: step.sent } : {}), ...(step.save?.id ? { save: { id: step.save.id, folder: step.save.folder, names: step.save.names, state: step.save.state === 'waiting' && !pendingSaves.has(step.save.id) ? 'gone' : step.save.state } } : {}), ...(step.answer != null ? { answer: step.answer } : {}) })),
     unverified: message.unverified || [],
     attachments: message.attachmentIds.map((id) => chat.attachments.id(id)).filter(Boolean).map(presentAttachment),
     createdAt: message.createdAt
@@ -4130,6 +4320,8 @@ export const deleteChat = asyncHandler(async (req, res) => {
     await endReplies([chat.id], { wait: 5000 });
     await letSandboxGo(`${req.user.id}:${chat.id}`);
     chatPrograms.delete(programKey(req.user.id, chat));
+    chatFigures.delete(programKey(req.user.id, chat));
+    for (const [saveId, held] of pendingSaves) if (held.chatId === String(chat.id)) pendingSaves.delete(saveId);
     for (const [key, held] of lastContext) if (held.chat.id === chat.id) lastContext.delete(key);
     await chat.deleteOne();
     logger.info('[Chat] Chat deleted', { chatId: chat.id, userId: req.user.id });
@@ -4312,7 +4504,14 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
         };
         // Room is kept for the largest skill that may be opened, so opening one never overflows what the model can read.
         // A function may put something into the reply itself, such as a page it built for the person to see.
-        const show = (block) => {
+        // A newer version of the same thing takes the older one's place, so an answer never holds both.
+        const shown = new Map();
+        const show = (block, key = null) => {
+            if (key && shown.has(key) && reply.content.includes(shown.get(key))) {
+                reply.content = reply.content.replace(shown.get(key), () => '');
+                write({ type: 'replace', text: reply.content });
+            }
+            if (key) shown.set(key, block);
             const text = `${reply.content && !/\n\n$/.test(reply.content) ? '\n\n' : ''}${block}\n\n`;
             reply.content += text;
             write({ type: 'token', text });
@@ -4370,12 +4569,13 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
         const failures = new Map();
         // An earlier version of a program is no use once a later one has been sent: the last one stays as it was.
         const putProgramsAway = () => {
-            const sent = messages.flatMap((message) => message.tool_calls || []).filter((call) => PROGRAM_CALLS.has(call.function?.name));
-            for (const call of sent.slice(0, -1)) {
+            const calls = messages.flatMap((message) => message.tool_calls || []);
+            const earlier = [PROGRAM_CALLS, FIGURE_CALLS].flatMap((set) => calls.filter((call) => set.has(call.function?.name)).slice(0, -1));
+            for (const call of earlier) {
                 const given = toolArguments(call.function.arguments);
                 if (JSON.stringify(given).length < PUT_AWAY_MIN_CHARS) continue;
                 const size = JSON.stringify(given).length.toLocaleString('en-GB');
-                call.function = { name: call.function.name, arguments: call.function.name === 'run_program' ? { language: given.language || 'python', code: `${PROGRAM_AWAY}, ${size} characters, put away to save room. The newest version is kept for change_program.]` } : { add: `[An earlier change, ${size} characters, put away to save room.]` } };
+                call.function = { name: call.function.name, arguments: call.function.name === 'hairline_build' ? { code: `${PROGRAM_AWAY}, ${size} characters, put away to save room. The newest version is kept for hairline_change.]` } : call.function.name === 'run_program' ? { language: given.language || 'python', code: `${PROGRAM_AWAY}, ${size} characters, put away to save room. The newest version is kept for change_program.]` } : { add: `[An earlier change, ${size} characters, put away to save room.]` } };
             }
         };
         // A reply never sends more than the model can read: Ollama would drop the start of the conversation without
@@ -4619,7 +4819,7 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
                     const given = opener ? opener.slip(name) : toolArguments(call.function?.arguments);
                     const input = mine?.shown ? mine.shown(given) : mine ? clip(JSON.stringify(given), 500) : toolInput(name, call.function?.arguments);
                     const step = { tool: mine ? mine.label : name, input, failed: null };
-                    const sent = PROGRAM_CALLS.has(mine?.fn) ? sentText(given) : '';
+                    const sent = PROGRAM_CALLS.has(mine?.fn) || FIGURE_CALLS.has(mine?.fn) ? sentText(given) : '';
                     if (sent && sentRoom > 0) {
                         step.sent = clip(sent, Math.min(STEP_SENT_CHARS, sentRoom));
                         sentRoom -= step.sent.length;
@@ -4629,15 +4829,15 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
                     write({ type: 'tool', tool: step.tool, input, ...(step.sent ? { sent: step.sent } : {}) });
                     // The same call made again in a reply is not run again: the model is given what it got before, so a
                     // model that has lost its way is moved on instead of going round in circles.
-                    const same = `${mine ? mine.fn : name}\n${JSON.stringify(given ?? input)}${mine?.fn === 'change_program' ? `\n${chatPrograms.get(programKey(userId, chat))?.code ?? ''}` : ''}`;
+                    const same = `${mine ? mine.fn : name}\n${JSON.stringify(given ?? input)}${mine?.fn === 'change_program' ? `\n${chatPrograms.get(programKey(userId, chat))?.code ?? ''}` : mine?.fn === 'hairline_change' ? `\n${chatFigures.get(programKey(userId, chat)) ?? ''}` : ''}`;
                     if (PROGRAM_CALLS.has(mine?.fn)) programming = true;
                     const failedBefore = failures.get(same);
                     // Stop does not wait for a tool that is still running: a search, a page being read, a question to the person.
                     const outcome = results.has(same) && awayKeys.has(same) ? { content: results.get(same) } : results.has(same) ? { content: `You already called ${mine ? mine.fn : name} with the same input in this reply. What it gave you then is above and has not changed: use it and go on with your answer.\n\n${clip(results.get(same), 2000)}` } : failedBefore?.times >= 2 ? { content: `This exact call has failed ${failedBefore.times} times and was not run again: it would fail the same way. Do something different.\n\n${clip(failedBefore.content, 1500)}`, failed: 'failed' } : await Promise.race([
-                        mine ? runChatTool(mine, given, { chat, userId, write, stopped: () => gone, show, kept })
+                        mine ? runChatTool(mine, given, { chat, userId, write, stopped: () => gone, show, kept, offer: (save) => { step.save = save; write({ type: 'toolSave', save }); return step; } })
                             : offered.includes(name) ? runSearchTool(name, input)
                                 : { content: `There is no function called ${clip(name, 60)}. The functions you can call are: ${offered.join(', ')}.`, failed: 'failed' },
-                        stopSignal.then(() => ({ content: 'The reply was stopped.', failed: 'refused' }))
+                        stopSignal.then(() => ({ content: 'The reply was stopped.', failed: 'stopped' }))
                     ]);
                     if (outcome.failed) {
                         step.failed = outcome.failed;
@@ -4667,7 +4867,7 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
                 }
             }
             // Something a function held back for mending, and the model never came back to, is shown as it was.
-            if (kept.has('unshown') && !gone) show(kept.get('unshown'));
+            if (kept.has('unshown') && !gone) show(kept.get('unshown').block, kept.get('unshown').key);
         } catch (error) {
             if (gone) reply.stopped = true;
             else {
@@ -5508,7 +5708,8 @@ const sentText = (given) => [
     Array.isArray(given?.save) && given.save.length > 0 && `Save ${given.save.join(', ')} in ${given.save_to || 'no folder'}`
 ].filter(Boolean).join('\n\n');
 const TOOL_CALLS_AN_HOUR = 120;
-const PERMISSION_WAIT_MS = 3 * 60 * 1000;
+let permissionWaitMs = 3 * 60 * 1000;
+export const setPermissionWait = (ms) => { permissionWaitMs = ms ?? 3 * 60 * 1000; };
 
 const toolArguments = (raw) => {
     if (raw && typeof raw === 'object') return raw;
@@ -5632,11 +5833,11 @@ const underLimit = (userId) => {
     return window.count <= toolCallLimit;
 };
 
-// A tool that changes something waits here until the person allows or refuses it; no answer in time is a refusal.
+// A tool that changes something waits here until the person allows or refuses it. With no answer in time it is not run.
 const permissions = new Map();
 const askPermission = (chat, tool, input, write) => new Promise((resolve) => {
     const id = crypto.randomBytes(8).toString('hex');
-    const timer = setTimeout(() => settle('no'), PERMISSION_WAIT_MS);
+    const timer = setTimeout(() => settle('unanswered'), permissionWaitMs);
     timer.unref?.();
     const settle = (answer) => {
         clearTimeout(timer);
@@ -5644,7 +5845,7 @@ const askPermission = (chat, tool, input, write) => new Promise((resolve) => {
         resolve(answer);
     };
     permissions.set(id, { chatId: chat.id, settle });
-    write({ type: 'permission', id, tool: tool.label, input: clip(JSON.stringify(input), 500) });
+    write({ type: 'permission', id, tool: tool.label, input: clip(JSON.stringify(input), 500), asks: asksFor(tool, input), minutes: Math.round(permissionWaitMs / 60000) });
 });
 
 export const waitingPermissions = () => [...permissions.entries()].map(([id, waiting]) => ({ id, chatId: waiting.chatId }));
@@ -5657,17 +5858,34 @@ export const answerPermission = asyncHandler(async (req, res) => {
     res.status(200).json({ success: true });
 });
 
-const runChatTool = async (tool, input, { chat, userId, write, stopped, show, kept }) => {
+// What a tool needs the person's word for, in words that follow "may".
+const asksFor = (tool, input) => {
+    const files = (Array.isArray(input?.files) ? input.files : []).map(String).filter((one) => one.trim());
+    const folder = PROGRAM_CALLS.has(tool.fn) && files.length > 0 ? saveFolder(input, files) : '';
+    const parts = [files.length > 0 && `read ${clip(files.join(', '), 160)}`, folder && `save files in ${clip(folder, 120)}`].filter(Boolean);
+    return parts.length > 0 ? parts.join(' and ') : 'change things';
+};
+// Why a call was not run, first for the person, who reads that line on the step, then what the model can do about it.
+const notRun = (tool, input, answer) => {
+    const what = PROGRAM_CALLS.has(tool.fn) ? 'the program' : tool.label;
+    const minutes = Math.max(1, Math.round(permissionWaitMs / 60000));
+    const why = answer === 'unanswered' ? `there was no answer within ${minutes} ${minutes === 1 ? 'minute' : 'minutes'}` : 'Refuse was chosen';
+    const next = answer !== 'unanswered' ? 'Do not try another way to do the same thing; say that it was not done.'
+        : PROGRAM_CALLS.has(tool.fn) ? 'Nobody was there to answer. Run it again without files, which needs no permission, or go on without it and tell the user what was not done.'
+            : 'Nobody was there to answer. Go on without it, and tell the user what was not done so they can ask for it again.';
+    return { content: `Mollama did not run ${what}: it asked whether ${what} may ${asksFor(tool, input)}, and ${why}.\n\n${next}`, failed: answer === 'unanswered' ? 'unanswered' : 'declined' };
+};
+const runChatTool = async (tool, input, { chat, userId, write, stopped, show, kept, offer }) => {
     try {
         if (!underLimit(userId)) return { content: 'The limit on tool use for this hour has been reached. Answer without tools and say so.', failed: 'limited' };
         const changes = typeof tool.changes === 'function' ? tool.changes(input) : tool.changes;
         if (changes && !(chat.allowedTools || []).includes(tool.fn)) {
             const answer = await askPermission(chat, tool, input, write);
-            if (stopped()) return { content: 'The reply was stopped.', failed: 'refused' };
-            if (answer === 'no') return { content: 'The person did not allow this tool to run. Do not try another way to do the same thing; say that it was not done.', failed: 'refused' };
+            if (stopped()) return { content: 'The reply was stopped.', failed: 'stopped' };
+            if (answer === 'no' || answer === 'unanswered') return notRun(tool, input, answer);
             if (answer === 'always') chat.allowedTools = [...(chat.allowedTools || []), tool.fn];
         }
-        return await tool.run(input, { show, kept, chat, userId });
+        return await tool.run(input, { show, kept, chat, userId, offer });
     } catch (error) {
         const code = mapOllamaError(error).code;
         logger.warn('[Chat] Tool failed', { tool: tool.fn, code });

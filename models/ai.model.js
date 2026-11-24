@@ -254,7 +254,7 @@ const chatMessageSchema = new mongoose.Schema({
     errorCode: { type: String, default: null },
     errorDetail: { type: String, default: null },
     stopped: { type: Boolean, default: false },
-    steps: { type: [new mongoose.Schema({ tool: String, input: String, sent: String, failed: String, answer: String }, { _id: false })], default: [] },
+    steps: { type: [new mongoose.Schema({ tool: String, input: String, sent: String, failed: String, answer: String, save: { type: mongoose.Schema.Types.Mixed, default: undefined } }, { _id: false })], default: [] },
     unverified: { type: [String], default: [] },
     attachmentIds: { type: [mongoose.Schema.Types.ObjectId], default: [] }
 }, { timestamps: { createdAt: true, updatedAt: false } });
@@ -467,10 +467,12 @@ const chatFields = {
 
 export const chatSchemas = {
     chatId: Joi.object({ id: Joi.objectId().required() }),
+    saveId: Joi.object({ id: Joi.objectId().required(), saveId: Joi.string().pattern(/^[a-f0-9]{16}$/).required() }),
     attachmentId: Joi.object({ id: Joi.objectId().required(), attachmentId: Joi.objectId().required() }),
     list: Joi.object({ search: Joi.string().trim().max(100).allow('') }),
     create: Joi.object(chatFields),
     update: Joi.object(chatFields).min(1),
+    saveAnswer: Joi.object({ answer: Joi.string().valid('save', 'always', 'no').required() }),
     permission: Joi.object({ id: Joi.string().pattern(/^[a-z0-9]{6,40}$/).required(), answer: Joi.string().valid('once', 'always', 'no').required() }),
     send: Joi.object({
         content: Joi.string().min(1).max(100000),

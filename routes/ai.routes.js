@@ -45,6 +45,7 @@ router.validRoutes = [
     '/api/v1/chats/:id',
     '/api/v1/chats/:id/messages',
     '/api/v1/chats/:id/permission',
+    '/api/v1/chats/:id/saves/:saveId',
     '/api/v1/chats/:id/reply',
     '/api/v1/chats/:id/live',
     '/api/v1/chats/:id/stop',
@@ -136,6 +137,7 @@ router.patch('/chats/:id', ...signedIn, withChatId, validateRequest(chatSchemas.
 router.delete('/chats/:id', ...signedIn, withChatId, aiController.deleteChat);
 router.post('/chats/:id/messages', ...signedIn, withChatId, validateRequest(chatSchemas.send), aiController.sendMessage);
 router.post('/chats/:id/permission', ...signedIn, withChatId, validateRequest(chatSchemas.permission), aiController.answerPermission);
+router.post('/chats/:id/saves/:saveId', ...signedIn, validateRequest(chatSchemas.saveId, 'params'), validateRequest(chatSchemas.saveAnswer), aiController.answerSave);
 router.get('/chats/:id/reply', ...signedIn, withChatId, aiController.rejoinReply);
 router.get('/chats/:id/live', ...signedIn, withChatId, aiController.liveReply);
 router.post('/chats/:id/stop', ...signedIn, withChatId, aiController.stopReply);
