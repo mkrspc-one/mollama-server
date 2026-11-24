@@ -12,6 +12,8 @@ https://github.com/anthropics/skills
 
 The files of each skill's folder are included, copied unchanged at commit e4bb5d960d87.
 
+The Algorithmic Art page uses p5.js 1.7.0 (https://p5js.org, LGPL-2.1), which the web app holds unchanged as an npm package and puts into the page when it is shown.
+
 ## mattpocock/skills
 
 https://github.com/mattpocock/skills

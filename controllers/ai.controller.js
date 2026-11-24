@@ -3,6 +3,7 @@ import os from 'node:os';
 import crypto from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import path from 'node:path';
+import vm from 'node:vm';
 import { EventEmitter } from 'node:events';
 import express from 'express';
 import mongoose from 'mongoose';
@@ -2334,13 +2335,14 @@ const capacityFor = (chat, facts) => {
     return facts.online ? facts.contextLength : Math.min(facts.contextLength, AUTO_CONTEXT_LIMIT);
 };
 
-// What the models are told lives in server/instructions, and all of it is skills a chat turns on or off: skills/ holds
-// Mollama's own, the one that makes its viewers work and the map of what each skill is for, and library/ holds skills from other projects, one
-// folder per project. Nothing else is sent: no base instructions, no tool rules, no search rules. Credits and licences
-// are in THIRD_PARTY.md.
-const INSTRUCTIONS = path.join(import.meta.dirname, '..', 'instructions');
+// What the models are told lives in server/instructions/library, and all of it is skills a chat turns on or off: one
+// folder for each project skills come from, and one for each of Mollama's own two (OWN_FOLDERS), components, which makes
+// its viewers work, and skill-map, the map of what each skill is for. Nothing else is sent: no base instructions, no tool
+// rules, no search rules. Credits and licences are in THIRD_PARTY.md.
+const LIBRARY = path.join(import.meta.dirname, '..', 'instructions', 'library');
+const OWN_FOLDERS = ['components', 'skill-map'];
 const readGuide = (file) => {
-    const text = fs.readFileSync(path.join(INSTRUCTIONS, file), 'utf8').replace(/\r\n/g, '\n');
+    const text = fs.readFileSync(path.join(LIBRARY, file), 'utf8').replace(/\r\n/g, '\n');
     const head = text.match(/^---\n([\s\S]*?)\n---\n/);
     const facts = Object.fromEntries((head?.[1] || '').split('\n').map((line) => line.match(/^(\w+):\s*(.*)$/)).filter(Boolean).map((match) => [match[1], match[2].trim()]));
     const parts = `\n${text.slice(head?.[0].length || 0)}`.split(/\n=== ([A-Z ]+) ===\n/);
@@ -2364,14 +2366,16 @@ const skillFilesIn = (folder, base = '') => (fs.existsSync(folder) ? fs.readdirS
     if (entry.isDirectory()) return skillFilesIn(path.join(folder, entry.name), `${base}${entry.name}/`);
     return SKILL_FILE_TYPES.test(entry.name) ? [{ path: `${base}${entry.name}`, bytes: fs.statSync(path.join(folder, entry.name)).size }] : [];
 }) : []);
-const OWN_SKILLS = fs.readdirSync(path.join(INSTRUCTIONS, 'skills')).filter((file) => file.endsWith('.md')).map((file) => {
-    const guide = readGuide(path.join('skills', file));
-    const folder = path.join(INSTRUCTIONS, 'skills', file.slice(0, -3));
+// An own skill's page is named after its folder. Its other files are the ones in folders beside the page: the pages
+// beside the Components page are opened by open_component instead.
+const OWN_SKILLS = OWN_FOLDERS.map((id) => {
+    const guide = readGuide(path.join(id, `${id}.md`));
+    const folder = path.join(LIBRARY, id);
     return {
         folder,
-        files: skillFilesIn(folder),
-        id: file.slice(0, -3),
-        name: guide.facts.name || file.slice(0, -3),
+        files: skillFilesIn(folder).filter((file) => file.path.includes('/')),
+        id,
+        name: guide.facts.name || id,
         description: guide.facts.description || '',
         default: guide.facts.default === 'true',
         order: Number(guide.facts.order) || 99,
@@ -2402,7 +2406,6 @@ export const SKILL_SOURCES = {
     explainer: { name: 'Visual Explainer', repo: 'nicobailon/visual-explainer' },
     cadsmith: { name: 'CadSmith (Jonathan Fermin)', repo: 'JonFermin/cadsmith' }
 };
-const LIBRARY = path.join(INSTRUCTIONS, 'library');
 // The text of one of a skill's files, or null when the skill has no such file. Only a path from the skill's own list
 // is ever read, so nothing outside its folder can be reached.
 export const skillFileText = (skill, wanted) => {
@@ -2532,7 +2535,7 @@ export const skillLinks = (all, guide = '') => {
 };
 const COMBINING_GUIDE = (() => {
     try {
-        return fs.readFileSync(path.join(INSTRUCTIONS, 'skills', 'skill-map', 'examples', 'combining.md'), 'utf8').replace(/\r\n/g, '\n');
+        return fs.readFileSync(path.join(LIBRARY, 'skill-map', 'examples', 'combining.md'), 'utf8').replace(/\r\n/g, '\n');
     } catch {
         return '';
     }
@@ -3184,7 +3187,31 @@ const CAD_EXPORT = {
     parameters: { type: 'object', properties: { name: CAD_NAME, format: { type: 'string', enum: ['stl', 'obj', 'glb', 'ply', '3mf', 'off'], description: 'The kind of file wanted' }, save_to: CAD_SAVE }, required: ['name', 'format'] },
     run: async (input, context) => exportCad(input, context)
 };
+const ART_CONTROLS = { type: 'array', items: { type: 'object', properties: { name: { type: 'string', description: 'The key in params it changes, such as particleCount, or colorPalette.0 for the first of a list' }, label: { type: 'string', description: 'What it is called on the page' }, type: { type: 'string', enum: ['slider', 'color'] }, min: { type: 'number' }, max: { type: 'number' }, step: { type: 'number' } }, required: ['name', 'label', 'type'] }, description: 'The sliders and colour pickers of the Parameters and Colors sections' };
+const ART_FUNCTIONS = [{
+    name: 'art_build',
+    label: 'Algorithmic Art build',
+    doing: 'Building the artwork…',
+    description: 'Makes the single page the Algorithmic Art skill asks for from templates/viewer.html and shows it to the user in the chat. The template is filled in for you: its seed section, its buttons, the sliders and colour pickers you list, updateParam, updateColor, resetParameters and p5.js itself are all put in, so send none of them and no HTML. Give only the sketch: let params = { seed: 12345, ... }, function setup() with createCanvas and initializeSystem(), function initializeSystem() that makes everything anew from params, function draw(), and any classes. Every control changes params and then runs initializeSystem() again. Randomness is seeded from params.seed before each run. The page has no network and no other library. When it returns things to fix, mend them with art_change.',
+    parameters: { type: 'object', properties: { title: { type: 'string', description: 'The name of the artwork' }, subtitle: { type: 'string', description: 'One short line under it' }, code: { type: 'string', description: 'The whole p5.js sketch' }, controls: ART_CONTROLS }, required: ['title', 'code', 'controls'] },
+    run: async (input, context) => buildArt({ title: input?.title, subtitle: input?.subtitle, controls: input?.controls, code: String(input?.code ?? '') }, context)
+}, {
+    name: 'art_change',
+    label: 'Algorithmic Art build',
+    doing: 'Mending the artwork…',
+    description: 'Changes the last sketch given to art_build in this chat, then checks and shows it as art_build does. Use it to mend or improve an artwork instead of sending the whole sketch again: give only the pieces that change, and the controls or title only when they change.',
+    parameters: { type: 'object', properties: { change: CHANGES, controls: ART_CONTROLS, title: { type: 'string' }, subtitle: { type: 'string' }, show: { type: 'string', description: 'Lines of the sketch to read, such as 40-80. Nothing is built.' } } },
+    run: async (input, context) => {
+        const held = chatFigures.get(programKey(context.userId, context.chat))?.art;
+        if (!held) return { content: 'There is no artwork in this chat to change. Build one with art_build.', failed: 'failed' };
+        if (String(input?.show ?? '').trim()) return { content: shownLines(held.code, input.show) };
+        const edited = Array.isArray(input?.change) && input.change.length > 0 ? applyChanges(held.code, input.change) : { code: held.code, problem: input?.controls || input?.title || input?.subtitle ? null : 'Give the pieces to change.' };
+        if (edited.problem) return { content: `Nothing was changed or built. ${edited.problem}`, failed: 'failed' };
+        return buildArt({ title: input?.title ?? held.title, subtitle: input?.subtitle ?? held.subtitle, controls: input?.controls ?? held.controls, code: edited.code }, context);
+    }
+}];
 const SKILL_FUNCTIONS = {
+    'anthropic-algorithmic-art': ART_FUNCTIONS,
     'cadsmith-make-model': [CAD_BUILD, CAD_CHANGE, CAD_EXPORT],
     'cadsmith-edit-model': [CAD_BUILD, CAD_CHANGE, CAD_EXPORT],
     'cadsmith-make-mechanism': [MECH_RUN, CAD_CHANGE],
@@ -3549,6 +3576,192 @@ const buildAnatomy = async (given, { show, kept, chat, userId }) => {
         : `Built ${name}.html and showed it to the user in the chat, in the app's colours. ${counts} ${seen}${ends} You cannot see the page from here, so the close-ups the skill asks for have not been done.` };
 };
 
+// An Algorithmic Art page is the skill's viewer template with its variable parts filled: the model gives the sketch and a
+// list of controls, and what the template says to always keep is taken from it word for word. The page names p5.js at
+// the template's own address; the chat puts its local copy there, since a sealed page has no network.
+const ART = 'anthropic-algorithmic-art';
+const ART_STYLE = '<style>body{background:var(--app-background,#faf9f5)!important}.container{min-height:0!important}.sidebar{width:260px;box-shadow:none!important;background:var(--app-surface,#fff)!important;border:1px solid var(--anthropic-light-gray)}.seed-input,.seed-input:focus{background:var(--anthropic-light)!important;color:var(--anthropic-dark)}#canvas-container{background:var(--app-surface,#fff)!important;box-shadow:none!important}@media (max-width:820px){.container{flex-direction:column-reverse}.canvas-area{padding:0!important}.sidebar{width:100%;display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:0 24px}.sidebar h1,.sidebar .subtitle{grid-column:1/-1}.sidebar .subtitle{margin-bottom:20px}}</style>';
+const ART_PALETTE = 'anthropic-dark:text, anthropic-light:background, anthropic-mid-gray:text 60%, anthropic-light-gray:border, anthropic-orange:primary, anthropic-blue:secondary, anthropic-green:tertiary';
+const ART_HELP = String.raw`
+// Controls: every slider and colour picker changes params and makes the artwork anew.
+const artControls = __CONTROLS__;
+const artDefaults = JSON.parse(JSON.stringify(params));
+const artGet = (name) => name.split('.').reduce((at, key) => (at === undefined || at === null ? undefined : at[key]), params);
+const artMake = initializeSystem;
+initializeSystem = function () {
+  randomSeed(params.seed);
+  noiseSeed(params.seed);
+  artMake();
+  if (!isLooping()) redraw();
+};
+function artSet(name, value) {
+  const keys = name.split('.');
+  const last = keys.pop();
+  keys.reduce((at, key) => at[key], params)[last] = value;
+}
+function artShow() {
+  for (const one of artControls) {
+    const value = artGet(one.name);
+    const input = document.getElementById(one.name);
+    if (value === undefined || !input) continue;
+    input.value = value;
+    document.getElementById(one.name + '-value').textContent = value;
+  }
+  updateSeedDisplay();
+}
+function updateParam(name, value) {
+  artSet(name, Number(value));
+  artShow();
+  initializeSystem();
+}
+function updateColor(name, value) {
+  artSet(name, value);
+  artShow();
+  initializeSystem();
+}
+function resetParameters() {
+  Object.assign(params, JSON.parse(JSON.stringify(artDefaults)));
+  artShow();
+  initializeSystem();
+}
+window.addEventListener('load', function () {
+  const loading = document.querySelector('.loading');
+  if (loading) loading.style.display = 'none';
+  const canvas = document.querySelector('canvas.p5Canvas');
+  const holder = document.getElementById('canvas-container');
+  if (canvas && !holder.contains(canvas)) holder.append(canvas);
+  artShow();
+  const missing = artControls.filter((one) => artGet(one.name) === undefined).map((one) => one.name);
+  if (missing.length > 0) throw new Error('params has no ' + missing.join(', ') + ', which a control changes');
+});
+`;
+const ART_PROBE = String.raw`
+const errors = [];
+const say = (text) => { const line = String(text || '').split('\n')[0].slice(0, 200); if (line && !errors.includes(line)) errors.push(line); };
+addEventListener('error', (event) => say(event.message));
+addEventListener('unhandledrejection', (event) => say(event.reason && event.reason.message || event.reason));
+addEventListener('load', async () => {
+  const wait = (ms) => new Promise((done) => setTimeout(done, ms));
+  const colours = () => {
+    const canvas = document.querySelector('canvas');
+    if (!canvas || !canvas.width || !canvas.height) return 0;
+    const small = document.createElement('canvas');
+    small.width = small.height = 96;
+    const pen = small.getContext('2d');
+    pen.drawImage(canvas, 0, 0, 96, 96);
+    const data = pen.getImageData(0, 0, 96, 96).data;
+    const seen = new Set();
+    for (let at = 0; at < data.length; at += 4) seen.add((data[at] >> 2) + ',' + (data[at + 1] >> 2) + ',' + (data[at + 2] >> 2) + ',' + (data[at + 3] >> 2));
+    return seen.size;
+  };
+  // Frames are asked for here: a browser with no screen may not run any by itself.
+  const frames = (count) => {
+    const until = Date.now() + 4000;
+    try { for (let at = 0; at < count && Date.now() < until; at += 1) redraw(); } catch (error) { say(error.message); }
+  };
+  await wait(1500);
+  frames(40);
+  let most = colours();
+  for (const input of document.querySelectorAll('.sidebar input[type="range"], .sidebar input[type="color"]')) {
+    input.value = input.type === 'color' ? '#336699' : input.max;
+    input.dispatchEvent(new Event(input.type === 'color' ? 'change' : 'input', { bubbles: true }));
+    frames(2);
+    await wait(150);
+  }
+  for (const button of document.querySelectorAll('.sidebar button')) {
+    button.click();
+    frames(2);
+    await wait(150);
+  }
+  frames(20);
+  most = Math.max(most, colours());
+  const out = document.createElement('pre');
+  out.id = 'figure-probe';
+  out.textContent = JSON.stringify({ errors: errors.slice(0, 4), colours: most, canvas: Boolean(document.querySelector('canvas')) });
+  document.body.append(out);
+});
+`;
+const ART_JOB = String.raw`p5=/root/node/node_modules/p5/lib/p5.min.js
+if [ ! -f "$p5" ]; then echo NOP5; exit 0; fi
+P5="$p5" node -e 'const fs=require("fs");const p=fs.readFileSync("page.html","utf8");const lib=fs.readFileSync(process.env.P5,"utf8");fs.writeFileSync("check.html",p.replace(/<script\b[^>]*\bp5(?:\.min)?\.js["\x27][^>]*>\s*<\/script>/i,()=>"<script>"+fs.readFileSync("probe.js","utf8")+"</script><script>"+lib+"</script>"))'
+timeout 70 chromium --headless --no-sandbox --disable-gpu --enable-unsafe-swiftshader --window-size=1000,900 --virtual-time-budget=12000 --dump-dom "file://$PWD/check.html" 2>/dev/null | node -e 'let t="";process.stdin.on("data",(d)=>t+=d).on("end",()=>{const m=t.match(/<pre id="figure-probe">([^<]*)<\/pre>/);console.log("PROBE "+(m?m[1].replace(/&quot;/g,"\"").replace(/&lt;/g,"<").replace(/&gt;/g,">").replace(/&amp;/g,"&"):"none"))})'
+rm -f probe.js check.html page.html`;
+const inHtml = (text) => String(text ?? '').replace(/[&<>"]/g, (one) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[one]));
+const artControls = (given) => (Array.isArray(given) ? given : []).filter((one) => one && /^[A-Za-z_$][\w$]*(\.[\w$]+)*$/.test(String(one.name ?? ''))).slice(0, 16).map((one) => {
+    const number = (value, otherwise) => (Number.isFinite(Number(value)) && value !== null && value !== '' ? Number(value) : otherwise);
+    const color = one.type === 'color';
+    return { name: String(one.name), label: clip(String(one.label || one.name), 60), type: color ? 'color' : 'slider', ...(color ? {} : { min: number(one.min, 0), max: number(one.max, 100), step: number(one.step, 1) }) };
+});
+const artPage = ({ title, subtitle, controls, code }) => {
+    const template = skillFileText(SKILL_BY_ID.get(ART), 'templates/viewer.html');
+    if (!template) return null;
+    const between = (text, from, to) => { const start = text.indexOf(from); const end = text.indexOf(to, start + from.length); return start < 0 || end < 0 ? null : [start, end]; };
+    const keep = between(template, 'function updateSeedDisplay()', 'function resetParameters()');
+    const sides = between(template, '<!-- Parameters Section', '<!-- Actions Section');
+    const script = between(template, '<script>\n', '</script>\n</body>');
+    if (!keep || !sides || !script) return null;
+    const row = (one) => (one.type === 'color'
+        ? `<div class="color-group"><label>${inHtml(one.label)}</label><div class="color-picker-container"><input type="color" id="${one.name}" onchange="updateColor('${one.name}', this.value)"><span class="color-value" id="${one.name}-value"></span></div></div>`
+        : `<div class="control-group"><label>${inHtml(one.label)}</label><div class="slider-container"><input type="range" id="${one.name}" min="${one.min}" max="${one.max}" step="${one.step}" oninput="updateParam('${one.name}', this.value)"><span class="value-display" id="${one.name}-value"></span></div></div>`);
+    const section = (name, rows) => (rows.length > 0 ? `<div class="control-section">\n<h3>${name}</h3>\n${rows.map(row).join('\n')}\n</div>\n` : '');
+    const body = `${code}\n\n${template.slice(...keep).trim()}\n${ART_HELP.replace('__CONTROLS__', () => JSON.stringify(controls.map(({ name }) => ({ name }))))}`;
+    const page = template.slice(0, sides[0]) + section('Parameters', controls.filter((one) => one.type === 'slider')) + section('Colors', controls.filter((one) => one.type === 'color'))
+        + template.slice(sides[1], script[0]) + `<script>\n${body}\n` + template.slice(script[1]);
+    return {
+        body,
+        page: page.replace(/<!--[\s\S]*?-->\s*/g, '').replace(/<link\b[^>]*>\s*/g, '').replace(/<title>[^<]*<\/title>/, () => `<title>${inHtml(title)}</title>`)
+            .replace('<h1>TITLE - EDIT</h1>', () => `<h1>${inHtml(title)}</h1>`).replace('<div class="subtitle">SUBHEADER - EDIT</div>', () => `<div class="subtitle">${inHtml(subtitle)}</div>`)
+            .replace('</head>', () => `${ART_STYLE}\n</head>`)
+    };
+};
+const artFaults = (probe) => {
+    if (!probe) return [];
+    if (probe.errors?.length > 0) return [`run: the figure fails when it is opened in a browser: ${probe.errors.join('; ')}`];
+    if (!probe.canvas) return ['run: the figure draws nothing: setup() made no canvas.'];
+    return probe.colours < 2 ? ['run: the figure draws nothing: its canvas is one flat colour after forty frames.'] : [];
+};
+const buildArt = async (given, { show, kept, chat, userId }) => {
+    const code = given.code.replace(/\r\n/g, '\n').trim();
+    const title = clip(String(given.title || 'Algorithmic art').replace(/["<>]/g, ''), 80);
+    const subtitle = clip(String(given.subtitle || ''), 160);
+    const nothing = (why) => ({ content: `Nothing was built. ${why}`, failed: 'failed' });
+    if (code.startsWith(PROGRAM_AWAY)) return nothing('Give the whole sketch, or mend the last one with art_change.');
+    if (code.includes('```') || /<\/script/i.test(code)) return nothing('The sketch must not contain three backticks in a row or a closing script tag. Send only JavaScript, no HTML.');
+    if (code.length > MAX_PROGRAM_CHARS) return nothing('The sketch is too long.');
+    const lacks = [[/\b(?:let|var|const)\s+params\s*=/, 'let params = { seed: 12345, ... }'], [/\bfunction\s+setup\s*\(/, 'function setup()'], [/\bfunction\s+initializeSystem\s*\(/, 'function initializeSystem()'], [/\bfunction\s+draw\s*\(/, 'function draw()']].filter(([pattern]) => !pattern.test(code)).map(([, name]) => name);
+    if (lacks.length > 0) return nothing(`The sketch has no ${lacks.join(', no ')}. Each is needed, written just so.`);
+    const controls = artControls(given.controls);
+    const made = artPage({ title, subtitle, controls, code });
+    if (!made) return nothing('The skill\'s viewer template could not be read.');
+    keepFigure(userId, chat, { code, title, subtitle, controls }, 'art');
+    const faults = [];
+    let probe = null;
+    try {
+        // Only read through for mistakes in the writing: nothing of it is run on this server.
+        new vm.Script(made.body, { filename: 'sketch.js' });
+    } catch (error) {
+        faults.push(`run: the figure fails when it is opened in a browser: ${error.message} (${String(error.stack || '').split('\n')[0]})`);
+    }
+    if (faults.length === 0 && sandboxReady()) {
+        try {
+            const answer = await runInSandbox({ language: 'bash', seconds: 120, files: [{ path: 'page.html', buffer: Buffer.from(made.page) }, { path: 'probe.js', buffer: Buffer.from(ART_PROBE) }], code: ART_JOB });
+            probe = JSON.parse(String(answer.stdout || '').split('\n').find((line) => line.startsWith('PROBE {'))?.slice(6) || 'null');
+        } catch {
+            probe = null;
+        }
+        faults.push(...artFaults(probe));
+    }
+    const showing = `Artwork ${title}`;
+    const block = ['```component', `<Frame height="640px" title="${title}" palette="${ART_PALETTE}">`, made.page, '</Frame>', '```'].join('\n');
+    if (faults.length > 0) {
+        kept?.set('unshown', { block: `_The artwork “${title}” is not shown: it did not work when it was opened._`, key: showing });
+        return { content: [`Not shown yet. ${faults.length} to fix in the sketch:`, ...faults, 'Mend it with art_change, sending only the lines that change.'].join('\n'), failed: 'failed' };
+    }
+    kept?.delete('unshown');
+    show(block, showing);
+    return { content: `Built "${title}" from the skill's viewer template and showed it to the user in the chat, with ${controls.length} ${controls.length === 1 ? 'control' : 'controls'}. ${probe ? 'It was opened in a browser, every control and button was used, and it ran without errors.' : 'It was not opened in a browser here.'} You cannot see the page from here. The page cannot download files; the user saves it with "Save to my files".` };
+};
+
 // A CadSmith model or mechanism is a Python script the model writes, run on the chat's own computer as the skill has it
 // run: saved in output/, with what it exports left there for the next call. This goes with it and does what the skill's
 // previewer and reviewer would: it measures what was exported and writes a light copy the chat's 3D viewer can draw
@@ -3821,7 +4034,7 @@ const explainerBlock = (page, title) => {
 
 // The skills whose own files are in the sandbox snapshot, by their folder there (/root/skills/<folder>). With sandboxes
 // set up, these lack nothing: their commands run, as programs a model writes, beside their files.
-const SANDBOX_SKILLS = { 'anthropic-docx': 'docx', 'anthropic-pptx': 'pptx', 'anthropic-xlsx': 'xlsx', 'anthropic-pdf': 'pdf', 'hairline-hairline-create': 'hairline-create', 'marketing-conversion-tracking': 'conversion-tracking', 'taste-taste-skill': 'taste', 'anatomy-anatomy': 'anatomy', 'explainer-visual-explainer': 'visual-explainer', 'cadsmith-make-model': 'cadsmith', 'cadsmith-make-mechanism': 'cadsmith', 'cadsmith-edit-model': 'cadsmith', 'cadsmith-export-model': 'cadsmith' };
+const SANDBOX_SKILLS = { 'anthropic-docx': 'docx', 'anthropic-pptx': 'pptx', 'anthropic-xlsx': 'xlsx', 'anthropic-pdf': 'pdf', 'hairline-hairline-create': 'hairline-create', 'marketing-conversion-tracking': 'conversion-tracking', 'taste-taste-skill': 'taste', 'anatomy-anatomy': 'anatomy', 'explainer-visual-explainer': 'visual-explainer', 'cadsmith-make-model': 'cadsmith', 'cadsmith-make-mechanism': 'cadsmith', 'cadsmith-edit-model': 'cadsmith', 'cadsmith-export-model': 'cadsmith', 'anthropic-canvas-design': 'canvas-design', 'anthropic-slack-gif-creator': 'slack-gif-creator' };
 // Whose files a reply may reach: the sign-in of the person who sent the message, and their home folder.
 const filesScope = new AsyncLocalStorage();
 const personFiles = () => createFilesClient({ baseUrl: process.env.FILESYSTEM_ONE_URL, accessToken: filesScope.getStore()?.token });
@@ -3936,7 +4149,7 @@ const programFunction = () => ({
     label: 'Program',
     doing: 'Running the program…',
     changes: touchesFiles,
-    description: `Runs a program you write in a computer of its own that has no network, and saves the files it makes to the user's FilesystemOne. It has Python 3 with python-docx, python-pptx, openpyxl, pandas, markitdown, pypdf, pdfplumber, pdf2image, pytesseract, reportlab and Pillow; Node with docx, pptxgenjs, react, react-dom, react-icons and sharp; and soffice (LibreOffice), chromium, pdftoppm, qpdf, pandoc and tesseract. A skill's own files are there: ${Object.entries(SANDBOX_SKILLS).map(([id, folder]) => `${SKILLS.find((skill) => skill.id === id)?.name || id} in /root/skills/${folder}`).join(', ')}. The program starts in an empty folder holding the files named in files, each under its own file name. Every file it makes or changes in that folder can be saved to save_to, or beside the first file. The user is asked first only when it is given files to read; what it makes is offered to the user to save, without holding you up. To see what you built, have the program take screenshots (chromium --headless --screenshot, or Playwright) and name them in look: they come back to you as pictures. The computer is kept for this chat between calls for ten minutes, so files a run leaves in its folder are there for the next run (you are told when a run had to start on a fresh one); only files made or changed in a run are saved or returned. A program runs for up to five minutes, or up to thirty when you set minutes.`,
+    description: `Runs a program you write in a computer of its own that has no network, and saves the files it makes to the user's FilesystemOne. It has Python 3 with python-docx, python-pptx, openpyxl, pandas, markitdown, pypdf, pdfplumber, pdf2image, pytesseract, reportlab, imageio and Pillow; Node with docx, pptxgenjs, react, react-dom, react-icons and sharp; and soffice (LibreOffice), chromium, pdftoppm, qpdf, pandoc and tesseract. A skill's own files are there: ${Object.entries(SANDBOX_SKILLS).map(([id, folder]) => `${SKILLS.find((skill) => skill.id === id)?.name || id} in /root/skills/${folder}`).join(', ')}. The program starts in an empty folder holding the files named in files, each under its own file name. Every file it makes or changes in that folder can be saved to save_to, or beside the first file. The user is asked first only when it is given files to read; what it makes is offered to the user to save, without holding you up. To see what you built, have the program take screenshots (chromium --headless --screenshot, or Playwright) and name them in look: they come back to you as pictures. The computer is kept for this chat between calls for ten minutes, so files a run leaves in its folder are there for the next run (you are told when a run had to start on a fresh one); only files made or changed in a run are saved or returned. A program runs for up to five minutes, or up to thirty when you set minutes.`,
     parameters: {
         type: 'object',
         properties: {
@@ -4147,7 +4360,7 @@ export const cutInput = (text, name) => {
     }
 };
 const PROGRAM_CALLS = new Set(['run_program', 'change_program']);
-const FIGURE_KINDS = { hairline_build: 'hairline', hairline_change: 'hairline', anatomy_build: 'anatomy', anatomy_change: 'anatomy', cad_build: 'cad', mech_run: 'cad', cad_change: 'cad' };
+const FIGURE_KINDS = { hairline_build: 'hairline', hairline_change: 'hairline', anatomy_build: 'anatomy', anatomy_change: 'anatomy', cad_build: 'cad', mech_run: 'cad', cad_change: 'cad', art_build: 'art', art_change: 'art' };
 const FIGURE_CALLS = new Set(Object.keys(FIGURE_KINDS));
 // The text of the last figure or script of a kind kept for a chat.
 const keptFigure = (userId, chat, kind) => {
@@ -4250,13 +4463,13 @@ const closingOf = (chat) => {
     return reminders.length > 0 ? ['REMEMBER', ...reminders].join('\n') : '';
 };
 
-// Each component the chat can draw has its own page in instructions/components: every attribute, every value and what
+// Each component the chat can draw has its own page in library/components, beside the Components skill's: every attribute, every value and what
 // each does on screen. The Components skill is only the index. A model that can use tools opens the page of the
 // component it is about to write, and the page is gone again once that reply is written: no page is ever sent ahead of
 // need, and none is carried into the next message. A model that cannot use tools has the index alone.
-export const COMPONENT_PAGES = fs.readdirSync(path.join(INSTRUCTIONS, 'components')).filter((file) => file.endsWith('.md')).sort().map((file) => ({
+export const COMPONENT_PAGES = fs.readdirSync(path.join(LIBRARY, 'components')).filter((file) => file.endsWith('.md') && file !== 'components.md').sort().map((file) => ({
     name: file.slice(0, -3),
-    text: fs.readFileSync(path.join(INSTRUCTIONS, 'components', file), 'utf8').replace(/\r\n/g, '\n').trim()
+    text: fs.readFileSync(path.join(LIBRARY, 'components', file), 'utf8').replace(/\r\n/g, '\n').trim()
 }));
 // A reply's components are checked by rule before the reply is finished, with no model involved: which tags exist and
 // which attributes each must have are read from the index, so the check and the instructions cannot drift apart. When

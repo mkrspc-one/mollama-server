@@ -17,6 +17,7 @@ Nothing limits a reply's length, figures or function calls. Explain until the to
 | A real machine drawn in detail | Anatomy | anatomy_build |
 | A small line figure that moves with the pointer, also from an SVG the user has | Hairline Create | hairline_read for the SVG, hairline_build |
 | A 3D part, or a mechanism that moves | CadSmith | cad_build, mech_run |
+| Art made by a program, with a seed and sliders | Algorithmic Art | art_build |
 | A Word, PowerPoint, Excel or PDF file | DOCX, PPTX, XLSX, PDF | run_program |
 
 Use only skills that are on; find_skill names others. Two skills in one request each make their own piece, never one figure together. Plan the pieces first, open each skill once, build each piece with its function, then write around them.
