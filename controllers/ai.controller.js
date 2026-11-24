@@ -3531,7 +3531,7 @@ const buildAnatomy = async (given, { show, kept, chat, userId }) => {
     const built = (answer.files || []).find((one) => one.path === 'page.html');
     const mend = 'Mend it with anatomy_change, sending only the lines that change.';
     if (answer.timedOut || !built) {
-        const said = lines.filter((line) => !/^(BUILD|PAGE|PROBE) |^\s+at (async )?(node:|ModuleJob)|^Node\.js v/.test(line)).join('\n').replace(/(file:\/\/)?\/root\/skills\/anatomy\/(examples\/figure\/)?/g, '').trim();
+        const said = lines.filter((line) => !/^(BUILD|PAGE|PROBE) |^\s+at .*\(?node:internal|^\s+at (async )?ModuleJob|^Node\.js v/.test(line)).join('\n').replace(/(file:\/\/)?\/root\/skills\/anatomy\/(examples\/figure\/)?/g, '').trim();
         const why = answer.timedOut || lines.includes('BUILD 124') ? 'the build script ran for too long'
             : lines.includes('BUILD 0') ? 'the build script wrote no page. It must write one .html file next to itself, as the examples do with writeFileSync and k.pageHtml'
                 : 'the build script failed';
@@ -3948,7 +3948,7 @@ const buildCad = async (given, input, context, mode) => {
         .map((file) => ({ path: file.path.replace(/^output\//, ''), buffer: file.buffer }));
     const invalid = mode === 'mechanism' && facts?.status === 3;
     if (!preview && (invalid || (facts?.models || []).length === 0) && !(facts?.note || '').includes('too detailed')) {
-        const why = mode === 'mechanism' ? 'the mechanism is not valid, so there is nothing to draw'
+        const why = mode === 'mechanism' ? 'the mechanism is not valid or its analysis failed, so there is nothing to draw'
             : `the script ran but exported no model. End it with export_step(result, "./output/${name}.step") and export_stl(result, "./output/${name}.stl")`;
         return { content: [`Nothing was shown: ${why}.`, printed && (mode === 'mechanism' ? printed : `It printed:\n${bothEnds(printed, 2500)}`), answer.stderr && `Errors:\n${bothEnds(answer.stderr, 2500)}`, facts?.note, mend].filter(Boolean).join('\n\n'), failed: 'failed' };
     }
@@ -4196,10 +4196,11 @@ const guideLine = (chat, code, errors, kept) => {
 };
 // A Word, PowerPoint or Excel file a program made is checked at once with its skill's own script, on the same computer,
 // when that skill is on: the skills say to run it after every build, and a small model seldom does. Excel's also
-// works the formulas out, so the file that is saved holds their values.
+// works the formulas out, so the file that is saved holds their values. A Word or PowerPoint file is compared with an
+// empty one from python-docx or python-pptx, whose own templates have a fault or two that no program made.
 const OFFICE_CHECKS = [
-    { ending: /\.(docx|docm|dotx)$/i, skill: 'anthropic-docx', script: 'scripts/office/validate.py', run: (file) => `python /root/skills/docx/scripts/office/validate.py ${file}` },
-    { ending: /\.(pptx|pptm|potx)$/i, skill: 'anthropic-pptx', script: 'scripts/office/validate.py', run: (file) => `python /root/skills/pptx/scripts/office/validate.py ${file}` },
+    { ending: /\.(docx|docm|dotx)$/i, skill: 'anthropic-docx', script: 'scripts/office/validate.py', run: (file) => `python /root/skills/docx/scripts/office/validate.py ${file} --original /tmp/blank.docx` },
+    { ending: /\.(pptx|pptm|potx)$/i, skill: 'anthropic-pptx', script: 'scripts/office/validate.py', run: (file) => `python /root/skills/pptx/scripts/office/validate.py ${file} --original /tmp/blank.pptx` },
     { ending: /\.(xlsx|xlsm|xltx)$/i, skill: 'anthropic-xlsx', script: 'scripts/recalc.py', run: (file) => `python /root/skills/xlsx/scripts/recalc.py ${file} 60` }
 ];
 const checkOffice = async (chat, userId, made) => {
@@ -4208,7 +4209,8 @@ const checkOffice = async (chat, userId, made) => {
     const found = made.map((file) => ({ file, check: OFFICE_CHECKS.find((one) => one.ending.test(file.path) && on.has(one.skill)) })).filter((one) => one.check).slice(0, 3);
     if (found.length === 0) return null;
     const quoted = (text) => `'${String(text).replace(/'/g, '\'\\\'\'')}'`;
-    const code = found.map(({ file, check }, at) => `out=$(${check.run(quoted(file.path))} 2>&1); echo "=== ${at} $?"; echo "$out" | tail -c 2500`).join('\n');
+    const blanks = `python -c "import docx; docx.Document().save('/tmp/blank.docx')" 2>/dev/null; python -c "import pptx; pptx.Presentation().save('/tmp/blank.pptx')" 2>/dev/null\n`;
+    const code = blanks + found.map(({ file, check }, at) => `out=$(${check.run(quoted(file.path))} 2>&1); echo "=== ${at} $?"; echo "$out" | tail -c 2500`).join('\n');
     let answer;
     try {
         answer = await runInSandbox({ language: 'bash', code, seconds: 240, keep: `${userId}:${chat.id}` });
