@@ -1600,7 +1600,11 @@ deviceGateway.on('network', async (deviceId, network) => {
     announceDevice(true)(deviceId);
 });
 // Whatever a computer says about its part in a pool, and what its main computer found, is shown to its person at once.
-deviceGateway.on('pool', async (deviceId) => {
+deviceGateway.on('pool', async (deviceId, state) => {
+    // An app that says another part than the one chosen has started again, perhaps before its old link was seen to
+    // close, and has not been told: it is told now.
+    const saved = await Device.findOne({ _id: deviceId, service: SERVICE, kind: 'companion' }).select('poolRole').catch(() => null);
+    if (saved && state?.role && state.role !== (saved.poolRole || 'off')) await syncPoolsOf(deviceId);
     await checkReach(deviceId).catch((error) => logger.warn('[Pool] Could not check a lending computer', { deviceId: String(deviceId), error: error.message }));
     announceDevice(true)(deviceId);
 });
