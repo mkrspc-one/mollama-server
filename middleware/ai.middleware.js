@@ -377,6 +377,11 @@ export class DeviceGateway extends EventEmitter {
         this.helloMs = 10000;
         this.pingMs = 25000;
         this.askMs = 15000;
+        // A link that drops usually comes back in seconds. What a computer was being asked is held that long, and goes on
+        // where it was when the app returns to this same server: the app keeps the model writing meanwhile.
+        this.parkMs = 2 * 60 * 1000;
+        this.parked = new Map();
+        this.session = crypto.randomUUID();
     }
 
     isOnline(deviceId) {
@@ -414,9 +419,27 @@ export class DeviceGateway extends EventEmitter {
     }
 
     attach(deviceId, ws, hello = {}, publicAddress = null) {
-        const entry = { ws, pending: new Map(), publicAddress };
+        const entry = { ws, pending: new Map(), publicAddress, resume: hello.resume === true, since: Date.now(), missed: 0 };
         const earlier = this.devices.get(deviceId);
         this.devices.set(deviceId, entry);
+        // What was being asked when the link dropped moves to the new one, from the last piece that arrived.
+        const have = {};
+        const dropped = this.parked.get(deviceId);
+        clearTimeout(dropped?.timer);
+        this.parked.delete(deviceId);
+        const held = entry.resume && hello.session === this.session && Array.isArray(hello.held) ? new Set(hello.held.map(String)) : new Set();
+        for (const from of [dropped?.entry, earlier].filter(Boolean)) {
+            for (const [id, waiting] of [...from.pending]) {
+                if (!waiting.moveTo || !held.has(id)) {
+                    if (from !== earlier) waiting.fail();
+                    continue;
+                }
+                from.pending.delete(id);
+                waiting.moveTo(entry);
+                entry.pending.set(id, waiting);
+                have[id] = waiting.got;
+            }
+        }
         earlier?.ws.close(1000, 'Replaced');
 
         ws.on('message', (raw) => {
@@ -439,27 +462,46 @@ export class DeviceGateway extends EventEmitter {
                 this.emit('pool', deviceId, entry.pool);
                 return;
             }
-            entry.pending.get(String(message.id))?.[message.type]?.(message);
+            if (!['head', 'chunk', 'end', 'error', 'answer'].includes(message.type)) return;
+            const waiting = entry.pending.get(String(message.id));
+            // A piece sent again after the link came back is not taken twice.
+            if (waiting && message.n) {
+                if (message.n <= waiting.got) return;
+                waiting.got = message.n;
+            }
+            waiting?.[message.type]?.(message);
         });
-        let answered = true;
-        ws.on('pong', () => { answered = true; });
+        // A busy computer may miss a check or two; one that misses three has gone.
+        ws.on('pong', () => { entry.missed = 0; });
         const beat = setInterval(() => {
-            if (!answered) return ws.terminate();
-            answered = false;
+            if (entry.missed >= 3) return ws.terminate();
+            entry.missed += 1;
             try { ws.ping(); } catch { /* closing */ }
+            // The app cannot see a ping, so it is told as well, and knows by it that the link is alive.
+            if (entry.resume) this.send(entry, { type: 'beat' });
             return undefined;
         }, this.pingMs);
         beat.unref?.();
-        ws.on('close', () => {
+        ws.on('close', (code, reason) => {
             clearInterval(beat);
             const current = this.devices.get(deviceId) === entry;
             if (current) this.devices.delete(deviceId);
-            for (const waiting of [...entry.pending.values()]) waiting.fail();
+            const park = current && entry.resume && !entry.leaving && !entry.removed && this.parkMs > 0;
+            for (const waiting of [...entry.pending.values()]) if (!park || !waiting.moveTo) waiting.fail();
+            this.emit('closed', deviceId, { code, reason: String(reason || '').slice(0, 80), missed: entry.missed, seconds: Math.round((Date.now() - entry.since) / 1000), replaced: !current, held: entry.pending.size });
+            if (park && entry.pending.size > 0) {
+                const timer = setTimeout(() => {
+                    this.parked.delete(deviceId);
+                    for (const waiting of [...entry.pending.values()]) waiting.fail();
+                }, this.parkMs);
+                timer.unref?.();
+                this.parked.set(deviceId, { entry, timer });
+            }
             if (current) this.emit(entry.leaving ? 'goodbye' : 'offline', deviceId);
         });
         ws.on('error', () => {});
 
-        this.send(entry, { type: 'welcome' });
+        this.send(entry, { type: 'welcome', session: this.session, have });
         this.emit('online', deviceId, hello, Boolean(earlier));
     }
 
@@ -507,7 +549,10 @@ export class DeviceGateway extends EventEmitter {
     }
 
     disconnect(deviceId) {
-        this.devices.get(String(deviceId))?.ws.close(1000, 'Removed');
+        const entry = this.devices.get(String(deviceId));
+        if (!entry) return;
+        entry.removed = true;
+        entry.ws.close(1000, 'Removed');
     }
 
     // Asks the desktop app about the tool servers on its computer. An app too old to know the question stays silent.
@@ -554,7 +599,7 @@ export class DeviceGateway extends EventEmitter {
     // 'via' sends the requests to something else the app runs for Mollama: 'pool' is a pooled model on the main computer.
     fetcher(deviceId, via = null) {
         return (input, init = {}) => new Promise((resolve, reject) => {
-            const entry = this.devices.get(String(deviceId));
+            let entry = this.devices.get(String(deviceId));
             if (!entry) return reject(new OllamaError('DEVICE_OFFLINE'));
 
             const id = String(++this.counter);
@@ -583,6 +628,8 @@ export class DeviceGateway extends EventEmitter {
             });
 
             entry.pending.set(id, {
+                got: 0,
+                moveTo: (next) => { entry = next; },
                 head: (message) => {
                     answered = true;
                     const empty = [204, 205, 304].includes(message.status);
@@ -1215,6 +1262,72 @@ export const setSandboxKeepMs = (ms) => {
 export const releaseSandboxes = async () => {
     for (const key of [...keptSandboxes.keys()]) await letSandboxGo(key);
 };
+// Read by Python as it starts, beside the program: a program stopped for running too long says where it was, and a call
+// that was made wrongly is followed by what that call accepts, so a model mends it instead of guessing again.
+export const PYTHON_HOOK = String.raw`import sys
+
+def _explain(error, trace):
+    import ast, difflib, inspect, os
+    main = os.path.abspath(sys.argv[0])
+    found = None
+    while trace is not None:
+        if os.path.abspath(trace.tb_frame.f_code.co_filename) == main:
+            found = trace
+        trace = trace.tb_next
+    said = []
+    if isinstance(error, AttributeError) and getattr(error, 'name', None) and getattr(error, 'obj', None) is not None:
+        near = difflib.get_close_matches(error.name, [n for n in dir(error.obj) if not n.startswith('_')], 6, 0.4)
+        if near:
+            said.append('The nearest names there are: ' + ', '.join(near))
+    if isinstance(error, ImportError) and getattr(error, 'name', None) in sys.modules and getattr(error, 'name_from', None):
+        near = difflib.get_close_matches(error.name_from, dir(sys.modules[error.name]), 6, 0.4)
+        if near:
+            said.append('The nearest names in ' + error.name + ' are: ' + ', '.join(near))
+    if isinstance(error, TypeError) and found is not None:
+        frame = found.tb_frame
+        line = found.tb_lineno
+        calls = [n for n in ast.walk(ast.parse(open(main, encoding='utf-8').read())) if isinstance(n, ast.Call) and n.lineno <= line <= n.end_lineno]
+        try:
+            spot = list(frame.f_code.co_positions())[found.tb_lasti // 2]
+            exact = [n for n in calls if (n.lineno, n.end_lineno, n.col_offset, n.end_col_offset) == tuple(spot)]
+            calls = exact or calls
+        except Exception:
+            pass
+        def look(node):
+            if isinstance(node, ast.Name):
+                for names in (frame.f_locals, frame.f_globals, __builtins__ if isinstance(__builtins__, dict) else vars(__builtins__)):
+                    if node.id in names:
+                        return names[node.id]
+                raise NameError(node.id)
+            if isinstance(node, ast.Attribute):
+                return getattr(look(node.value), node.attr)
+            raise ValueError()
+        for call in calls[:3]:
+            try:
+                called = look(call.func)
+                said.append('What it accepts: ' + ast.unparse(call.func) + str(inspect.signature(called)))
+                about = (inspect.getdoc(called) or '').strip().split('\n\n')[0].replace('\n', ' ')
+                if about:
+                    said.append(about[:200])
+            except Exception:
+                pass
+    if said:
+        print('\n' + '\n'.join(said)[:1500], file=sys.stderr)
+
+def _hook(kind, error, trace):
+    sys.__excepthook__(kind, error, trace)
+    try:
+        _explain(error, trace)
+    except Exception:
+        pass
+
+sys.excepthook = _hook
+try:
+    import faulthandler, signal
+    faulthandler.register(signal.SIGTERM, all_threads=False, chain=True)
+except Exception:
+    pass
+`;
 // The network is shut unless a job names the few addresses it may reach.
 export const runInSandbox = async ({ language, code, files = [], seconds = 300, allow = [], keep = null }) => {
     const [command, ending] = PROGRAM_RUNS[language] || PROGRAM_RUNS.python;
@@ -1256,7 +1369,7 @@ export const runInSandbox = async ({ language, code, files = [], seconds = 300, 
         };
         // A kept sandbox may have been closed meanwhile; then a new one is started and the earlier files are gone.
         try {
-            await exec('mkdir -p /root/work /root/job');
+            await exec('mkdir -p /root/work /root/job/hook');
         } catch (error) {
             if (fresh) throw error;
             keptSandboxes.delete(keep);
@@ -1264,12 +1377,17 @@ export const runInSandbox = async ({ language, code, files = [], seconds = 300, 
             sandbox = await start();
             createdAt = Date.now();
             fresh = true;
-            await exec('mkdir -p /root/work /root/job');
+            await exec('mkdir -p /root/work /root/job/hook');
         }
         for (const file of files) await sandboxes.upload(sandbox.id, `/root/work/${file.path}`, file.buffer);
         await sandboxes.upload(sandbox.id, `/root/job/main.${ending}`, Buffer.from(code));
+        if (language === 'python') await sandboxes.upload(sandbox.id, '/root/job/hook/sitecustomize.py', Buffer.from(PYTHON_HOOK));
         await exec('touch /root/job/.start');
-        const ran = await exec(`cd /root/work && export HOME=/root PATH=/root/env/bin:$PATH NODE_PATH=/root/node/node_modules && timeout -k 5 ${runFor} ${command} /root/job/main.${ending}`);
+        const began = Date.now();
+        const ran = await exec(`cd /root/work && export HOME=/root PATH=/root/env/bin:$PATH NODE_PATH=/root/node/node_modules PYTHONUNBUFFERED=1 PYTHONPATH=/root/job/hook && timeout -k 5 ${runFor} ${command} /root/job/main.${ending}`);
+        const ranMs = Date.now() - began;
+        // Ended with a kill signal well before its time is up: the computer ended it itself, which is nearly always memory.
+        const killed = ran.exitCode === 137 && ranMs < runFor * 1000;
         const listed = await exec(`cd /root/work && find . -type f -newer /root/job/.start | sed 's|^./||' | head -${SANDBOX_FILES + 1}`);
         const made = [];
         let size = 0;
@@ -1288,7 +1406,7 @@ export const runInSandbox = async ({ language, code, files = [], seconds = 300, 
             size += buffer.length;
             made.push({ path, buffer });
         }
-        return { exitCode: ran.exitCode, timedOut: ran.exitCode === 124 || ran.exitCode === 137, stdout: ran.stdout, stderr: ran.stderr, files: made, skipped, kept: keeping, fresh: keeping && Boolean(held) && fresh };
+        return { exitCode: ran.exitCode, timedOut: ran.exitCode === 124 || (ran.exitCode === 137 && !killed), killed, ranMs, seconds: runFor, stdout: ran.stdout, stderr: ran.stderr, files: made, skipped, kept: keeping, fresh: keeping && Boolean(held) && fresh };
     } finally {
         if (keeping) {
             const timer = setTimeout(() => { letSandboxGo(keep); }, keepIdleMs);
@@ -1298,6 +1416,27 @@ export const runInSandbox = async ({ language, code, files = [], seconds = 300, 
             await sandboxes.terminate(sandbox.id).catch(() => {});
         }
     }
+};
+
+// Files an earlier run left in a chat's kept sandbox, read without running anything. Null when that sandbox has gone.
+export const takeFromSandbox = async (keep, paths) => {
+    const held = keptSandboxes.get(keep);
+    if (!held) return null;
+    const sandboxes = await sandboxesOf();
+    const files = [];
+    const missing = [];
+    let size = 0;
+    for (const path of paths) {
+        const download = await sandboxes.download(held.id, `/root/work/${path}`, undefined, { maxSizeBytes: SANDBOX_BYTES }).catch(() => null);
+        const buffer = download ? Buffer.from(download.data) : null;
+        if (!buffer || size + buffer.length > SANDBOX_BYTES) {
+            missing.push(path);
+            continue;
+        }
+        size += buffer.length;
+        files.push({ path, buffer });
+    }
+    return { files, missing };
 };
 
 let filesRetryMs = 3000;

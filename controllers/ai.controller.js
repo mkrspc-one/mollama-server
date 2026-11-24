@@ -12,7 +12,7 @@ import { hasRight, RIGHTS } from '../config/rights.js';
 import { SERVICE, Device, Setting, PersonalModel, Download, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, chatSchemas, ToolServer, Provider, Skill } from '../models/ai.model.js';
 import {
     OllamaError, mapOllamaError, UNREADABLE_CALL, memoryNeededMb, createOllamaClient, libraryModels, libraryEntries, loadLibrarySizes, librarySizes, friendlyName, cloudTitle, computerName, detectHardware, appleGpus, readDisk, rankCatalogue, fitModel, fitNotes, fitPool, freeHardware, poolShareMb, poolSplit, GPU_HEADROOM_MB, RAM_RESERVE_MB,
-    GenerationQueue, estimateTokens, extractText, createFilesClient, imageTypeOf, MAX_IMAGE_BYTES, MAX_CHAT_IMAGE_BYTES, runInSandbox, letSandboxGo, sandboxReady, poolGroups, MAX_PROGRAM_SECONDS, MAX_ATTACHMENT_BYTES, fetchRemote, MAX_REMOTE_BYTES,
+    GenerationQueue, estimateTokens, extractText, createFilesClient, imageTypeOf, MAX_IMAGE_BYTES, MAX_CHAT_IMAGE_BYTES, runInSandbox, takeFromSandbox, letSandboxGo, sandboxReady, poolGroups, MAX_PROGRAM_SECONDS, MAX_ATTACHMENT_BYTES, fetchRemote, MAX_REMOTE_BYTES,
     searchReady, searchWeb, readPage, deviceGateway,
     CLOUD_PROVIDERS, PROVIDER_HEALTH, createCloudClient, ollamaOnlineNames, runsOnline,
     TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, toolKeyNeeded, listedTool, seal, unseal, accountKeeper, withToolServer, finishToolSignIn, readTools, toolFault, ToolSignInError
@@ -369,6 +369,40 @@ const useKey = (target, model) => `${target} ${model}`;
 const loadingAhead = new Map();
 
 // What one computer holds in memory right now: each model, what it takes, what it is doing and for how long it has not.
+// What one model is doing: the reply it is writing, or when it was last used, and how its context is used.
+const doing = async (where, model, fallback = null) => {
+    const [chatId] = repliesOn(where, model);
+    const live = chatId ? liveReplies.get(chatId) : null;
+    const chat = chatId ? await Chat.findOne({ _id: chatId, service: SERVICE }).select('title') : null;
+    const used = modelUse.get(useKey(where, model)) || fallback;
+    const progress = live ? replyProgress(live) : null;
+    return {
+        state: live ? (progress.phase === 'waiting' ? 'waiting' : 'answering') : 'idle',
+        chat: chat ? { id: chat.id, title: chat.title } : null,
+        progress,
+        use: live?.context ? { now: true, chat: null, ...presentContext(live.context) } : lastContext.has(useKey(where, model)) ? { now: false, chat: lastContext.get(useKey(where, model)).chat, ...lastContext.get(useKey(where, model)).context } : null,
+        replies: repliesOn(where, model).length,
+        usedAt: live ? null : used,
+        idleMs: live || !used ? null : Math.max(0, Date.now() - used)
+    };
+};
+// The online models answering now or used lately. They take no memory on a computer, and no service says what they
+// take on its own.
+const ONLINE_LATELY_MS = 15 * 60 * 1000;
+const onlineInUse = async (userId) => {
+    const providers = await Provider.find({ service: SERVICE, owner: userId }).sort({ name: 1 });
+    const services = await Promise.all(providers.map(async (provider) => {
+        const target = String(provider.id);
+        const lately = [...modelUse].filter(([key, at]) => key.startsWith(`${target} `) && Date.now() - at < ONLINE_LATELY_MS).map(([key]) => key.slice(target.length + 1));
+        const names = new Set([...[...liveReplies.values()].filter((live) => String(live.target) === target && live.model).map((live) => live.model), ...lately]);
+        const models = await Promise.all([...names].map(async (name) => {
+            const known = provider.models.find((one) => one.name === name);
+            return { name, displayName: known?.title || name, source: 'online', sizeMb: null, gpuMb: null, ramMb: null, context: known?.contextLength || null, endsAt: null, helpers: [], ...await doing(target, name) };
+        }));
+        return { id: target, name: provider.name, models };
+    }));
+    return services.filter((one) => one.models.length > 0);
+};
 const memoryOf = async (device, names = new Map()) => {
     const local = device.kind === 'local';
     const id = String(device.id);
@@ -391,21 +425,6 @@ const memoryOf = async (device, names = new Map()) => {
 
     const now = Date.now();
     const keepMs = settings.keepAliveMinutes * 60 * 1000;
-    const doing = async (where, model, fallback = null) => {
-        const [chatId] = repliesOn(where, model);
-        const live = chatId ? liveReplies.get(chatId) : null;
-        const chat = chatId ? await Chat.findOne({ _id: chatId, service: SERVICE }).select('title') : null;
-        const used = modelUse.get(useKey(where, model)) || fallback;
-        const progress = live ? replyProgress(live) : null;
-        return {
-            state: live ? (progress.phase === 'waiting' ? 'waiting' : 'answering') : 'idle',
-            chat: chat ? { id: chat.id, title: chat.title } : null,
-            progress,
-            replies: repliesOn(where, model).length,
-            usedAt: live ? null : used,
-            idleMs: live || !used ? null : Math.max(0, now - used)
-        };
-    };
     const label = (name) => names.get(name) || knownModels.get(name)?.name || friendlyName(name);
     for (const entry of running?.models || []) {
         const ends = entry.expires_at ? new Date(entry.expires_at).getTime() : null;
@@ -459,7 +478,8 @@ export const listMemory = asyncHandler(async (req, res) => {
     const local = localEnabled() ? await getLocalDevice() : null;
     const devices = [...(local ? [local] : []), ...await ownDevices(req.user.id)];
     const { keepAliveMinutes } = await getSettings();
-    res.status(200).json({ success: true, at: Date.now(), keepAliveMinutes, poolIdleMinutes: POOL_IDLE_MS / 60000, computers: await Promise.all(devices.map((device) => memoryOf(device))) });
+    const [computers, online] = await Promise.all([Promise.all(devices.map((device) => memoryOf(device))), onlineInUse(req.user.id)]);
+    res.status(200).json({ success: true, at: Date.now(), keepAliveMinutes, poolIdleMinutes: POOL_IDLE_MS / 60000, computers, online });
 });
 
 // Takes one model out of a computer's memory. One that is answering is left alone unless its reply is to be stopped.
@@ -486,6 +506,7 @@ export const freeMemory = asyncHandler(async (req, res) => {
             removed = await waitUntil(async () => !(await client.running()).models.some((one) => one.name === model), 8000);
         }
         if (removed) modelUse.delete(useKey(where, model));
+        if (removed) lastContext.delete(useKey(where, model));
         logger.info('[Memory] Model removed', { deviceId: id, model, pooled, removed, userId: req.user.id });
         getNotificationService().sendToUser(String(req.user.id), { type: 'models:changed', data: { id: null, removed: false } });
         res.status(200).json({ success: true, removed, computer: await memoryOf(device) });
@@ -1557,6 +1578,8 @@ deviceGateway.on('online', async (deviceId, hello, replaced) => {
     await syncPoolsOf(deviceId);
 });
 deviceGateway.on('offline', announceDevice(false));
+// Why each link closed, so a computer that keeps dropping can be explained.
+deviceGateway.on('closed', (deviceId, about) => logger.info('[Device] A link closed', { deviceId: String(deviceId), ...about }));
 // A computer whose link drops usually returns in seconds and keeps its part in a pool for two minutes (its desktop app
 // does the same), so the others are only told it has gone if it is still away then.
 const POOL_GRACE_MS = process.env.NODE_ENV === 'test' ? 0 : 2 * 60 * 1000;
@@ -2254,6 +2277,9 @@ const AUTO_CONTEXT_LIMIT = 32768;
 const CONTEXT_STEPS = [8192, 16384, AUTO_CONTEXT_LIMIT];
 const REPLY_RESERVE = 1024;
 const PROGRAM_ROOM = 8192;
+// How long a reply waits for a computer whose link dropped, and how many times.
+const RETURN_MS = process.env.NODE_ENV === 'test' ? 1500 : 2 * 60 * 1000;
+const MAX_DROPS = 10;
 const DRAFT_MS = 8000;
 // A model that thinks before it answers spends room on the thinking too, often several thousand tokens of it.
 const THINK_RESERVE = 6144;
@@ -2540,11 +2566,54 @@ const skillsOf = (chat) => skillsFor(chat.owner).filter((skill) => (Array.isArra
 // and opens a skill with that function when a request fits it. A skill opened earlier in the chat is sent in full from
 // then on, and so is Mollama's own. A model that cannot use tools is sent every skill in full.
 const SKILL_STEP = 'Skill';
-const sortSkills = (chat, listing) => {
+// A skill that would take more than a sixth of what the model can read is opened in parts, word for word: its start and
+// the first sections that fit, then the rest by their headings, each opened when it is needed. A model with a large
+// room is given every skill whole.
+const skillRoom = (capacity) => Math.max(1500, Math.floor(capacity / 6));
+export const skillParts = (text) => {
+    const parts = [];
+    let start = [];
+    let into = start;
+    let fenced = false;
+    for (const line of String(text || '').split('\n')) {
+        if (/^\s*(```|~~~)/.test(line)) fenced = !fenced;
+        if (!fenced && /^## /.test(line)) {
+            into = [];
+            parts.push({ title: line.replace(/^##\s+/, '').trim(), lines: into });
+        }
+        into.push(line);
+    }
+    return { start: start.join('\n').trim(), parts: parts.map((part) => ({ title: part.title, text: part.lines.join('\n').trim() })) };
+};
+const isLong = (skill, capacity) => estimateTokens(skill.text) > skillRoom(capacity) && skillParts(skill.text).parts.length > 1;
+export const skillInParts = (skill, capacity, wanted = '') => {
+    const { start, parts } = skillParts(skill.text);
+    const asked = String(wanted ?? '').trim().toLowerCase();
+    const about = (at) => `- ${at + 1}. ${parts[at].title} (about ${estimateTokens(parts[at].text).toLocaleString('en-GB')} tokens)`;
+    if (asked) {
+        const numbers = (asked.match(/\d+/g) || []).map(Number).filter((number) => number >= 1 && number <= parts.length);
+        const named = parts.findIndex((part) => part.title.toLowerCase() === asked || part.title.toLowerCase().includes(asked));
+        const chosen = named >= 0 && !/^[0-9, ]+$/.test(asked) ? [named] : [...new Set(numbers)].map((number) => number - 1);
+        if (chosen.length === 0) return { content: `${skill.name} has no such part. Its parts are:\n${parts.map((part, at) => about(at)).join('\n')}`, failed: 'failed' };
+        return { content: chosen.map((at) => `${skill.name}, part ${at + 1} of ${parts.length}\n\n${parts[at].text}`).join('\n\n') };
+    }
+    const given = [];
+    let room = skillRoom(capacity) - estimateTokens(start);
+    for (const [at, part] of parts.entries()) {
+        room -= estimateTokens(part.text);
+        if (room < 0) break;
+        given.push(at);
+    }
+    const rest = parts.map((part, at) => at).slice(given.length);
+    return {
+        content: [start, ...given.map((at) => parts[at].text), `This skill is long, so it comes in parts. Above ${given.length === 0 ? 'is its start' : given.length === 1 ? 'are its start and part 1' : `are its start and parts 1 to ${given.length}`}. Not read yet:\n${rest.map(about).join('\n')}\nOpen each one that bears on what you are doing before you do it: call open_skill with the same skill and part set to its number.`].filter(Boolean).join('\n\n')
+    };
+};
+const sortSkills = (chat, listing, capacity = Infinity) => {
     const active = skillsOf(chat);
     if (!listing) return { full: active.filter((skill) => Array.isArray(chat.skills) || skill.default !== 'tools'), listed: [] };
     const opened = new Set(chat.messages.flatMap((message) => (message.steps || []).filter((step) => step.tool === SKILL_STEP && !step.failed).map((step) => step.input)));
-    const full = active.filter((skill) => skill.source === 'mollama' || opened.has(skill.name));
+    const full = active.filter((skill) => skill.source === 'mollama' || (opened.has(skill.name) && !isLong(skill, capacity)));
     return { full, listed: active.filter((skill) => !full.includes(skill)) };
 };
 // The skills an opened skill goes with, so a model knows its companions without searching for them.
@@ -2561,7 +2630,7 @@ const companionsOf = (skill, others) => {
         ...(away.length > 0 ? [`In the library, not on: ${away.join(', ')}. When one would help, tell the user its name; they turn it on under Skills.`] : [])
     ].join('\n');
 };
-const openSkillTool = (listed, others = []) => {
+const openSkillTool = (listed, others = [], capacity = Infinity) => {
     const find = (input) => {
         const wanted = String(input?.skill ?? '').trim().toLowerCase();
         return listed.find((skill) => skill.name.toLowerCase() === wanted || skill.id === wanted);
@@ -2570,7 +2639,7 @@ const openSkillTool = (listed, others = []) => {
         fn: 'open_skill',
         label: SKILL_STEP,
         changes: false,
-        shown: (input) => find(input)?.name || clip(String(input?.skill ?? ''), 80),
+        shown: (input) => `${find(input)?.name || clip(String(input?.skill ?? ''), 80)}${find(input) && String(input?.part ?? '').trim() ? `, part ${clip(String(input.part).trim(), 30)}` : ''}`,
         knows: (name) => Boolean(find({ skill: String(name).replace(/[_-]+/g, ' ') })),
         slip: (name) => ({ skill: String(name).replace(/[_-]+/g, ' ') }),
         definition: {
@@ -2578,11 +2647,15 @@ const openSkillTool = (listed, others = []) => {
             function: {
                 name: 'open_skill',
                 description: `Open one of this chat's skills and get its full instructions. The user turned these skills on, so the list itself says what kind of help they expect: before you answer, weigh every skill on it against the request and open each one that bears on it, not only the first that fits. The instructions are written for you and the user does not see them: do what they say in your reply, and do not repeat them back.\n${listed.map((skill) => `- ${skill.name}: ${skill.description}`).join('\n')}`,
-                parameters: { type: 'object', properties: { skill: { type: 'string', enum: listed.map((skill) => skill.name), description: 'The name of the skill to open' } }, required: ['skill'] }
+                parameters: { type: 'object', properties: { skill: { type: 'string', enum: listed.map((skill) => skill.name), description: 'The name of the skill to open' }, part: { type: 'string', description: 'Only for a long skill you have opened: the number of one of its parts' } }, required: ['skill'] }
             }
         },
         run: async (input) => {
             const skill = find(input);
+            if (skill && isLong(skill, capacity)) {
+                const answer = skillInParts(skill, capacity, input?.part);
+                return String(input?.part ?? '').trim() ? answer : { ...answer, content: `${answer.content}${companionsOf(skill, others)}` };
+            }
             return skill ? { content: `${skill.text}${companionsOf(skill, others)}` } : { content: `There is no skill by that name in this chat. The skills are: ${listed.map((one) => one.name).join(', ')}.`, failed: 'failed' };
         }
     };
@@ -2775,13 +2848,14 @@ const skillFileTool = (withFiles) => {
                 parameters: { type: 'object', properties: { skill: { type: 'string', enum: withFiles.map((skill) => skill.id), description: 'The skill the file belongs to' }, file: { type: 'string', description: 'The path of the file, as listed' }, until: { type: 'string', description: 'Optional. Read only the start of the file, up to the first line that contains this text. Use it when the instructions say to read only the top of a file.' } }, required: ['skill', 'file'] }
             }
         },
-        run: async (input) => {
+        run: async (input, { kept } = {}) => {
             const skill = find(input);
             const whole = skill ? skillFileText(skill, input?.file) : null;
             const stop = typeof input?.until === 'string' && input.until.trim() ? input.until.trim() : null;
             const lines = whole === null ? [] : whole.split('\n');
             const end = stop ? lines.findIndex((line) => line.includes(stop)) : -1;
             const text = whole !== null && end > 0 ? lines.slice(0, end).join('\n') : whole;
+            if (text !== null) kept?.set(`file:${skill.id}/${String(input?.file ?? '').trim().replace(/^\.?\//, '')}`, true);
             if (text !== null) return { content: text };
             return { content: skill ? `That skill has no file by that name. Its files are: ${skill.files.map((file) => file.path).join(', ')}.` : `There is no skill by that name with files in this chat. The skills with files are: ${withFiles.map((one) => one.id).join(', ')}.`, failed: 'failed' };
         }
@@ -3180,7 +3254,7 @@ const readPersonFiles = async (files, paths) => {
 const savePersonFiles = async (files, folder, made) => {
     if (made.length === 0) return '';
     const names = made.map((file) => file.path).join(', ');
-    if (!folder || folder === '/') return `It made ${names}, but nothing was saved: call again with save_to, a folder in the user's FilesystemOne.`;
+    if (!folder || folder === '/') return `It made ${names}, but nothing was saved. To save any of it, call change_program with save listing the files and save_to, a folder in the user's FilesystemOne: nothing is run again.`;
     try {
         await files.upload(folder, made);
         return `Saved in ${folder}: ${names}. A name already taken there was not overwritten; that file was given a new name.`;
@@ -3188,10 +3262,13 @@ const savePersonFiles = async (files, folder, made) => {
         return `It made ${names}, but they could not be saved in ${folder}.`;
     }
 };
+// What a program printed, kept to a length with its start and its end: the end is where an error says what it is.
+const bothEnds = (text, limit) => (text.length <= limit ? text : `${text.slice(0, Math.floor(limit / 3))}\n[... ${(text.length - limit).toLocaleString('en-GB')} characters left out ...]\n${text.slice(text.length - Math.ceil((limit * 2) / 3))}`);
 const reportRun = (title, answer, saved) => {
-    const ended = answer.timedOut ? 'was stopped because it ran too long' : `finished with exit code ${answer.exitCode}`;
+    const ended = answer.killed ? `was ended by the computer it ran on after ${Math.round(answer.ranMs / 1000)} seconds, most likely for using too much memory`
+        : answer.timedOut ? `was stopped because it ran longer than ${answer.seconds ? `${answer.seconds} seconds` : 'it may'}. Errors shows where it was, when that is known` : `finished with exit code ${answer.exitCode}`;
     const left = (answer.skipped || []).length > 0 ? `Not returned, being past the limit on files: ${answer.skipped.join(', ')}.` : '';
-    const content = [`${title} ${ended}.`, answer.stdout && `It printed:\n${clip(answer.stdout, 6000)}`, answer.stderr && `Errors:\n${clip(answer.stderr, 3000)}`, saved, left].filter(Boolean).join('\n\n');
+    const content = [`${title} ${ended}.`, answer.stdout && `It printed:\n${bothEnds(answer.stdout, 6000)}`, answer.stderr && `Errors:\n${bothEnds(answer.stderr, 3500)}`, saved, left].filter(Boolean).join('\n\n');
     return { content, ...(answer.timedOut || answer.exitCode !== 0 ? { failed: 'failed' } : {}) };
 };
 // A call touches the person's files only when it names files to send or a folder to save into: with neither, nothing
@@ -3229,7 +3306,7 @@ const programFunction = () => ({
         },
         required: ['language', 'code']
     },
-    run: async (input, { chat, userId } = {}) => {
+    run: async (input, { chat, userId, kept } = {}) => {
         const language = languageOf(input);
         const code = String(input?.code ?? '');
         if (!language) return { content: 'Nothing was run. Say what the program is written in: python, node or bash.', failed: 'failed' };
@@ -3237,14 +3314,30 @@ const programFunction = () => ({
         if (code.length > MAX_PROGRAM_CHARS) return { content: TOO_LONG, failed: 'failed' };
         keepProgram(userId, chat, { language, code });
         if (input?.unfinished === true) return { content: keptSoFar(code) };
-        return runProgram({ language, code, input, chat, userId });
+        return runProgram({ language, code, input, chat, userId, kept });
     }
 });
 const keptSoFar = (code) => `Kept, not run yet. The program has ${linesOf(code).length} lines so far. Go on with add in change_program, and leave unfinished out with the last part.`;
 const languageOf = (input) => (['python', 'node', 'bash'].includes(input?.language) ? input.language : null);
 const TOO_LONG = `Nothing was run. A program may be at most ${MAX_PROGRAM_CHARS.toLocaleString('en-GB')} characters.`;
 const PROGRAM_AWAY = '[An earlier version of this program';
-const runProgram = async ({ language, code, input, chat, userId }) => {
+// The libraries a failed program was using: the ones its error passed through, or else the ones it asks for.
+const librariesOf = (code, errors) => {
+    const through = [...String(errors || '').matchAll(/(?:site-packages|node_modules)\/([A-Za-z][\w.-]*)/g)].map((match) => match[1].replace(/\.py$/, ''));
+    const asked = [...String(code || '').matchAll(/^\s*(?:from|import)\s+([A-Za-z_]\w*)|require\(['"]([\w@/.-]+)['"]\)|from\s+['"]([\w@/.-]+)['"]/gm)].map((match) => match[1] || match[2] || match[3]);
+    return [...new Set(through.length > 0 ? through : asked)].filter((name) => name.length > 3);
+};
+// A skill's own page about a library the program failed in, when the model has not read it in this reply.
+const guideLine = (chat, code, errors, kept) => {
+    const pages = skillsOf(chat).flatMap((skill) => (skill.files || []).filter((file) => /\.md$/i.test(file.path) && !kept?.has(`file:${skill.id}/${file.path}`)).map((file) => ({ skill, path: file.path })));
+    const found = librariesOf(code, errors).flatMap((library) => pages.map((page) => {
+        const named = page.path.toLowerCase().includes(library.toLowerCase());
+        const mentions = (skillFileText(page.skill, page.path) || '').split(library).length - 1;
+        return { ...page, library, score: (named ? 100 : 0) + mentions };
+    })).filter((page) => page.score >= 5).sort((a, b) => b.score - a.score)[0];
+    return found ? ` The skill ${found.skill.name} has a page on ${found.library} that you have not read in this reply: call open_skill_file with skill "${found.skill.id}" and file "${found.path}" before trying again.` : '';
+};
+const runProgram = async ({ language, code, input, chat, userId, kept }) => {
     const minutes = Number.isFinite(Number(input?.minutes)) ? Math.min(Math.max(Math.round(Number(input.minutes)), 1), MAX_PROGRAM_SECONDS / 60) : 5;
     const paths = (Array.isArray(input?.files) ? input.files.map(String) : []).slice(0, 10);
     const folder = saveFolder(input, paths);
@@ -3266,7 +3359,7 @@ const runProgram = async ({ language, code, input, chat, userId }) => {
     const shots = (answer.files || []).filter((file) => look.includes(file.path) && LOOK_TYPES.test(file.path) && file.buffer.length <= MAX_LOOK_BYTES).slice(0, MAX_LOOKS);
     const report = reportRun(`The ${language} program`, answer, await savePersonFiles(files, folder, (answer.files || []).filter((file) => !look.includes(file.path))));
     if (answer.fresh) report.content = `This run started on a fresh computer: the files earlier runs left are gone.\n\n${report.content}`;
-    if (report.failed && chat) report.content += '\n\nThe program is kept. To mend it, send only what changes with change_program.';
+    if (report.failed && chat) report.content += `\n\nThe program is kept. To mend it, send only what changes with change_program.${guideLine(chat, code, answer.stderr, kept)}`;
     if (look.length === 0) return report;
     const missing = look.filter((one) => !shots.some((file) => file.path === one));
     const seen = [shots.length > 0 && `The pictures you asked to see are attached: ${shots.map((file) => file.path).join(', ')}.`, missing.length > 0 && `Not attached (not made, not a PNG, JPEG, WebP or GIF picture, over ${MAX_LOOK_BYTES / 1024 / 1024} MB, or past ${MAX_LOOKS} pictures): ${missing.join(', ')}.`].filter(Boolean).join(' ');
@@ -3290,7 +3383,7 @@ const changeFunction = () => ({
     label: 'Program',
     doing: 'Changing the program…',
     changes: touchesFiles,
-    description: 'Changes the last program of this chat and runs it again, in the same computer as run_program. Use it to mend or improve a program instead of sending the whole of it again, and to write a long program in parts: each call sends only what is new. change replaces pieces of it, add puts text after its last line, show returns lines of it without running it.',
+    description: 'Changes the last program of this chat and runs it again, in the same computer as run_program. Use it to mend or improve a program instead of sending the whole of it again, and to write a long program in parts: each call sends only what is new. change replaces pieces of it, add puts text after its last line, show returns lines of it, and save keeps files an earlier run made, both without running it.',
     parameters: {
         type: 'object',
         properties: {
@@ -3298,6 +3391,7 @@ const changeFunction = () => ({
             add: { type: 'string', description: 'Text put after the last line of the program' },
             unfinished: { type: 'boolean', description: 'True when more is still to come, so the program is kept and not run yet' },
             show: { type: 'string', description: 'Lines to read, such as 150-190. Nothing is run.' },
+            save: { type: 'array', items: { type: 'string' }, description: 'Files an earlier run made, to save in save_to. Nothing is run.' },
             language: { type: 'string', enum: ['python', 'node', 'bash'], description: 'Only when the program was cut off before it said' },
             files: filesParameter,
             save_to: saveParameter,
@@ -3305,7 +3399,17 @@ const changeFunction = () => ({
             look: { type: 'array', items: { type: 'string' }, description: 'Pictures the program makes that you want to see, as in run_program' }
         }
     },
-    run: async (input, { chat, userId } = {}) => {
+    run: async (input, { chat, userId, kept } = {}) => {
+        const wanted = (Array.isArray(input?.save) ? input.save : []).map((one) => String(one).trim().replace(/^(\.\/|\/root\/work\/)/, '')).filter((one) => one && !one.startsWith('/') && !one.split('/').includes('..')).slice(0, 40);
+        if (wanted.length > 0) {
+            const folder = String(input?.save_to ?? '').trim();
+            if (!folder) return { content: 'Nothing was saved. Say which folder of the user\'s FilesystemOne in save_to.', failed: 'failed' };
+            const taken = await takeFromSandbox(programKey(userId, chat), wanted);
+            if (!taken) return { content: 'Nothing was saved: the computer those files were on is gone. Run the program again with save_to.', failed: 'failed' };
+            const saved = taken.files.length > 0 ? await savePersonFiles(personFiles(), inHome(folder), taken.files) : '';
+            const lost = taken.missing.length > 0 ? `Not there: ${taken.missing.join(', ')}.` : '';
+            return { content: [saved, lost].filter(Boolean).join(' '), ...(taken.files.length === 0 ? { failed: 'failed' } : {}) };
+        }
         const program = chatPrograms.get(programKey(userId, chat));
         if (!program) return { content: 'There is no program in this chat to change. Write one with run_program.', failed: 'failed' };
         let { code } = program;
@@ -3334,7 +3438,7 @@ const changeFunction = () => ({
         if (input?.unfinished === true) return { content: keptSoFar(code) };
         if (!language) return { content: 'The change is kept, and nothing was run. Say what the program is written in: call change_program with language.', failed: 'failed' };
         if (!code.trim()) return { content: 'Nothing was run: the program is empty.', failed: 'failed' };
-        return runProgram({ language, code, input, chat, userId });
+        return runProgram({ language, code, input, chat, userId, kept });
     }
 });
 // The text of one input of a call that was cut off before its end, as far as it got.
@@ -3385,7 +3489,7 @@ const skillFunctionsFor = (chat) => {
     const active = skillsOf(chat);
     const own = active.flatMap((skill) => [...(SKILL_FUNCTIONS[skill.id] || []).filter((entry) => !entry.ready || entry.ready())].map((entry) => asChatTool(entry, () => skill.name)));
     const writes = sandboxReady() && active.some((skill) => SANDBOX_SKILLS[skill.id] || (skill.needs || []).includes('commands'));
-    return writes ? [...own, asChatTool(programFunction(), (input) => `${languageOf(input) || 'A'} program`), asChatTool(changeFunction(), (input) => (input?.show ? `lines ${clip(input.show, 20)} of the program` : 'a change to the program'))] : own;
+    return writes ? [...own, asChatTool(programFunction(), (input) => `${languageOf(input) || 'A'} program`), asChatTool(changeFunction(), (input) => (Array.isArray(input?.save) && input.save.length > 0 ? 'saving what it made' : input?.show ? `lines ${clip(input.show, 20)} of the program` : 'a change to the program'))] : own;
 };
 // The level above a chat's own skills is the whole library, searched by a few words. A model cannot turn a skill on:
 // it names the one that would help, and the person turns it on.
@@ -3785,9 +3889,9 @@ const ROLL_PERCENT = 60;
 const KEEP_MESSAGES = 6;
 const memoryStart = (chat) => (chat.memory && chat.memoryThrough > 0 && chat.memoryThrough <= chat.messages.length ? chat.memoryThrough : 0);
 const notesText = (chat) => ((chat.notes || []).length > 0 ? `Notes saved in this chat with save_note:\n${chat.notes.map((note) => `- ${note.key}: ${note.text}`).join('\n')}` : '');
-const buildMessages = (chat, listing = false, seeing = false) => {
+const buildMessages = (chat, listing = false, seeing = false, capacity = Infinity) => {
     const out = [];
-    const active = sortSkills(chat, listing).full;
+    const active = sortSkills(chat, listing, capacity).full;
     const through = memoryStart(chat);
     const system = [...active.map((skill) => (skill.id === 'components' && !listing ? `${skill.text}\n\n${COMPONENT_VALUES_PAGE}` : skill.text)), systemText(chat), chat.summary && `Summary of the earlier conversation:\n${chat.summary}`, through > 0 && `Memory of the earlier part of this conversation (those messages are not repeated below):\n${chat.memory}`, notesText(chat), todayLine(), closingOf(chat)].filter(Boolean).join('\n\n');
     if (system) out.push({ role: 'system', content: system });
@@ -3810,13 +3914,41 @@ const buildMessages = (chat, listing = false, seeing = false) => {
 const callTokens = (message) => (message.tool_calls || []).reduce((sum, call) => sum + estimateTokens(JSON.stringify(call.function || {})), 0);
 const promptTokens = (messages) => messages.reduce((sum, message) => sum + estimateTokens(message.content) + callTokens(message) + 4, 0);
 
+// How the model's room is used by the request being answered: what each part of it takes. Estimates, set right by the
+// service's own count once it has given one. `start` is how many of the messages are the conversation itself.
+const contextParts = (messages, { start, tools, marks }) => {
+    const size = (list) => list.reduce((sum, message) => sum + estimateTokens(message.content) + 4, 0);
+    const conversation = messages.slice(0, start);
+    const reply = messages.slice(start);
+    const from = new Map(marks.map((mark) => [mark.index, mark]));
+    const result = (page) => reply.filter((message, at) => message.role === 'tool' && KEPT_RESULTS.has(from.get(start + at)?.fn) === page);
+    return {
+        instructions: size(conversation.filter((message) => message.role === 'system')),
+        functions: tools?.length ? estimateTokens(JSON.stringify(tools)) : 0,
+        conversation: size(conversation.filter((message) => message.role !== 'system')),
+        pages: size(result(true)),
+        results: size(result(false)),
+        calls: reply.reduce((sum, message) => sum + callTokens(message), 0),
+        reply: size(reply.filter((message) => message.role !== 'tool'))
+    };
+};
+const presentContext = (held) => {
+    if (!held) return null;
+    const parts = Object.fromEntries(Object.entries(held.parts).map(([id, tokens]) => [id, Math.round(tokens * (held.scale || 1))]));
+    const used = Math.min(held.total, Object.values(parts).reduce((sum, tokens) => sum + tokens, 0) + held.writing);
+    return { total: held.total, room: held.room, used, left: Math.max(0, held.total - used), percent: Math.min(100, Math.round((used / held.total) * 100)), parts: { ...parts, writing: held.writing }, keptFree: held.keptFree, putAway: held.putAway, steps: held.steps };
+};
+// What each model in memory was last asked with, kept while nothing is being answered.
+const lastContext = new Map();
+
 const contextUse = (chat, facts) => {
     if (!facts) return null;
     const capacity = capacityFor(chat, facts);
     const pending = chat.attachments.filter((attachment) => !attachment.sent).reduce((sum, attachment) => sum + attachment.tokens, 0);
     const last = [...chat.messages].reverse().find((message) => message.role === 'assistant' && message.stats?.promptEvalCount);
-    const measured = last ? last.stats.promptEvalCount + (last.stats.evalCount || 0) : 0;
-    const used = Math.max(promptTokens(buildMessages(chat, facts.capabilities.includes('tools'))), measured) + pending;
+    // Of a reply, only its text is carried on: what the model thought, and the calls it wrote on the way, are not.
+    const measured = last ? last.stats.promptEvalCount + Math.min(last.stats.evalCount || 0, estimateTokens(last.content)) : 0;
+    const used = Math.max(promptTokens(buildMessages(chat, facts.capabilities.includes('tools'), false, capacity)), measured) + pending;
     const percent = Math.min(100, Math.round((used / capacity) * 100));
     return { usedTokens: used, capacityTokens: capacity, percent, warn: percent >= CONTEXT_WARN_PERCENT };
 };
@@ -3841,7 +3973,7 @@ const presentMessage = (chat, message, index) => ({
     stats: message.stats?.evalCount ? message.stats : null,
     error: message.errorCode ? new OllamaError(message.errorCode, message.errorDetail).toJSON() : null,
     stopped: message.stopped,
-    steps: (message.steps || []).map((step) => ({ tool: step.tool, input: step.input, failed: step.failed || null, ...(step.answer != null ? { answer: step.answer } : {}) })),
+    steps: (message.steps || []).map((step) => ({ tool: step.tool, input: step.input, failed: step.failed || null, ...(step.sent ? { sent: step.sent } : {}), ...(step.answer != null ? { answer: step.answer } : {}) })),
     unverified: message.unverified || [],
     attachments: message.attachmentIds.map((id) => chat.attachments.id(id)).filter(Boolean).map(presentAttachment),
     createdAt: message.createdAt
@@ -3994,6 +4126,7 @@ export const deleteChat = asyncHandler(async (req, res) => {
     await endReplies([chat.id], { wait: 5000 });
     await letSandboxGo(`${req.user.id}:${chat.id}`);
     chatPrograms.delete(programKey(req.user.id, chat));
+    for (const [key, held] of lastContext) if (held.chat.id === chat.id) lastContext.delete(key);
     await chat.deleteOne();
     logger.info('[Chat] Chat deleted', { chatId: chat.id, userId: req.user.id });
     res.status(200).json({ success: true, message: 'Chat deleted.' });
@@ -4063,14 +4196,14 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
             if (cost?.tight && !body.anyway) throw Object.assign(memoryRefusal(chat.model, cost), { loaded: await inTheWay(chat.model).catch(() => []), fitsEmpty: cost.fitsEmpty });
         }
 
-        prompt = buildMessages(chat, facts.capabilities.includes('tools'), facts.capabilities.includes('vision'));
+        prompt = buildMessages(chat, facts.capabilities.includes('tools'), facts.capabilities.includes('vision'), capacityFor(chat, facts));
         // Too long for the model: older messages are compressed into the chat's memory now, so the chat carries on here.
         if (promptTokens(prompt) + REPLY_RESERVE > capacityFor(chat, facts)) {
             const folded = await foldMemory({ chat, facts, ollama, settings, userId, now: true });
             if (folded) {
                 chat.memory = folded.memory;
                 chat.memoryThrough = folded.to;
-                prompt = buildMessages(chat, facts.capabilities.includes('tools'), facts.capabilities.includes('vision'));
+                prompt = buildMessages(chat, facts.capabilities.includes('tools'), facts.capabilities.includes('vision'), capacityFor(chat, facts));
             }
         }
         const needed = promptTokens(prompt) + REPLY_RESERVE;
@@ -4149,6 +4282,10 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
     }, DRAFT_MS);
     draft.unref?.();
     const lane = currentLane();
+    const pooled = currentTarget()?.kind === 'pool';
+    // The computer whose link this reply depends on.
+    const linked = currentTarget()?.kind === 'companion' ? String(currentTarget().id) : pooled ? String((await poolTarget(currentTarget().id).catch(() => null))?.main.id || '') : '';
+    let drops = 0;
     const run = async () => {
         if (gone) return;
         const loaded = await ollama.running().then((list) => list.models.some((entry) => entry.name === chat.model)).catch(() => true);
@@ -4157,13 +4294,13 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
         const searching = webSearchReady() && facts.capabilities.includes('tools');
         const messages = [...prompt];
         // With web search on, its own page reader does the built-in one's job, so only one of the two is offered.
-        const { listed } = sortSkills(chat, facts.capabilities.includes('tools'));
+        const { listed } = sortSkills(chat, facts.capabilities.includes('tools'), capacityFor(chat, facts));
         const on = new Set(skillsOf(chat).map((skill) => skill.id));
         const others = skillsFor(chat.owner).filter((skill) => !on.has(skill.id));
         const draws = drawsComponents(chat);
         // A skill that is only on by default offers its files once the model has opened it.
         const withFiles = facts.capabilities.includes('tools') ? skillsOf(chat).filter((skill) => (skill.files || []).length > 0 && (Array.isArray(chat.skills) || skill.default !== 'tools' || !listed.includes(skill))) : [];
-        const chatTools = facts.capabilities.includes('tools') ? [...(draws ? [openComponentTool()] : []), ...(withFiles.length > 0 ? [skillFileTool(withFiles)] : []), ...skillFunctionsFor(chat), ...(listed.length > 0 ? [openSkillTool(listed, others)] : []), ...(others.length > 0 ? [findSkillTool(others)] : []), askUserTool(), noteTool(chat), ...(process.env.FILESYSTEM_ONE_URL ? [listFilesTool(), readFileTool(), saveToFilesTool()] : []), ...(await toolsForChat(chat, userId)).filter((tool) => !(searching && tool.fn === 'read_web_page'))] : [];
+        const chatTools = facts.capabilities.includes('tools') ? [...(draws ? [openComponentTool()] : []), ...(withFiles.length > 0 ? [skillFileTool(withFiles)] : []), ...skillFunctionsFor(chat), ...(listed.length > 0 ? [openSkillTool(listed, others, capacityFor(chat, facts))] : []), ...(others.length > 0 ? [findSkillTool(others)] : []), askUserTool(), noteTool(chat), ...(process.env.FILESYSTEM_ONE_URL ? [listFilesTool(), readFileTool(), saveToFilesTool()] : []), ...(await toolsForChat(chat, userId)).filter((tool) => !(searching && tool.fn === 'read_web_page'))] : [];
         const capacity = capacityFor(chat, facts);
         const sizeFor = (list, extra = 0) => {
             const fitted = CONTEXT_STEPS.find((step) => step >= promptTokens(list) + REPLY_RESERVE + extra) || capacity;
@@ -4179,7 +4316,7 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
         const thinkRoom = facts.capabilities.includes('thinking') ? THINK_RESERVE : 0;
         // A skill that is only on by default is not given room ahead: most chats never open it, and the room grows
         // by itself in the round after one is opened.
-        const numCtx = sizeFor(messages, thinkRoom + listed.filter((skill) => Array.isArray(chat.skills) || skill.default !== 'tools').reduce((most, skill) => Math.max(most, estimateTokens(skill.text)), Math.max(draws && facts.capabilities.includes('tools') ? COMPONENT_ROOM : 0, withFiles.some((skill) => skill.source !== 'mollama') ? SKILL_FILE_ROOM : 0)));
+        const numCtx = sizeFor(messages, thinkRoom + listed.filter((skill) => Array.isArray(chat.skills) || skill.default !== 'tools').reduce((most, skill) => Math.max(most, isLong(skill, capacity) ? skillRoom(capacity) : estimateTokens(skill.text)), Math.max(draws && facts.capabilities.includes('tools') ? COMPONENT_ROOM : 0, withFiles.some((skill) => skill.source !== 'mollama') ? SKILL_FILE_ROOM : 0)));
         // The room a model is given grows with what the reply has gathered: a skill it opened, a file it read.
         let room = numCtx;
         let grew = false;
@@ -4201,7 +4338,9 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
         const away = (mark) => {
             const held = messages[mark.index];
             delete held.images;
-            held.content = `[Put away to save room: what ${mark.fn} returned for ${clip(JSON.stringify(mark.given ?? {}), 300)}, ${String(held.content).length.toLocaleString('en-GB')} characters, read ${round - mark.round} steps ago. Call ${mark.fn} again with exactly the same input to see it again, or keep what you need with save_note.]`;
+            const size = String(held.content).length.toLocaleString('en-GB');
+            // A program is not run again only to see what it gave back: its first and last lines stay.
+            held.content = PROGRAM_CALLS.has(mark.fn) ? `[Put away to save room: ${size} characters a program gave back ${round - mark.round} steps ago. It began and ended:\n${bothEnds(String(held.content), 450)}]` : `[Put away to save room: what ${mark.fn} returned for ${clip(JSON.stringify(mark.given ?? {}), 300)}, ${size} characters, read ${round - mark.round} steps ago. Call ${mark.fn} again with exactly the same input to see it again, or keep what you need with save_note.]`;
             mark.away = true;
             awayKeys.add(mark.key);
         };
@@ -4222,6 +4361,7 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
         let reserve = chatTools.some((tool) => tool.fn === 'run_program') ? Math.max(REPLY_RESERVE * 2, Math.min(PROGRAM_ROOM, Math.floor(capacity / 4))) : REPLY_RESERVE * 2;
         let programming = false;
         let cutsInVain = 0;
+        let sentRoom = REPLY_SENT_CHARS;
         // Calls that failed, so one made again and again with the same input is not run without end.
         const failures = new Map();
         // An earlier version of a program is no use once a later one has been sent: the last one stays as it was.
@@ -4278,6 +4418,13 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
                 room = Math.max(room, sizeFor(messages, thinkRoom + uncounted + (programming ? reserve : 0)));
                 const calls = [];
                 let cutCall = null;
+                // A pooled or online model has all of its room at once; Ollama sets aside more as the reply needs it.
+                live.context = {
+                    total: capacity, room: facts.online || pooled ? capacity : request.options.num_ctx, parts: contextParts(messages, { start: prompt.length, tools: request.tools, marks }),
+                    scale: live.context?.scale || 1, writing: 0, keptFree: reserve, putAway: marks.filter((mark) => mark.away).length, steps: round
+                };
+                let wrote = 0;
+                write({ type: 'context', context: presentContext(live.context) });
                 let said = '';
                 let endedBy = null;
                 let unread = false;
@@ -4287,6 +4434,8 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
                 for await (const part of stream) {
                     // Nothing that arrives after Stop is kept or shown, even if the service had already sent it.
                     if (gone) break;
+                    wrote += (part.message?.thinking?.length || 0) + (part.message?.content?.length || 0) + (part.message?.tool_draft?.length || 0);
+                    live.context.writing = Math.ceil(wrote / 4);
                     if (part.message?.tool_start) write({ type: 'note', text: doingOf(String(part.message.tool_start), chatTools) });
                     if (part.message?.tool_draft) write({ type: 'draft', text: String(part.message.tool_draft) });
                     if (part.message?.thinking) {
@@ -4312,10 +4461,31 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
                         // The first request of a reply holds the conversation alone. Later ones also hold what its tools
                         // returned, which is gone once the reply is written, so they are not what the chat is measured by.
                         promptEvalCount = promptEvalCount || part.prompt_eval_count || null;
+                        // A count far from the estimate leaves out what the service had already read, so it is not used.
+                        const guess = Object.values(live.context.parts).reduce((sum, tokens) => sum + tokens, 0);
+                        const scale = part.prompt_eval_count / guess;
+                        if (scale > 0.6 && scale < 2) live.context.scale = scale;
+                        if (part.eval_count) live.context.writing = part.eval_count;
+                        write({ type: 'context', context: presentContext(live.context) });
                         if (part.prompt_eval_count > counted) uncounted = Math.max(uncounted, Math.min(part.prompt_eval_count - counted, Math.floor(capacity / 2)));
                     }
                 }
                 } catch (error) {
+                    // A link that drops and comes back costs only the step being written: what the reply has gathered
+                    // is still here, so the step is asked again. The desktop app usually saves even that.
+                    if (!gone && linked && drops < MAX_DROPS && mapOllamaError(error).code === 'DEVICE_OFFLINE') {
+                        drops += 1;
+                        write({ type: 'note', text: 'The link to your computer dropped. Waiting for it to come back…' });
+                        await waitUntil(() => gone || (deviceGateway.isOnline(linked) && (!pooled || Boolean(poolStateOf(linked)))), RETURN_MS);
+                        if (gone || deviceGateway.isOnline(linked)) {
+                            if (gone) break;
+                            reply.content = reply.content.slice(0, reply.content.length - said.length);
+                            write({ type: 'replace', text: reply.content });
+                            correcting = true;
+                            round -= 1;
+                            continue;
+                        }
+                    }
                     // A small model sometimes writes a function call that Ollama cannot read, which ends the reply with
                     // an error. It is asked once more, as a second attempt usually comes out right.
                     if (gone || reasked || !request.tools || !UNREADABLE_CALL.test(String(error?.error || error?.message || ''))) throw error;
@@ -4445,9 +4615,14 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
                     const given = opener ? opener.slip(name) : toolArguments(call.function?.arguments);
                     const input = mine?.shown ? mine.shown(given) : mine ? clip(JSON.stringify(given), 500) : toolInput(name, call.function?.arguments);
                     const step = { tool: mine ? mine.label : name, input, failed: null };
+                    const sent = PROGRAM_CALLS.has(mine?.fn) ? sentText(given) : '';
+                    if (sent && sentRoom > 0) {
+                        step.sent = clip(sent, Math.min(STEP_SENT_CHARS, sentRoom));
+                        sentRoom -= step.sent.length;
+                    }
                     reply.steps.push(step);
                     write({ type: 'note', text: doingOf(mine ? mine.fn : name, chatTools) });
-                    write({ type: 'tool', tool: step.tool, input });
+                    write({ type: 'tool', tool: step.tool, input, ...(step.sent ? { sent: step.sent } : {}) });
                     // The same call made again in a reply is not run again: the model is given what it got before, so a
                     // model that has lost its way is moved on instead of going round in circles.
                     const same = `${mine ? mine.fn : name}\n${JSON.stringify(given ?? input)}${mine?.fn === 'change_program' ? `\n${chatPrograms.get(programKey(userId, chat))?.code ?? ''}` : ''}`;
@@ -4559,7 +4734,7 @@ const MAX_MEMORY_CHARS = 12000;
 const foldMemory = async ({ chat, facts, ollama, settings, userId, now = false }) => {
     try {
         const capacity = capacityFor(chat, facts);
-        if (!now && promptTokens(buildMessages(chat, facts.capabilities.includes('tools'))) * 100 < capacity * ROLL_PERCENT) return null;
+        if (!now && promptTokens(buildMessages(chat, facts.capabilities.includes('tools'), false, capacity)) * 100 < capacity * ROLL_PERCENT) return null;
         const from = memoryStart(chat);
         let to = chat.messages.length - KEEP_MESSAGES;
         while (to > from && chat.messages[to]?.role !== 'user') to -= 1;
@@ -4621,7 +4796,7 @@ export const recoverReplies = async (quietMs = 45000) => {
 };
 
 const openLive = (id, model = null) => {
-    const live = { events: [], listeners: new Set(), stop: null, stopped: false, seq: 0, target: currentTarget()?.id ?? null, model };
+    const live = { events: [], listeners: new Set(), stop: null, stopped: false, seq: 0, target: currentTarget()?.id ?? null, model, startedAt: Date.now() };
     liveReplies.set(id, live);
     return live;
 };
@@ -4639,6 +4814,7 @@ const takeTurns = async (chat, body, userId, res) => {
                 logger.error('[Chat] Turn failed', { chatId: id, message: String(error?.message || '').slice(0, 200) });
                 if (turn.res && !turn.res.headersSent) turn.res.status(500).json({ success: false, message: 'The message could not be sent.' });
             }
+            if (turn.live.context) lastContext.set(useKey(turn.live.target, turn.live.model || turn.chat.model), { chat: { id, title: turn.chat.title }, context: presentContext(turn.live.context) });
             if (turn.live.model || turn.chat?.model) modelUse.set(useKey(turn.live.target, turn.live.model || turn.chat.model), Date.now());
             for (const listener of turn.live.listeners) {
                 if (!listener.writableEnded) listener.end();
@@ -4714,7 +4890,7 @@ export const liveReply = asyncHandler(async (req, res) => {
     const chat = await findChat(req, res);
     if (!chat) return;
     const live = liveReplies.get(chat.id);
-    res.status(200).json({ success: true, replying: Boolean(live), seq: live?.seq || 0, events: live?.events || [] });
+    res.status(200).json({ success: true, replying: Boolean(live), seq: live?.seq || 0, events: live?.events || [], workedMs: live ? Date.now() - live.startedAt : 0 });
 });
 
 export const rejoinReply = asyncHandler(async (req, res) => {
@@ -4730,6 +4906,9 @@ export const rejoinReply = asyncHandler(async (req, res) => {
         'X-Accel-Buffering': 'no'
     });
     res.flushHeaders();
+    // How long it has been going, as a length of time, since the two clocks may differ.
+    res.write(`${JSON.stringify({ type: 'clock', workedMs: Date.now() - live.startedAt })}
+`);
     for (const event of live.events) res.write(`${JSON.stringify(event)}\n`);
     live.listeners.add(res);
     res.on('close', () => live.listeners.delete(res));
@@ -5314,6 +5493,16 @@ export const removeProvider = asyncHandler(async (req, res) => {
 const MAX_CHAT_TOOLS = 40;
 const TOOL_RESULT_CHARS = 20000;
 const STEP_ANSWER_CHARS = 1500;
+// The programs a reply sent, kept on its steps so the person can open them.
+const STEP_SENT_CHARS = 8000;
+const REPLY_SENT_CHARS = 160000;
+const sentText = (given) => [
+    typeof given?.code === 'string' && given.code,
+    ...(Array.isArray(given?.change) ? given.change : []).filter((one) => one && typeof one === 'object').map((one) => `Replace:\n${one.find ?? ''}\n\nWith:\n${one.replace ?? ''}`),
+    typeof given?.add === 'string' && given.add && `Add at the end:\n${given.add}`,
+    given?.show && `Show lines ${given.show}`,
+    Array.isArray(given?.save) && given.save.length > 0 && `Save ${given.save.join(', ')} in ${given.save_to || 'no folder'}`
+].filter(Boolean).join('\n\n');
 const TOOL_CALLS_AN_HOUR = 120;
 const PERMISSION_WAIT_MS = 3 * 60 * 1000;
 
