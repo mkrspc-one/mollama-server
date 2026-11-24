@@ -3512,32 +3512,23 @@ const SKILL_FUNCTIONS = {
         label: 'Visual Explainer render',
         doing: 'Rendering the page…',
         ready: () => sandboxReady(),
-        description: 'Does what `node kit/render.mjs <name>.src.html` does in the Visual Explainer skill, then shows the page to the user in the chat: it renders your page source with the skill\'s kit, looks at it in a browser, and gives you the report. Give the whole source page as you would write <name>.src.html, linking the kit with <link rel="stylesheet" data-ve-kit>. The page is shown in the app\'s own theme, which takes the place of the kit\'s colours and fonts, so pick no register or palette and add no theme picker. Fix every ✗ the report lists and call again with the whole page. Nothing is saved to the user\'s files.',
+        description: 'Does what `node kit/render.mjs <name>.src.html` does in the Visual Explainer skill, then shows the page to the user in the chat: it renders your page source with the skill\'s kit, looks at it in a browser, and gives you the report. Give the whole source page as you would write <name>.src.html, linking the kit with <link rel="stylesheet" data-ve-kit>. Every <svg> needs an aria-label saying what it shows (aria-hidden="true" when it is decoration). The page is shown in the app\'s own theme, which takes the place of the kit\'s colours and fonts, so pick no register or palette and add no theme picker. When the report lists a ✗, mend it with visual_explainer_change. Nothing is saved to the user\'s files.',
         parameters: { type: 'object', properties: { page: { type: 'string', description: 'The whole page source, as <name>.src.html' }, title: { type: 'string', description: 'A few words naming the page' } }, required: ['page'] },
-        run: async (input, { show, kept }) => {
-            const page = String(input?.page ?? '').replace(/\r\n/g, '\n').trim();
-            const title = clip(String(input?.title || 'Visual explainer').replace(/["<>]/g, ''), 80);
-            if (!/data-ve-kit/.test(page)) return { content: 'Nothing was rendered. The page must link the kit in its <head>: <link rel="stylesheet" href="kit.css" data-ve-kit>.', failed: 'failed' };
-            if (page.length > MAX_PROGRAM_CHARS) return { content: `Nothing was rendered. A page may be at most ${MAX_PROGRAM_CHARS.toLocaleString('en-GB')} characters.`, failed: 'failed' };
-            let answer;
-            try {
-                // The rendered page asks Google for its fonts, and the check in the browser waits for the page to load, so
-                // this one job may reach those two addresses and nothing else.
-                answer = await runInSandbox({ language: 'bash', seconds: 120, allow: ['fonts.googleapis.com', 'fonts.gstatic.com'], files: [{ path: 'page.src.html', buffer: Buffer.from(page) }], code: 'node /root/skills/visual-explainer/kit/render.mjs page.src.html -o page.html 2>&1' });
-            } catch (error) {
-                return { content: `Nothing was rendered. ${error.message}`, failed: 'failed' };
-            }
-            const report = String(answer.stdout || '').replace(/\/root\/work\//g, '').trim();
-            const built = (answer.files || []).find((one) => one.path === 'page.html');
-            if (!built) return { content: `Nothing was shown: the render wrote no page.\n${clip(report || answer.stderr, 4000)}\nFix this and call visual_explainer_render again with the whole page.`, failed: 'failed' };
-            const problems = answer.exitCode !== 0;
-            // A page with something to fix goes back once before it is shown, as the skill has it fixed first; a second
-            // render is shown whatever is left, so the person is never left with nothing.
-            const before = kept?.get('visual_explainer_render') || 0;
-            kept?.set('visual_explainer_render', before + 1);
-            if (problems && before === 0) return { content: `Not shown yet. The render found something to fix:\n${clip(report, 4000)}\nFix these and call visual_explainer_render again with the whole page.`, failed: 'failed' };
-            show(explainerBlock(built.buffer.toString('utf8'), title), `Visual explainer ${title}`);
-            return { content: `Rendered and showed "${title}" to the user in the chat, in the app's theme.${problems ? ' Still to fix:' : ' Report:'}\n${clip(report, 3000)}\nYou cannot see the page from here.` };
+        run: async (input, context) => buildExplainer(String(input?.page ?? ''), input?.title, context)
+    }, {
+        name: 'visual_explainer_change',
+        label: 'Visual Explainer render',
+        doing: 'Mending the page…',
+        ready: () => sandboxReady(),
+        description: 'Changes the last page given to visual_explainer_render in this chat, then renders, checks and shows it as visual_explainer_render does. Use it to mend or improve a page instead of sending the whole of it again: give only the pieces that change.',
+        parameters: { type: 'object', properties: { change: CHANGES, title: { type: 'string', description: 'A new title, only when it changes' }, show: { type: 'string', description: 'Lines of the page to read, such as 120-150. Nothing is rendered.' } } },
+        run: async (input, context) => {
+            const held = chatFigures.get(programKey(context.userId, context.chat))?.visual_explainer;
+            if (!held) return { content: 'There is no page in this chat to change. Render one with visual_explainer_render.', failed: 'failed' };
+            if (String(input?.show ?? '').trim()) return { content: shownLines(held.code, input.show) };
+            const edited = applyChanges(held.code, input?.change);
+            if (edited.problem || !Array.isArray(input?.change) || input.change.length === 0) return { content: `Nothing was changed or rendered. ${edited.problem || 'Give the pieces to change.'}`, failed: 'failed' };
+            return buildExplainer(edited.code, input?.title ?? held.title, context);
         }
     }]
 };
@@ -4253,6 +4244,76 @@ const exportCad = async (input, context) => {
     return { content: `Exported ${name}.${format}: ${Number(done[3]).toLocaleString('en-GB')} triangles, ${Number(done[2]).toLocaleString('en-GB')} bytes.\n\n${saved}` };
 };
 
+// The render refuses a page for small things that were only left out, and a page takes a small model many minutes to
+// write: the kit's link and a label on a drawing are put in for it, and it is told, so it can say them better.
+const tidyExplainer = (given, title) => {
+    const added = [];
+    let page = given;
+    if (!/data-ve-kit/.test(page)) {
+        const link = '<link rel="stylesheet" href="kit.css" data-ve-kit>';
+        page = /<head\b[^>]*>/i.test(page) ? page.replace(/<head\b[^>]*>/i, (head) => `${head}\n${link}`) : /<html\b[^>]*>/i.test(page) ? page.replace(/<html\b[^>]*>/i, (root) => `${root}\n<head>${link}</head>`) : `<!doctype html>\n<html lang="en">\n<head><title>${inHtml(title)}</title>${link}</head>\n<body><main>\n${page}\n</main></body>\n</html>`;
+        added.push('the kit\'s link in <head>');
+    }
+    const heads = page.match(/<link\b[^>]*data-ve-kit[^>]*>/gi) || [];
+    if (heads.length > 1) {
+        let kept = false;
+        page = page.replace(/<link\b[^>]*data-ve-kit[^>]*>/gi, (link) => { if (kept) return ''; kept = true; return link; });
+    }
+    let labels = 0;
+    // Scripts are left as they are: what looks like a drawing in one is text.
+    page = page.split(/(<script\b[\s\S]*?<\/script>)/i).map((part) => (/^<script\b/i.test(part) ? part : part.replace(/<(svg|pre)\b([^>]*)>(?=([\s\S]{0,400}))/gi, (tag, name, attributes, after) => {
+        if (/^pre$/i.test(name) && !/\bmermaid\b/i.test(attributes)) return tag;
+        if (/\baria-(label|labelledby|hidden)\b/i.test(attributes) || /^\s*<title\b/i.test(after)) return tag;
+        labels += 1;
+        const closed = /\/\s*$/.test(attributes);
+        return `<${name}${attributes.replace(/\/\s*$/, '')} aria-label="${inHtml(title)}"${closed ? ' /' : ''}>`;
+    }))).join('');
+    if (labels > 0) added.push(`aria-label="${title}" on ${labels === 1 ? 'a drawing' : `${labels} drawings`} that had none`);
+    return { page, added };
+};
+// The report says a label is too small and not how much larger it must be: a model that guesses asks again and again.
+const labelSizes = (report) => {
+    const least = new Map();
+    for (const [, size, label] of report.matchAll(/label renders at ([0-9.]+)px at [0-9]+px \("([^"]*)"\)/g)) least.set(label, Math.min(least.get(label) ?? Infinity, Number(size)));
+    const lines = [...least].filter(([, size]) => size > 0).map(([label, size]) => `“${label}”: make its font-size ${(Math.ceil((12.2 / size) * 100) / 100).toFixed(2)} times what it is`);
+    return lines.length > 0 ? `\nEnough, in one change: ${lines.join('; ')}, for every label of that size, and move any that would then lie on the drawing.` : '';
+};
+const buildExplainer = async (given, named, { show, kept, chat, userId }) => {
+    const title = clip(String(named || 'Visual explainer').replace(/["<>]/g, ''), 80);
+    const source = given.replace(/\r\n/g, '\n').trim();
+    if (!source || source.startsWith(PROGRAM_AWAY)) return { content: 'Nothing was rendered. Give the whole page, or mend the last one with visual_explainer_change.', failed: 'failed' };
+    if (source.length > MAX_PROGRAM_CHARS) return { content: `Nothing was rendered. A page may be at most ${MAX_PROGRAM_CHARS.toLocaleString('en-GB')} characters.`, failed: 'failed' };
+    const { page, added } = tidyExplainer(source, title);
+    keepFigure(userId, chat, { code: page, title }, 'visual_explainer');
+    const put = added.length > 0 ? `\nPut in for you: ${added.join('; ')}. Say it better with visual_explainer_change if the drawing needs it.` : '';
+    const mend = 'Mend it with visual_explainer_change, sending only the lines that change.';
+    let answer;
+    try {
+        // The rendered page asks Google for its fonts, and the check in the browser waits for the page to load, so
+        // this one job may reach those two addresses and nothing else.
+        answer = await runInSandbox({ language: 'bash', seconds: 120, allow: ['fonts.googleapis.com', 'fonts.gstatic.com'], files: [{ path: 'page.src.html', buffer: Buffer.from(page) }], code: 'node /root/skills/visual-explainer/kit/render.mjs page.src.html -o page.html 2>&1' });
+    } catch (error) {
+        return { content: `Nothing was rendered. ${error.message} The page is kept: visual_explainer_change renders it again.`, failed: 'failed' };
+    }
+    const report = String(answer.stdout || '').replace(/\/root\/work\//g, '').trim();
+    const built = (answer.files || []).find((one) => one.path === 'page.html');
+    if (!built) return { content: `Nothing was shown: the render wrote no page.\n${clip(report || answer.stderr, 4000)}${put}\n${mend}`, failed: 'failed' };
+    const problems = answer.exitCode !== 0;
+    // A page with something to fix goes back once before it is shown, as the skill has it fixed first; a second
+    // render is shown whatever is left, so the person is never left with nothing.
+    const before = kept?.get('visual_explainer_render') || 0;
+    kept?.set('visual_explainer_render', before + 1);
+    const block = explainerBlock(built.buffer.toString('utf8'), title);
+    const showing = `Visual explainer ${title}`;
+    if (problems && before === 0) {
+        kept?.set('unshown', { block, key: showing });
+        return { content: `Not shown yet. The render found something to fix:\n${clip(report, 4000)}${labelSizes(report)}${put}\n${mend}`, failed: 'failed' };
+    }
+    kept?.delete('unshown');
+    show(block, showing);
+    return { content: `Rendered and showed "${title}" to the user in the chat, in the app's theme.${problems ? ' Still to fix:' : ' Report:'}\n${clip(report, 3000)}${problems ? labelSizes(report) : ''}${put}\n${problems ? 'The user has the page. Mend it once with visual_explainer_change if it is worth it, then go on. ' : ''}You cannot see the page from here.` };
+};
+
 // A built Visual Explainer page holds the kit's styles and scripts word for word. In the reply they are named, as Parts
 // the chat fills from the skill's own files, so the chat keeps only the page's own text. A page whose kit does not
 // match the files here is kept whole. The kit's colours and fonts give way to the app's theme.
@@ -4616,7 +4677,7 @@ export const cutInput = (text, name) => {
     }
 };
 const PROGRAM_CALLS = new Set(['run_program', 'change_program']);
-const FIGURE_KINDS = { hairline_build: 'hairline', hairline_change: 'hairline', anatomy_build: 'anatomy', anatomy_change: 'anatomy', cad_build: 'cad', mech_run: 'cad', cad_change: 'cad', art_build: 'art', art_change: 'art' };
+const FIGURE_KINDS = { hairline_build: 'hairline', hairline_change: 'hairline', anatomy_build: 'anatomy', anatomy_change: 'anatomy', cad_build: 'cad', mech_run: 'cad', cad_change: 'cad', art_build: 'art', art_change: 'art', visual_explainer_render: 'visual_explainer', visual_explainer_change: 'visual_explainer' };
 const FIGURE_CALLS = new Set(Object.keys(FIGURE_KINDS));
 // The text of the last figure or script of a kind kept for a chat.
 const keptFigure = (userId, chat, kind) => {
@@ -5558,7 +5619,7 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
                 const given = toolArguments(call.function.arguments);
                 if (JSON.stringify(given).length < PUT_AWAY_MIN_CHARS) continue;
                 const size = JSON.stringify(given).length.toLocaleString('en-GB');
-                call.function = { name: call.function.name, arguments: FIGURE_KINDS[call.function.name] && !/_change$/.test(call.function.name) ? { code: `${PROGRAM_AWAY}, ${size} characters, put away to save room. The newest version is kept for ${FIGURE_KINDS[call.function.name]}_change.]` } : call.function.name === 'run_program' ? { language: given.language || 'python', code: `${PROGRAM_AWAY}, ${size} characters, put away to save room. The newest version is kept for change_program.]` } : { add: `[An earlier change, ${size} characters, put away to save room.]` } };
+                call.function = { name: call.function.name, arguments: FIGURE_KINDS[call.function.name] && !/_change$/.test(call.function.name) ? { [call.function.name === 'visual_explainer_render' ? 'page' : 'code']: `${PROGRAM_AWAY}, ${size} characters, put away to save room. The newest version is kept for ${FIGURE_KINDS[call.function.name]}_change.]` } : call.function.name === 'run_program' ? { language: given.language || 'python', code: `${PROGRAM_AWAY}, ${size} characters, put away to save room. The newest version is kept for change_program.]` } : { add: `[An earlier change, ${size} characters, put away to save room.]` } };
             }
         };
         // A reply never sends more than the model can read: Ollama would drop the start of the conversation without
@@ -6706,6 +6767,7 @@ const STEP_SENT_CHARS = 8000;
 const REPLY_SENT_CHARS = 160000;
 const sentText = (given) => [
     typeof given?.code === 'string' && given.code,
+    typeof given?.page === 'string' && given.page,
     ...(Array.isArray(given?.change) ? given.change : []).filter((one) => one && typeof one === 'object').map((one) => `Replace:\n${one.find ?? ''}\n\nWith:\n${one.replace ?? ''}`),
     typeof given?.add === 'string' && given.add && `Add at the end:\n${given.add}`,
     given?.show && `Show lines ${given.show}`,
