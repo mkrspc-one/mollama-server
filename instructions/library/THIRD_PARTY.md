@@ -70,7 +70,7 @@ Its `examples`, `kit`, `references` and `scripts` folders are included, copied u
 
 https://github.com/lucasmarkes/hairline
 
-2 skills, in `hairline`. Licence: MIT. Copyright (c) 2026 Lucas Marques.
+1 skill, in `hairline`. Licence: MIT. Copyright (c) 2026 Lucas Marques. Its second skill, Hairline Adopt, was taken out on 2026-11-24: it only passes a drawing on to Hairline Create, whose step 0 reads it.
 
 The Hairline Create skill also comes with the files its instructions name, in `hairline/hairline-hairline-create`, copied unchanged from `skills/hairline-create` at commit 034f4bf9902c: its engine (`kernel.js`), its page (`bench.html`), its rules, concepts, source and look pages, its two examples and its build, look, read and validate scripts. Mollama serves the text files to a model and to the page that shows a figure, and runs none of the scripts.
 

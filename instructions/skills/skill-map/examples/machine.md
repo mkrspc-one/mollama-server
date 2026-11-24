@@ -16,7 +16,7 @@ The bike has two systems, so the answer has a piece for each, and the two named 
 The calls, in order
 1. open_skill Anatomy. Its page sends you to the closest example and to references/craft.md.
 2. open_skill_file anatomy-anatomy examples/dial-indicator/build.mjs (the smallest example, to see how a figure is built), then references/craft.md.
-3. run_program, when it is offered, with a build script written like the example, that makes the bike figure. When run_program is not offered, write the whole figure as one SVG page yourself and put it in a Frame (see the Frame component page). Either way, build it from solids: a frame of tubes, two wheels with spokes and tyres, a crank with chainring, a hub motor in the rear wheel, a battery on the down tube, the controller under it, the display on the bar.
+3. anatomy_build, when it is offered, with a build script written like the example, that makes the bike figure; mend what it reports with anatomy_change. When anatomy_build is not offered, write the whole figure as one SVG page yourself and put it in a Frame (see the Frame component page). Either way, build it from solids: a frame of tubes, two wheels with spokes and tyres, a crank with chainring, a hub motor in the rear wheel, a battery on the down tube, the controller under it, the display on the bar.
 4. open_component Flow, then open_component Data.
 5. open_skill Hairline Create, then open_skill_file hairline-hairline-create rules.md and examples/riffle.js.
 6. hairline_build with the whole throttle figure. Fix what it reports and call it again.
@@ -28,7 +28,7 @@ An electric bicycle is an ordinary bicycle with three things added: a motor that
 
 **The whole bike**
 
-[The Anatomy figure appears here: shown by run_program's result, or as the Frame you wrote.]
+[The Anatomy figure appears here: shown by anatomy_build, or as the Frame you wrote.]
 
 The figure shows the bike from the drive side. The battery sits on the down tube, low and central, where its weight disturbs the handling least. The hub motor is inside the rear wheel. The controller is the small box under the battery, and the cables run inside the frame to the display on the handlebar.
 

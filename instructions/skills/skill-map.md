@@ -14,8 +14,9 @@ Nothing limits a reply's length, figures or function calls. Explain until the to
 | Steps, a comparison, a plan | Rich Markdown First | Markdown tables, lists, Mermaid |
 | A diagram, flow, tree or table in the reply | Components | component blocks |
 | A page with several connected figures | Visual Explainer | visual_explainer_render |
-| A real machine drawn in detail | Anatomy | run_program, or your own SVG page in a Frame |
-| A small line figure that moves with the pointer | Hairline Create | hairline_build |
+| A real machine drawn in detail | Anatomy | anatomy_build |
+| A small line figure that moves with the pointer, also from an SVG the user has | Hairline Create | hairline_read for the SVG, hairline_build |
+| A 3D part, or a mechanism that moves | CadSmith | cad_build, mech_run |
 | A Word, PowerPoint, Excel or PDF file | DOCX, PPTX, XLSX, PDF | run_program |
 
 Use only skills that are on; find_skill names others. Two skills in one request each make their own piece, never one figure together. Plan the pieces first, open each skill once, build each piece with its function, then write around them.

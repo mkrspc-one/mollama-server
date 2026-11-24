@@ -3139,7 +3139,56 @@ const hairlineFaults = (() => {
     };
 })();
 const CHANGES = { type: 'array', items: { type: 'object', properties: { find: { type: 'string', description: 'Text in it, copied exactly, that occurs once' }, replace: { type: 'string', description: 'What takes its place' } }, required: ['find', 'replace'] }, description: 'The pieces to replace, in order' };
+const CAD_NAME = { type: 'string', description: 'A short file name for it without an ending, in lower case, such as bracket' };
+const CAD_SAVE = { type: 'string', description: 'The FilesystemOne folder for the files it makes. Left out, a CadSmith folder in the user\'s own folder.' };
+const CAD_BUILD = {
+    name: 'cad_build',
+    label: 'CadSmith build',
+    doing: 'Building the model…',
+    ready: () => sandboxReady(),
+    description: 'Does what `python ./output/<name>.py` does in the CadSmith skills, then shows the model to the user in the chat\'s 3D viewer. Your build123d or CadQuery script is saved as output/<name>.py on this chat\'s computer and run there; what it exported is measured (separate bodies, size, volume, whether it is watertight), and the .py, .step and .stl files are offered to the user to save. The script must export to ./output/<name>.step and ./output/<name>.stl. Give the whole script. The viewer in the chat takes the place of the skill\'s Three.js previewer, its manifest and its reviewer, none of which can run here, so judge the model by the measurements. When it returns things to fix, mend them with cad_change. Use this for a model instead of run_program.',
+    parameters: { type: 'object', properties: { code: { type: 'string', description: 'The whole script as you would save it in output/<name>.py' }, name: CAD_NAME, save_to: CAD_SAVE }, required: ['code', 'name'] },
+    run: async (input, context) => buildCad(String(input?.code ?? ''), input, context, 'model')
+};
+const MECH_RUN = {
+    name: 'mech_run',
+    label: 'CadSmith mechanism',
+    doing: 'Running the mechanism…',
+    ready: () => sandboxReady(),
+    description: 'Does what `uv run mech run output/<name>.py` does in CadSmith Make Mechanism, then shows the mechanism at its home pose in the chat\'s 3D viewer, each part in its own colour. Your script is saved as output/<name>.py on this chat\'s computer, the full analysis is run, and its summary comes back to you word for word: PASS, WARN, FAIL or INVALID with every issue line, and Δprev against the run before. Give the whole script, ending with run(build()). Then change one thing at a time with cad_change, as the skill says. `mech shot` and the skill\'s own viewer cannot run here.',
+    parameters: { type: 'object', properties: { code: { type: 'string', description: 'The whole script as you would save it in output/<name>.py' }, name: CAD_NAME, params: { type: 'string', description: 'Parameters to try without editing, as after -p, such as crank=35 gap=0.4' }, save_to: CAD_SAVE }, required: ['code', 'name'] },
+    run: async (input, context) => buildCad(String(input?.code ?? ''), input, context, 'mechanism')
+};
+const CAD_CHANGE = {
+    name: 'cad_change',
+    label: 'CadSmith build',
+    doing: 'Mending the model…',
+    ready: () => sandboxReady(),
+    description: 'Changes the last script given to cad_build or mech_run in this chat, then runs, measures and shows it as they do. Use it to mend or alter a model instead of sending the whole script again: give only the pieces that change.',
+    parameters: { type: 'object', properties: { change: CHANGES, show: { type: 'string', description: 'Lines of the script to read, such as 40-80. Nothing is run.' }, params: { type: 'string', description: 'For a mechanism: parameters to try without editing, such as crank=35' } } },
+    run: async (input, context) => {
+        const held = chatFigures.get(programKey(context.userId, context.chat))?.cad;
+        if (!held) return { content: 'There is no script in this chat to change. Build one with cad_build or mech_run.', failed: 'failed' };
+        if (String(input?.show ?? '').trim()) return { content: shownLines(held.code, input.show) };
+        const edited = Array.isArray(input?.change) && input.change.length > 0 ? applyChanges(held.code, input.change) : { code: held.code, problem: String(input?.params ?? '').trim() ? null : 'Give the pieces to change.' };
+        if (edited.problem) return { content: `Nothing was changed or run. ${edited.problem}`, failed: 'failed' };
+        return buildCad(edited.code, { ...input, name: held.name, save_to: held.folder }, context, held.mode);
+    }
+};
+const CAD_EXPORT = {
+    name: 'cad_export',
+    label: 'CadSmith export',
+    doing: 'Exporting the model…',
+    ready: () => sandboxReady(),
+    description: 'Does what the CadSmith export pipeline does for a model built in this chat, without Blender: turns output/<name>.stl, or its .step, into another kind of file and offers it to the user to save. A glb or gltf file is turned so that Y is up, as those files expect.',
+    parameters: { type: 'object', properties: { name: CAD_NAME, format: { type: 'string', enum: ['stl', 'obj', 'glb', 'ply', '3mf', 'off'], description: 'The kind of file wanted' }, save_to: CAD_SAVE }, required: ['name', 'format'] },
+    run: async (input, context) => exportCad(input, context)
+};
 const SKILL_FUNCTIONS = {
+    'cadsmith-make-model': [CAD_BUILD, CAD_CHANGE, CAD_EXPORT],
+    'cadsmith-edit-model': [CAD_BUILD, CAD_CHANGE, CAD_EXPORT],
+    'cadsmith-make-mechanism': [MECH_RUN, CAD_CHANGE],
+    'cadsmith-export-model': [CAD_EXPORT],
     'hairline-hairline-create': [{
         name: 'hairline_build',
         label: 'Hairline build',
@@ -3155,12 +3204,45 @@ const SKILL_FUNCTIONS = {
         parameters: { type: 'object', properties: { change: CHANGES, show: { type: 'string', description: 'Lines of the figure to read, such as 40-80. Nothing is built.' } } },
         run: async (input, context) => {
             const key = programKey(context.userId, context.chat);
-            const code = chatFigures.get(key);
+            const code = chatFigures.get(key)?.hairline;
             if (!code) return { content: 'There is no figure in this chat to change. Build one with hairline_build.', failed: 'failed' };
             if (String(input?.show ?? '').trim()) return { content: shownLines(code, input.show) };
             const edited = applyChanges(code, input?.change);
             if (edited.problem) return { content: `Nothing was changed or built. ${edited.problem}`, failed: 'failed' };
             return buildFigure(edited.code, context);
+        }
+    }, {
+        name: 'hairline_read',
+        label: 'Hairline read',
+        doing: 'Reading the drawing…',
+        ready: () => sandboxReady(),
+        changes: (input) => Boolean(String(input?.file ?? '').trim()),
+        description: 'Does what `node read.mjs <file.svg>` does in step 0 of the Hairline skill, for a figure made from a drawing the user already has (an icon, a logo, an illustration): it draws the SVG and returns the card of what it measured, which source.md says how to read. Give the SVG as text, or the path of an .svg file in the user\'s FilesystemOne. A model that can see is given the picture too.',
+        parameters: { type: 'object', properties: { svg: { type: 'string', description: 'The whole SVG, as text' }, file: { type: 'string', description: 'Or the FilesystemOne path of the .svg file, such as /docs/logo.svg' } } },
+        run: async (input) => readDrawing(input)
+    }],
+    'anatomy-anatomy': [{
+        name: 'anatomy_build',
+        label: 'Anatomy build',
+        doing: 'Building the figure…',
+        ready: () => sandboxReady(),
+        description: 'Does what `node examples/<name>/build.mjs` does in the Anatomy skill, then shows the page to the user in the chat. Your build script is run in the skill\'s own folder as examples/figure/build.mjs, so it imports the kit as the examples do ("../../kit/iso-kit.mjs", "../../scripts/inline-kit.mjs"), and it must write one .html page next to itself. The page is then opened in a browser with the pointer moved across it, and the skill\'s line check (scripts/lines.mjs) is run on it. Give the whole build script. When it returns things to fix, mend them with anatomy_change. The page is shown in the app\'s colours, light or dark, so --light is not needed. Use this for an Anatomy figure instead of run_program or a page of your own. You cannot see the page from here.',
+        parameters: { type: 'object', properties: { code: { type: 'string', description: 'The whole build script as you would save it in examples/<name>/build.mjs' } }, required: ['code'] },
+        run: async (input, context) => buildAnatomy(String(input?.code ?? ''), context)
+    }, {
+        name: 'anatomy_change',
+        label: 'Anatomy build',
+        doing: 'Mending the figure…',
+        ready: () => sandboxReady(),
+        description: 'Changes the last build script given to anatomy_build in this chat, then builds, checks and shows it as anatomy_build does. Use it to mend or add to a figure instead of sending the whole script again: give only the pieces that change.',
+        parameters: { type: 'object', properties: { change: CHANGES, show: { type: 'string', description: 'Lines of the build script to read, such as 40-80. Nothing is built.' } } },
+        run: async (input, context) => {
+            const code = chatFigures.get(programKey(context.userId, context.chat))?.anatomy;
+            if (!code) return { content: 'There is no build script in this chat to change. Build one with anatomy_build.', failed: 'failed' };
+            if (String(input?.show ?? '').trim()) return { content: shownLines(code, input.show) };
+            const edited = applyChanges(code, input?.change);
+            if (edited.problem) return { content: `Nothing was changed or built. ${edited.problem}`, failed: 'failed' };
+            return buildAnatomy(edited.code, context);
         }
     }],
     'explainer-visual-explainer': [{
@@ -3212,7 +3294,7 @@ addEventListener('unhandledrejection', (event) => say(event.reason && event.reas
 addEventListener('load', async () => {
   const wait = (ms) => new Promise((done) => setTimeout(done, ms));
   await wait(900);
-  const stage = document.getElementById('stage');
+  const stage = document.getElementById('stage') || document.querySelector('.iso-stage') || document.body;
   const shapes = [...stage.querySelectorAll('path,circle,ellipse,line,rect,polygon,polyline')];
   const drawn = shapes.filter((one) => one.tagName !== 'path' || (one.getAttribute('d') || '').length > 4).length;
   const bad = /NaN|undefined|Infinity/.test(stage.innerHTML.replace(/aria-[a-z]+="[^"]*"/g, ''));
@@ -3227,9 +3309,11 @@ addEventListener('load', async () => {
   stage.dispatchEvent(new PointerEvent('pointerleave', { pointerType: 'mouse', pointerId: 1, bubbles: true }));
   await wait(900);
   const slider = document.getElementById('intensity');
-  slider.value = '1';
-  slider.dispatchEvent(new Event('input', { bubbles: true }));
-  await wait(900);
+  if (slider) {
+    slider.value = '1';
+    slider.dispatchEvent(new Event('input', { bubbles: true }));
+    await wait(900);
+  }
   const shown = document.getElementById('error');
   if (shown && !shown.hidden) say(shown.textContent);
   const out = document.createElement('pre');
@@ -3283,10 +3367,11 @@ const hairlineChecks = async (code) => {
 
 // The last figure of each chat, so it is mended without being written again.
 const chatFigures = new Map();
-const keepFigure = (userId, chat, code) => {
+const keepFigure = (userId, chat, code, kind = 'hairline') => {
     const key = programKey(userId, chat);
+    const held = { ...chatFigures.get(key), [kind]: code };
     chatFigures.delete(key);
-    chatFigures.set(key, code);
+    chatFigures.set(key, held);
     if (chatFigures.size > MAX_KEPT_PROGRAMS) chatFigures.delete(chatFigures.keys().next().value);
 };
 // What a figure may call, for a model that got its figure wrong without having read it.
@@ -3326,6 +3411,379 @@ const buildFigure = async (given, { show, kept, chat, userId }) => {
     return { content: faults.length > 0
         ? [`Built hairline-${name}.html and showed it to the user in the chat, with ${faults.length} still to fix:`, ...faults, `Tell the user what is still wrong, or mend it with hairline_change. You cannot see the page from here.${kernelIndex(kept)}`].join('\n')
         : `Built hairline-${name}.html and showed it to the user in the chat. validate: ok, the figure passes the static checks. ${seen} You cannot see the page from here, so the look has not been done.` };
+};
+
+// The Hairline skill's own reading of a drawing the person has, run from the skill's folder in a sandbox.
+const readDrawing = async (input) => {
+    const nothing = (why) => ({ content: `Nothing was read. ${why}`, failed: 'failed' });
+    let svg = String(input?.svg ?? '').trim();
+    const file = String(input?.file ?? '').trim();
+    if (!svg && file) {
+        try {
+            svg = (await readPersonFiles(personFiles(), [file]))[0].buffer.toString('utf8').trim();
+        } catch {
+            return nothing(`${file} could not be read from the user's FilesystemOne. Check the path with them.`);
+        }
+    }
+    if (!/<svg[\s>]/i.test(svg)) return nothing('Give the SVG as text in svg, or the path of an .svg file in file.');
+    if (svg.length > 400000) return nothing('The SVG is too long.');
+    let answer;
+    try {
+        answer = await runInSandbox({ language: 'bash', seconds: 120, files: [{ path: 'source.svg', buffer: Buffer.from(svg) }], code: 'node /root/skills/hairline-create/read.mjs source.svg --name source 2>&1' });
+    } catch (error) {
+        return nothing(error.message);
+    }
+    const said = String(answer.stdout || '').replace(/\/root\/work\//g, '').trim();
+    if (answer.exitCode !== 0 || !said) return { content: `The drawing could not be read.\n${clip(said || answer.stderr, 3000)}`, failed: 'failed' };
+    const picture = (answer.files || []).find((one) => /-source\.png$/.test(one.path) && one.buffer.length <= MAX_LOOK_BYTES);
+    return { content: `${clip(said, 6000)}\n\n${picture ? 'The picture of the drawing is attached.' : 'No picture is attached.'} source.md says how to read the card.`, ...(picture ? { images: [picture.buffer.toString('base64')] } : {}) };
+};
+
+// An Anatomy figure is a build script the model writes, run as the skill's examples are: in the skill's own folder in a
+// sandbox, beside the kit it imports. The page it writes is opened in the sandbox's browser as a Hairline figure is, and
+// the skill's own line check is run on it. Nothing is run on this server, so without sandboxes there is no such function.
+const ANATOMY_JOB = String.raw`home=/root/skills/anatomy
+there=$home/examples/figure
+work=$PWD
+rm -rf $there && mkdir -p $there && cp build.mjs $there/build.mjs && ln -s ../../kit $there/kit && ln -s ../../scripts $there/scripts
+cd $there
+timeout 150 node build.mjs > $work/build.txt 2>&1
+built=$?
+page=$(ls -t *.html 2>/dev/null | head -1)
+cd $work
+rm -f build.mjs
+if [ $built -ne 0 ] || [ -z "$page" ]; then echo "BUILD $built"; tail -c 3000 build.txt; rm -f build.txt probe.js; exit 3; fi
+cp "$there/$page" page.html
+echo "PAGE $page"
+node -e 'const fs=require("fs");const p=fs.readFileSync("page.html","utf8");fs.writeFileSync("check.html",p.replace("</head>",()=>"<script>"+fs.readFileSync("probe.js","utf8")+"</script></head>"))'
+timeout 40 chromium --headless --no-sandbox --disable-gpu --window-size=1000,900 --virtual-time-budget=9000 --dump-dom "file://$PWD/check.html" 2>/dev/null | node -e 'let t="";process.stdin.on("data",(d)=>t+=d).on("end",()=>{const m=t.match(/<pre id="figure-probe">([^<]*)<\/pre>/);console.log("PROBE "+(m?m[1].replace(/&quot;/g,"\"").replace(/&lt;/g,"<").replace(/&gt;/g,">").replace(/&amp;/g,"&"):"none"))})'
+CHROME_PATH=$(command -v chromium) timeout 90 node $home/scripts/lines.mjs page.html 2>&1 | grep -A 8 "^line ends:"
+rm -f probe.js check.html build.txt
+exit 0`;
+// The page is drawn in the app's colours: the kit's tones are worked out from the theme's surface and text, light or
+// dark as the app is, and are the kit's own wherever the page is opened outside the app.
+const ANATOMY_THEME = (() => {
+    const surface = 'var(--app-surface,light-dark(#fbfbfa,#131313))';
+    const text = 'var(--app-text,light-dark(#18181a,#e6e6e6))';
+    const to = (colour, share) => `color-mix(in srgb,${colour} ${share}%,${surface})`;
+    const tone = (light, dark) => `light-dark(${light},${dark})`;
+    const tones = {
+        page: 'var(--app-background,light-dark(#f2f2ef,#0b0b0b))', card: surface, paper: surface, strong: text, text: to(text, 70), muted: to(text, 46),
+        face: tone(to('#fff', 80), to('#fff', 4)), top: tone(to('#fff', 80), to('#fff', 4.5)),
+        'shade-0': tone(to('#000', 12), to('#000', 22)), 'shade-1': tone(to('#000', 9), to('#000', 6)), 'shade-2': tone(to('#000', 6), to('#fff', 1)), 'shade-3': tone(to('#000', 3), to('#fff', 2.5)),
+        'lit-top': tone('#fff', to('#fff', 9)), 'lit-shade': tone(to('#000', 5), to('#fff', 5)),
+        hi: to(text, 92), mid: to(text, 45), lo: to(text, 24), faint: to(text, 13), lit: tone('#000', '#fff'), dot: to(text, 95),
+        halo: tone(to('#000', 16), to('#000', 75)), red: tone('#e5484d', '#ff6b6b'), green: tone('#30a46c', '#6be0a0'), blue: tone('#3e63dd', '#6b9bff')
+    };
+    return `<style>@supports (color:light-dark(#000,#fff)){.iso,.iso[data-theme]{${Object.entries(tones).map(([name, value]) => `--anatomy-${name}:${value};`).join('')}}}.iso-page{margin:0 auto;padding:20px 0 24px}</style>`;
+})();
+const MAX_SHOWN_PAGE = 1500000;
+// What the kit gives, for a script that called something it does not have.
+const kitNames = (kept) => {
+    if (kept?.has('anatomy:kit')) return '';
+    const names = [...(skillFileText(SKILL_BY_ID.get('anatomy-anatomy'), 'kit/iso-kit.mjs') || '').matchAll(/^export (?:async )?(?:function|const|let|class) ([A-Za-z_$][\w$]*)/gm)].map((found) => found[1]);
+    if (names.length === 0) return '';
+    kept?.set('anatomy:kit', true);
+    return `\n\nWhat kit/iso-kit.mjs exports (nothing else is in it): ${names.join(', ')}. references/kit.md gives the arguments of each.`;
+};
+const buildAnatomy = async (given, { show, kept, chat, userId }) => {
+    const code = given.replace(/\r\n/g, '\n').trim();
+    const nothing = (why) => ({ content: `Nothing was built. ${why}`, failed: 'failed' });
+    if (code.startsWith(PROGRAM_AWAY)) return nothing('Give the whole build script, or mend the last one with anatomy_change.');
+    if (!/kit\/iso-kit\.mjs/.test(code)) return nothing('An Anatomy figure is drawn with the skill\'s kit. The build script imports it as examples/dial-indicator/build.mjs does, with import * as k from "../../kit/iso-kit.mjs", and writes its page with k.pageHtml.');
+    if (code.includes('```')) return nothing('The build script must not contain three backticks in a row.');
+    if (code.length > MAX_PROGRAM_CHARS) return nothing('The build script is too long.');
+    keepFigure(userId, chat, code, 'anatomy');
+    let answer;
+    try {
+        answer = await runInSandbox({ language: 'bash', seconds: 300, files: [{ path: 'build.mjs', buffer: Buffer.from(`${code}\n`) }, { path: 'probe.js', buffer: Buffer.from(FIGURE_PROBE) }], code: ANATOMY_JOB });
+    } catch (error) {
+        return nothing(error.message);
+    }
+    const lines = String(answer.stdout || '').replace(/\r/g, '').split('\n');
+    const built = (answer.files || []).find((one) => one.path === 'page.html');
+    const mend = 'Mend it with anatomy_change, sending only the lines that change.';
+    if (answer.timedOut || !built) {
+        const said = lines.filter((line) => !/^(BUILD|PAGE|PROBE) |^\s+at (async )?(node:|ModuleJob)|^Node\.js v/.test(line)).join('\n').replace(/(file:\/\/)?\/root\/skills\/anatomy\/(examples\/figure\/)?/g, '').trim();
+        const why = answer.timedOut || lines.includes('BUILD 124') ? 'the build script ran for too long'
+            : lines.includes('BUILD 0') ? 'the build script wrote no page. It must write one .html file next to itself, as the examples do with writeFileSync and k.pageHtml'
+                : 'the build script failed';
+        return { content: `Nothing was shown: ${why}.${said ? `\n${clip(said, 3000)}` : ''}\n${mend}${kitNames(kept)}`, failed: 'failed' };
+    }
+    const name = (lines.find((line) => line.startsWith('PAGE ')) || '').slice(5).replace(/\.html$/, '').replace(/[^\w -]/g, '').slice(0, 60) || 'figure';
+    const page = built.buffer.toString('utf8');
+    let probe = null;
+    try {
+        probe = JSON.parse(lines.find((line) => line.startsWith('PROBE {'))?.slice(6) || 'null');
+    } catch {
+        probe = null;
+    }
+    const at = lines.findIndex((line) => /^line ends: \d+/.test(line));
+    const floating = at < 0 ? null : Number(lines[at].match(/\d+/)[0]);
+    const solids = (page.match(/class="iso-solid/g) || []).length;
+    const strokes = (page.match(/class="iso-line/g) || []).length;
+    const faults = [
+        ...probeFaults(probe),
+        ...(page.length > MAX_SHOWN_PAGE || page.includes('```') ? [`run: the figure fails to fit in the chat: its page is ${page.length.toLocaleString('en-GB')} characters${page.includes('```') ? ' and holds three backticks in a row' : ''}.`] : []),
+        ...(solids < 3 ? ['kit: the page draws no solids with the kit (k.solidSvg of k.slabOf, k.cylinder or k.extrude), so it is a flat drawing.'] : []),
+        ...(floating > 0 ? [`lines: ${[lines[at], ...lines.slice(at + 1, at + 8).filter((line) => /^\s+\S/.test(line))].join('\n')}\nEvery line ends on a stroke, a dot or an outline, or is marked free, as scripts/lines.mjs says.`] : [])
+    ];
+    const before = kept?.get('anatomy_build') || 0;
+    kept?.set('anatomy_build', before + 1);
+    const showing = `Anatomy ${name}`;
+    const block = ['```component', `<Frame height="560px" title="${showing}">`, page.replace(/<\/head>/i, () => `${ANATOMY_THEME}</head>`), '</Frame>', '```'].join('\n');
+    const broken = cannotShow(faults);
+    const counts = `It draws ${solids} solids and ${strokes} lines.`;
+    // As with a Hairline figure: one with something to fix goes back once, a second build is shown whatever is left, and
+    // one that does not run or draws nothing is never shown.
+    if (faults.length > 0 && (before === 0 || broken)) {
+        kept?.set('unshown', broken ? { block: `_The figure “${name}” is not shown: it did not work when it was opened._`, key: showing } : { block, key: showing });
+        return { content: [`Not shown yet. ${faults.length} to fix in ${name}.html:`, ...faults, mend].join('\n'), failed: 'failed' };
+    }
+    kept?.delete('unshown');
+    show(block, showing);
+    const seen = probe ? 'It was opened in a browser, the pointer was moved across it, and it ran without errors.' : 'It was not opened in a browser here.';
+    const ends = floating === 0 ? ' The line check found no floating ends.' : floating === null ? ' The line check did not run.' : '';
+    return { content: faults.length > 0
+        ? [`Built ${name}.html and showed it to the user in the chat, with ${faults.length} still to fix:`, ...faults, `Tell the user what is still wrong, or mend it with anatomy_change. ${counts} You cannot see the page from here.`].join('\n')
+        : `Built ${name}.html and showed it to the user in the chat, in the app's colours. ${counts} ${seen}${ends} You cannot see the page from here, so the close-ups the skill asks for have not been done.` };
+};
+
+// A CadSmith model or mechanism is a Python script the model writes, run on the chat's own computer as the skill has it
+// run: saved in output/, with what it exports left there for the next call. This goes with it and does what the skill's
+// previewer and reviewer would: it measures what was exported and writes a light copy the chat's 3D viewer can draw
+// (from the STEP file when there is one, so a curved part is not sent as a hundred thousand triangles).
+const CAD_DRIVER = String.raw`import glob, json, os, runpy, shutil, subprocess, sys, time
+NAME = __NAME__
+MODE = __MODE__
+PARAMS = __PARAMS__
+RUN = ['uv', 'run', 'mech', 'run']
+LIMIT = 900000
+os.makedirs('output', exist_ok=True)
+src = os.path.join('output', NAME + '.py')
+if os.path.exists(NAME + '.py'):
+    shutil.copyfile(NAME + '.py', src)
+    os.remove(NAME + '.py')
+began = time.time() - 2
+
+def fresh(*patterns):
+    found = []
+    for pattern in patterns:
+        found += [f for f in glob.glob(pattern, recursive=True) if os.path.getmtime(f) >= began]
+    return sorted(set(found))
+
+status = None
+if MODE == 'mechanism':
+    done = subprocess.run(RUN + [src, '--output-dir', 'output', '--step'] + (['-p'] + PARAMS if PARAMS else []), capture_output=True, text=True)
+    sys.stdout.write(done.stdout)
+    sys.stderr.write(done.stderr[-4000:])
+    status = done.returncode
+else:
+    sys.argv = [src]
+    try:
+        runpy.run_path(src, run_name='__main__')
+    except SystemExit as stop:
+        if stop.code not in (None, 0):
+            print('The script ended itself with', stop.code, file=sys.stderr)
+            sys.exit(1)
+    except BaseException:
+        kind, error, trace = sys.exc_info()
+        own = trace
+        while own is not None and os.path.abspath(own.tb_frame.f_code.co_filename) != os.path.abspath(src):
+            own = own.tb_next
+        sys.argv = [src]
+        sys.excepthook(kind, error.with_traceback(own or trace), own or trace)
+        sys.exit(1)
+sys.stdout.flush()
+
+facts = {'status': status, 'models': [], 'parts': 0, 'preview': None, 'note': ''}
+PALETTE = [(0.74, 0.76, 0.80), (0.36, 0.55, 0.82), (0.86, 0.56, 0.30), (0.42, 0.72, 0.52), (0.80, 0.42, 0.45), (0.62, 0.52, 0.80), (0.82, 0.74, 0.38), (0.35, 0.70, 0.74)]
+try:
+    import trimesh
+    coarse = []
+    if MODE == 'mechanism':
+        stls = fresh('output/*.mech/parts/*.stl')
+        facts['parts'] = len(stls)
+        shown = stls[:80]
+    else:
+        stls = fresh('output/**/*.stl')
+        steps = fresh('output/**/*.step', 'output/**/*.stp')
+        try:
+            if steps:
+                from build123d import import_step, export_stl
+            for step in steps[:3]:
+                shape = import_step(step)
+                size = shape.bounding_box().size
+                light = step + '.light.stl'
+                export_stl(shape, light, tolerance=max(size.X, size.Y, size.Z, 1e-6) / 300, angular_tolerance=0.4)
+                coarse.append(light)
+                fine = os.path.splitext(step)[0] + '.stl'
+                if not os.path.exists(fine):
+                    export_stl(shape, fine)
+                    stls.append(fine)
+        except Exception as problem:
+            facts['note'] = 'The STEP file could not be read back (%s). ' % str(problem)[:160]
+        shown = coarse or stls[:3]
+
+    def bodies(mesh):
+        if len(mesh.faces) > 400000:
+            return [mesh]
+        split = list(mesh.split(only_watertight=False))
+        return split or [mesh]
+
+    if MODE != 'mechanism':
+        for stl in stls[:4]:
+            mesh = trimesh.load(stl, force='mesh')
+            facts['models'].append({
+                'file': os.path.relpath(stl, 'output').replace(os.sep, '/'), 'triangles': int(len(mesh.faces)), 'bodies': len(bodies(mesh)),
+                'size': [round(float(side), 3) for side in mesh.extents] if len(mesh.faces) else [0, 0, 0],
+                'watertight': bool(mesh.is_watertight), 'volume': round(abs(float(mesh.volume)), 3) if mesh.is_watertight else None
+            })
+    pieces = []
+    for stl in shown:
+        mesh = trimesh.load(stl, force='mesh')
+        pieces += [mesh] if MODE == 'mechanism' else bodies(mesh)[:24]
+    lines, offset = [], 0
+    for index, mesh in enumerate(pieces):
+        tint = ' %.2f %.2f %.2f' % PALETTE[index % len(PALETTE)] if len(pieces) > 1 else ''
+        lines += ['v %.3f %.3f %.3f%s' % (v[0], v[1], v[2], tint) for v in mesh.vertices]
+        lines += ['f %d %d %d' % (f[0] + offset + 1, f[1] + offset + 1, f[2] + offset + 1) for f in mesh.faces]
+        offset += len(mesh.vertices)
+    text = '\n'.join(lines)
+    if not lines:
+        pass
+    elif len(text) > LIMIT:
+        facts['note'] += 'It is too detailed to draw in the chat (%d triangles). ' % sum(len(mesh.faces) for mesh in pieces)
+    else:
+        with open('cad-preview.obj', 'w') as out:
+            out.write(text)
+        facts['preview'] = 'cad-preview.obj'
+    for light in coarse:
+        os.remove(light)
+except Exception as problem:
+    facts['note'] += 'It could not be measured (%s: %s). ' % (type(problem).__name__, str(problem)[:200])
+print('CAD ' + json.dumps(facts))
+`;
+const CAD_EXPORTER = String.raw`import os, runpy, sys
+NAME = __NAME__
+FORMAT = __FORMAT__
+stl = os.path.join('output', NAME + '.stl')
+step = os.path.join('output', NAME + '.step')
+src = os.path.join('output', NAME + '.py')
+if os.path.exists(NAME + '.py'):
+    os.makedirs('output', exist_ok=True)
+    if not os.path.exists(src):
+        os.replace(NAME + '.py', src)
+    else:
+        os.remove(NAME + '.py')
+if not os.path.exists(stl) and not os.path.exists(step) and os.path.exists(src):
+    sys.argv = [src]
+    runpy.run_path(src, run_name='__main__')
+if not os.path.exists(stl) and os.path.exists(step):
+    from build123d import import_step, export_stl
+    export_stl(import_step(step), stl)
+if not os.path.exists(stl):
+    print('NOTHING')
+    sys.exit(0)
+import numpy, trimesh
+mesh = trimesh.load(stl, force='mesh')
+if FORMAT in ('glb', 'gltf'):
+    mesh.apply_transform(trimesh.transformations.rotation_matrix(-numpy.pi / 2, [1, 0, 0]))
+out = os.path.join('output', NAME + '.' + FORMAT)
+mesh.export(out)
+os.utime(out, None)
+print('EXPORTED %s %d %d' % (out, os.path.getsize(out), len(mesh.faces)))
+`;
+const cadName = (given, fallback) => String(given ?? '').trim().toLowerCase().replace(/\.py$/, '').replace(/[^a-z0-9_-]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || fallback;
+const MAX_CAD_BLOCK = 950000;
+const buildCad = async (given, input, context, mode) => {
+    const { show, kept, chat, userId } = context;
+    const code = given.replace(/\r\n/g, '\n').trim();
+    const change = 'cad_change';
+    const nothing = (why) => ({ content: `Nothing was run. ${why}`, failed: 'failed' });
+    if (!code || code.startsWith(PROGRAM_AWAY)) return nothing(`Give the whole script, or mend the last one with ${change}.`);
+    if (code.length > MAX_PROGRAM_CHARS) return nothing('The script is too long.');
+    if (mode === 'model' && !/\b(build123d|cadquery)\b/.test(code)) return nothing('A CadSmith model is a build123d or CadQuery script, as references/build123d-guide.md shows: it starts with from build123d import * and ends by exporting to ./output/<name>.step and ./output/<name>.stl.');
+    if (mode === 'mechanism' && !/\bmech\b/.test(code)) return nothing('A CadSmith mechanism is written with the skill\'s mech library, as its examples are: def build(...) -> Assembly, ending with run(build()).');
+    const name = cadName(input?.name, mode === 'model' ? 'model' : 'mechanism');
+    const folder = inHome(String(input?.save_to ?? '').trim() || 'CadSmith');
+    keepFigure(userId, chat, { code, name, mode, folder }, 'cad');
+    const params = String(input?.params ?? '').split(/[\s,]+/).filter((one) => /^[\w.]+=[\w.:+-]+$/.test(one)).slice(0, 12);
+    const driver = CAD_DRIVER.replace('__NAME__', () => JSON.stringify(name)).replace('__MODE__', () => JSON.stringify(mode)).replace('__PARAMS__', () => JSON.stringify(params));
+    let answer;
+    try {
+        answer = await runInSandbox({ language: 'python', code: driver, files: [{ path: `${name}.py`, buffer: Buffer.from(`${code}\n`) }], seconds: 600, keep: chat ? `${userId}:${chat.id}` : null });
+    } catch (error) {
+        return nothing(error.message);
+    }
+    const lines = String(answer.stdout || '').replace(/\r/g, '').split('\n');
+    let facts = null;
+    try {
+        facts = JSON.parse(lines.find((line) => line.startsWith('CAD {'))?.slice(4) || 'null');
+    } catch {
+        facts = null;
+    }
+    // The summary's last line points at the skill's own viewer and `mech shot`, which are not here.
+    const printed = lines.filter((line) => !line.startsWith('CAD {') && !(mode === 'mechanism' && /^view\b/.test(line))).join('\n').trim();
+    const mend = `The script is kept. Mend it with ${change}, sending only the lines that change.`;
+    if (answer.timedOut || answer.killed || (answer.exitCode !== 0 && !facts)) {
+        const why = answer.killed ? 'the script was ended by the computer it ran on, most likely for using too much memory' : answer.timedOut ? 'the script ran for longer than ten minutes' : 'the script failed';
+        return { content: [`Nothing was shown: ${why}.`, answer.stderr && `Errors:\n${bothEnds(answer.stderr, 3500)}`, printed && `It printed:\n${bothEnds(printed, 2500)}`, `${mend}${guideLine(chat, code, answer.stderr, kept)}`].filter(Boolean).join('\n\n'), failed: 'failed' };
+    }
+    const preview = (answer.files || []).find((file) => file.path === 'cad-preview.obj');
+    const made = (answer.files || []).filter((file) => /^output\//.test(file.path) && /\.(py|step|stp|stl)$/i.test(file.path) && (mode === 'model' || !/\/parts\//.test(file.path)))
+        .map((file) => ({ path: file.path.replace(/^output\//, ''), buffer: file.buffer }));
+    const invalid = mode === 'mechanism' && facts?.status === 3;
+    if (!preview && (invalid || (facts?.models || []).length === 0) && !(facts?.note || '').includes('too detailed')) {
+        const why = mode === 'mechanism' ? 'the mechanism is not valid, so there is nothing to draw'
+            : `the script ran but exported no model. End it with export_step(result, "./output/${name}.step") and export_stl(result, "./output/${name}.stl")`;
+        return { content: [`Nothing was shown: ${why}.`, printed && (mode === 'mechanism' ? printed : `It printed:\n${bothEnds(printed, 2500)}`), answer.stderr && `Errors:\n${bothEnds(answer.stderr, 2500)}`, facts?.note, mend].filter(Boolean).join('\n\n'), failed: 'failed' };
+    }
+    const number = (value) => Number(value).toLocaleString('en-GB', { maximumFractionDigits: 2 });
+    const measured = (facts?.models || []).map((one) => `${one.file}: ${one.bodies === 1 ? '1 body' : `${one.bodies} separate bodies`}, ${one.size.map(number).join(' × ')} (x × y × z), ${one.volume === null ? 'no volume, because it is NOT watertight' : `volume ${number(one.volume)}, watertight`}, ${number(one.triangles)} triangles.`);
+    const faults = (facts?.models || []).flatMap((one) => [
+        one.triangles === 0 && `${one.file} is empty: nothing was exported into it.`,
+        one.triangles > 0 && !one.watertight && `${one.file} is not watertight: it has open edges, so it cannot be printed or measured. A fillet or a cut that failed, or faces that only touch, leave it so.`,
+        one.triangles > 0 && one.watertight && one.volume === 0 && `${one.file} has no volume: it is a flat face, not a solid.`
+    ].filter(Boolean));
+    const before = kept?.get('cad_build') || 0;
+    kept?.set('cad_build', before + 1);
+    const showing = `Model ${name}`;
+    const text = preview ? preview.buffer.toString('utf8') : '';
+    const block = text && text.length <= MAX_CAD_BLOCK ? ['```component', `<Model3D format="obj" fileName="${name}.obj">`, text, '</Model3D>', '```'].join('\n') : null;
+    if (faults.length > 0 && before === 0) {
+        if (block) kept?.set('unshown', { block, key: showing });
+        return { content: [`Not shown yet. ${faults.length} to fix in ${name}:`, ...faults, ...measured, mend].join('\n'), failed: 'failed' };
+    }
+    kept?.delete('unshown');
+    if (block) show(block, showing);
+    const saved = await saveOrOffer({ fn: mode === 'model' ? 'cad_build' : 'mech_run', folder, made, context });
+    const drawn = block ? `showed it to the user in the chat's 3D viewer${mode === 'mechanism' ? `, ${facts.parts} parts at the home pose` : ''}` : 'could not draw it in the chat';
+    const head = mode === 'mechanism' ? `Ran ${name} and ${drawn}. The summary:` : `Built ${name} and ${drawn}${faults.length > 0 ? `, with ${faults.length} still to fix` : ''}.`;
+    return { content: [head, mode === 'mechanism' ? printed : [...faults, ...measured].join('\n'), mode === 'model' && printed && `It printed:\n${bothEnds(printed, 2000)}`, mode === 'mechanism' && answer.stderr && `Errors:\n${bothEnds(answer.stderr, 2000)}`, facts?.note, saved, 'You cannot see the viewer from here.'].filter(Boolean).join('\n\n') };
+};
+const exportCad = async (input, context) => {
+    const { chat, userId } = context;
+    const held = chatFigures.get(programKey(userId, chat))?.cad;
+    const name = cadName(input?.name, held?.name || 'model');
+    const format = ['stl', 'obj', 'glb', 'ply', '3mf', 'off'].includes(input?.format) ? input.format : null;
+    if (!format) return { content: 'Nothing was exported. Say which kind of file: stl, obj, glb, ply, 3mf or off.', failed: 'failed' };
+    const script = held?.name === name && held.mode === 'model' ? [{ path: `${name}.py`, buffer: Buffer.from(`${held.code}\n`) }] : [];
+    let answer;
+    try {
+        answer = await runInSandbox({ language: 'python', code: CAD_EXPORTER.replace('__NAME__', () => JSON.stringify(name)).replace('__FORMAT__', () => JSON.stringify(format)), files: script, seconds: 600, keep: chat ? `${userId}:${chat.id}` : null });
+    } catch (error) {
+        return { content: `Nothing was exported. ${error.message}`, failed: 'failed' };
+    }
+    const done = String(answer.stdout || '').match(/^EXPORTED (\S+) (\d+) (\d+)$/m);
+    const file = done && (answer.files || []).find((one) => one.path === done[1]);
+    if (!file) {
+        const why = /^NOTHING$/m.test(answer.stdout || '') ? `there is no output/${name}.stl or output/${name}.step on this chat's computer. Build the model first with cad_build` : 'the export failed';
+        return { content: [`Nothing was exported: ${why}.`, answer.stderr && `Errors:\n${bothEnds(answer.stderr, 2500)}`].filter(Boolean).join('\n\n'), failed: 'failed' };
+    }
+    const folder = inHome(String(input?.save_to ?? '').trim() || held?.folder || 'CadSmith');
+    const saved = await saveOrOffer({ fn: 'cad_export', folder, made: [{ path: file.path.replace(/^output\//, ''), buffer: file.buffer }], context });
+    return { content: `Exported ${name}.${format}: ${Number(done[3]).toLocaleString('en-GB')} triangles, ${Number(done[2]).toLocaleString('en-GB')} bytes.\n\n${saved}` };
 };
 
 // A built Visual Explainer page holds the kit's styles and scripts word for word. In the reply they are named, as Parts
@@ -3523,6 +3981,44 @@ const guideLine = (chat, code, errors, kept) => {
     })).filter((page) => page.score >= 5).sort((a, b) => b.score - a.score)[0];
     return found ? ` The skill ${found.skill.name} has a page on ${found.library} that you have not read in this reply: call open_skill_file with skill "${found.skill.id}" and file "${found.path}" before trying again.` : '';
 };
+// A Word, PowerPoint or Excel file a program made is checked at once with its skill's own script, on the same computer,
+// when that skill is on: the skills say to run it after every build, and a small model seldom does. Excel's also
+// works the formulas out, so the file that is saved holds their values.
+const OFFICE_CHECKS = [
+    { ending: /\.(docx|docm|dotx)$/i, skill: 'anthropic-docx', script: 'scripts/office/validate.py', run: (file) => `python /root/skills/docx/scripts/office/validate.py ${file}` },
+    { ending: /\.(pptx|pptm|potx)$/i, skill: 'anthropic-pptx', script: 'scripts/office/validate.py', run: (file) => `python /root/skills/pptx/scripts/office/validate.py ${file}` },
+    { ending: /\.(xlsx|xlsm|xltx)$/i, skill: 'anthropic-xlsx', script: 'scripts/recalc.py', run: (file) => `python /root/skills/xlsx/scripts/recalc.py ${file} 60` }
+];
+const checkOffice = async (chat, userId, made) => {
+    if (!chat) return null;
+    const on = new Set(skillsOf(chat).map((skill) => skill.id));
+    const found = made.map((file) => ({ file, check: OFFICE_CHECKS.find((one) => one.ending.test(file.path) && on.has(one.skill)) })).filter((one) => one.check).slice(0, 3);
+    if (found.length === 0) return null;
+    const quoted = (text) => `'${String(text).replace(/'/g, '\'\\\'\'')}'`;
+    const code = found.map(({ file, check }, at) => `out=$(${check.run(quoted(file.path))} 2>&1); echo "=== ${at} $?"; echo "$out" | tail -c 2500`).join('\n');
+    let answer;
+    try {
+        answer = await runInSandbox({ language: 'bash', code, seconds: 240, keep: `${userId}:${chat.id}` });
+    } catch {
+        return null;
+    }
+    if (answer.fresh || answer.timedOut) return null;
+    const parts = String(answer.stdout || '').split(/^=== (\d+) (\d+)$/m);
+    const lines = [];
+    let failed = false;
+    for (let at = 1; at < parts.length; at += 3) {
+        const one = found[Number(parts[at])];
+        if (!one) continue;
+        const said = (parts[at + 2] || '').trim();
+        const wrong = parts[at + 1] !== '0' || /"status":\s*"errors_found"/.test(said);
+        failed = failed || wrong;
+        lines.push(`${one.file.path}, checked with ${SKILL_BY_ID.get(one.check.skill)?.name || one.check.skill}'s ${one.check.script}:${wrong ? ' it has faults to fix.' : ''}\n${said || 'It printed nothing.'}`);
+        // A check that changed the file (Excel's values) is what gets saved.
+        const changed = (answer.files || []).find((file) => file.path === one.file.path);
+        if (changed) one.file.buffer = changed.buffer;
+    }
+    return lines.length > 0 ? { text: lines.join('\n\n'), failed } : null;
+};
 const runProgram = async ({ fn, language, code, input, context }) => {
     const { chat, userId, kept } = context;
     const minutes = Number.isFinite(Number(input?.minutes)) ? Math.min(Math.max(Math.round(Number(input.minutes)), 1), MAX_PROGRAM_SECONDS / 60) : 5;
@@ -3545,7 +4041,12 @@ const runProgram = async ({ fn, language, code, input, context }) => {
     const look = (Array.isArray(input?.look) ? input.look.map((one) => String(one).trim().replace(/^\.?\//, '')) : []).filter(Boolean);
     const shots = (answer.files || []).filter((file) => look.includes(file.path) && LOOK_TYPES.test(file.path) && file.buffer.length <= MAX_LOOK_BYTES).slice(0, MAX_LOOKS);
     const toSave = (answer.files || []).filter((file) => !look.includes(file.path));
+    const checked = !answer.timedOut && answer.exitCode === 0 ? await checkOffice(chat, userId, toSave) : null;
     const report = reportRun(`The ${language} program`, answer, await (paths.length > 0 ? savePersonFiles(files, folder, toSave) : saveOrOffer({ fn, folder, made: toSave, context })));
+    if (checked) {
+        report.content += `\n\n${checked.text}`;
+        if (checked.failed) report.failed = 'failed';
+    }
     if (answer.fresh) report.content = `This run started on a fresh computer: the files earlier runs left are gone.\n\n${report.content}`;
     if (report.failed && chat) report.content += `\n\nThe program is kept. To mend it, send only what changes with change_program.${guideLine(chat, code, answer.stderr, kept)}`;
     if (look.length === 0) return report;
@@ -3646,7 +4147,13 @@ export const cutInput = (text, name) => {
     }
 };
 const PROGRAM_CALLS = new Set(['run_program', 'change_program']);
-const FIGURE_CALLS = new Set(['hairline_build', 'hairline_change']);
+const FIGURE_KINDS = { hairline_build: 'hairline', hairline_change: 'hairline', anatomy_build: 'anatomy', anatomy_change: 'anatomy', cad_build: 'cad', mech_run: 'cad', cad_change: 'cad' };
+const FIGURE_CALLS = new Set(Object.keys(FIGURE_KINDS));
+// The text of the last figure or script of a kind kept for a chat.
+const keptFigure = (userId, chat, kind) => {
+    const held = chatFigures.get(programKey(userId, chat))?.[kind];
+    return typeof held === 'string' ? held : held?.code ?? '';
+};
 // A call cut off before its end was not run. What there is of a program is kept, up to its last whole line, and the
 // model is told where to go on; any other call has to be written again, shorter.
 const keepCut = (cut, { chat, userId, ranOut }) => {
@@ -3681,7 +4188,9 @@ const asChatTool = (entry, shown) => ({
 });
 const skillFunctionsFor = (chat) => {
     const active = skillsOf(chat);
-    const own = active.flatMap((skill) => [...(SKILL_FUNCTIONS[skill.id] || []).filter((entry) => !entry.ready || entry.ready())].map((entry) => asChatTool(entry, () => skill.name)));
+    // Skills of one project share functions, and a chat is offered each once.
+    const own = active.flatMap((skill) => [...(SKILL_FUNCTIONS[skill.id] || []).filter((entry) => !entry.ready || entry.ready())].map((entry) => asChatTool(entry, () => skill.name)))
+        .filter((tool, at, all) => all.findIndex((one) => one.fn === tool.fn) === at);
     const writes = sandboxReady() && active.some((skill) => SANDBOX_SKILLS[skill.id] || (skill.needs || []).includes('commands'));
     return writes ? [...own, asChatTool(programFunction(), (input) => `${languageOf(input) || 'A'} program`), asChatTool(changeFunction(), (input) => (Array.isArray(input?.save) && input.save.length > 0 ? 'saving what it made' : input?.show ? `lines ${clip(input.show, 20)} of the program` : 'a change to the program'))] : own;
 };
@@ -4071,10 +4580,10 @@ export const todayLine = () => `Today is ${new Date().toLocaleDateString('en-GB'
 
 // A page a reply showed earlier is long, and the model needs only to know it was shown: it is sent back as one line.
 const LONG_PAGE = 6000;
-const shortenPages = (text) => String(text).replace(/```component\n(<Frame\b[^>]*>)[\s\S]*?```/g, (block, opening) => {
+const shortenPages = (text) => String(text).replace(/```component\n(<(Frame|Model3D)\b[^>]*>)[\s\S]*?```/g, (block, opening, tag) => {
     if (block.length <= LONG_PAGE) return block;
-    const title = (opening.match(/\btitle="([^"]*)"/) || [])[1] || 'a page';
-    return `[Shown here: "${title}", a page of ${block.length.toLocaleString('en-GB')} characters, not repeated.]`;
+    const title = (opening.match(/\b(?:title|fileName)="([^"]*)"/) || [])[1] || 'a page';
+    return `[Shown here: "${title}", a ${tag === 'Frame' ? 'page' : '3D model'} of ${block.length.toLocaleString('en-GB')} characters, not repeated.]`;
 });
 // Rolling memory: once a chat uses more than ROLL_PERCENT of its context, its older messages are folded into a memory
 // after a reply, by the chat's own model, in the background. The last KEEP_MESSAGES are always sent word for word.
@@ -4575,7 +5084,7 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
                 const given = toolArguments(call.function.arguments);
                 if (JSON.stringify(given).length < PUT_AWAY_MIN_CHARS) continue;
                 const size = JSON.stringify(given).length.toLocaleString('en-GB');
-                call.function = { name: call.function.name, arguments: call.function.name === 'hairline_build' ? { code: `${PROGRAM_AWAY}, ${size} characters, put away to save room. The newest version is kept for hairline_change.]` } : call.function.name === 'run_program' ? { language: given.language || 'python', code: `${PROGRAM_AWAY}, ${size} characters, put away to save room. The newest version is kept for change_program.]` } : { add: `[An earlier change, ${size} characters, put away to save room.]` } };
+                call.function = { name: call.function.name, arguments: FIGURE_KINDS[call.function.name] && !/_change$/.test(call.function.name) ? { code: `${PROGRAM_AWAY}, ${size} characters, put away to save room. The newest version is kept for ${FIGURE_KINDS[call.function.name]}_change.]` } : call.function.name === 'run_program' ? { language: given.language || 'python', code: `${PROGRAM_AWAY}, ${size} characters, put away to save room. The newest version is kept for change_program.]` } : { add: `[An earlier change, ${size} characters, put away to save room.]` } };
             }
         };
         // A reply never sends more than the model can read: Ollama would drop the start of the conversation without
@@ -4829,7 +5338,7 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
                     write({ type: 'tool', tool: step.tool, input, ...(step.sent ? { sent: step.sent } : {}) });
                     // The same call made again in a reply is not run again: the model is given what it got before, so a
                     // model that has lost its way is moved on instead of going round in circles.
-                    const same = `${mine ? mine.fn : name}\n${JSON.stringify(given ?? input)}${mine?.fn === 'change_program' ? `\n${chatPrograms.get(programKey(userId, chat))?.code ?? ''}` : mine?.fn === 'hairline_change' ? `\n${chatFigures.get(programKey(userId, chat)) ?? ''}` : ''}`;
+                    const same = `${mine ? mine.fn : name}\n${JSON.stringify(given ?? input)}${mine?.fn === 'change_program' ? `\n${chatPrograms.get(programKey(userId, chat))?.code ?? ''}` : FIGURE_KINDS[mine?.fn] && /_change$/.test(mine.fn) ? `\n${keptFigure(userId, chat, FIGURE_KINDS[mine.fn])}` : ''}`;
                     if (PROGRAM_CALLS.has(mine?.fn)) programming = true;
                     const failedBefore = failures.get(same);
                     // Stop does not wait for a tool that is still running: a search, a page being read, a question to the person.
