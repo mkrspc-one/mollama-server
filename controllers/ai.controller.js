@@ -2396,7 +2396,6 @@ export const SKILL_SOURCES = {
     marketing: { name: 'Marketing (Corey Haines)', repo: 'coreyhaines31/marketingskills' },
     medical: { name: 'Medical (Open Medica)', repo: 'Open-Medica/open-medical-skills' },
     dex: { name: 'Chief of staff (Dex)', repo: 'davekilleen/dex' },
-    context7: { name: 'Context7', repo: 'upstash/context7' },
     search: { name: 'Web search (Perplexica, Morphic)', repo: 'ItzCrazyKns/Perplexica, miurla/morphic' },
     last30days: { name: 'Last 30 days', repo: 'mvanhorn/last30days-skill' },
     anatomy: { name: 'Anatomy', repo: 'wheresryan22/anatomy' },
@@ -3210,7 +3209,243 @@ const ART_FUNCTIONS = [{
         return buildArt({ title: input?.title ?? held.title, subtitle: input?.subtitle ?? held.subtitle, controls: input?.controls ?? held.controls, code: edited.code }, context);
     }
 }];
+// Public medical records, read by this server for the skills that ask for them, so no program needs the network. Each is
+// a fixed address of a public service that takes no key; only the words being looked up are sent.
+const MEDICAL_KEPT = new Map();
+let pubmedNext = 0;
+const medicalText = async (address) => {
+    const held = MEDICAL_KEPT.get(address);
+    if (held && Date.now() - held.at < 10 * 60 * 1000) return held.text;
+    if (address.startsWith('https://eutils.ncbi.nlm.nih.gov/')) {
+        // PubMed allows three requests a second.
+        const wait = Math.max(0, pubmedNext - Date.now());
+        pubmedNext = Math.max(pubmedNext, Date.now()) + 400;
+        if (wait > 0) await new Promise((resolve) => setTimeout(resolve, wait));
+    }
+    const { content } = await readPage(address);
+    MEDICAL_KEPT.delete(address);
+    MEDICAL_KEPT.set(address, { text: content, at: Date.now() });
+    if (MEDICAL_KEPT.size > 100) MEDICAL_KEPT.delete(MEDICAL_KEPT.keys().next().value);
+    return content;
+};
+const medicalJson = async (address) => JSON.parse(await medicalText(address));
+const medicalTerm = (value, limit = 200) => String(value ?? '').replace(/["\\:()[\]{}<>]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, limit);
+const medicalCount = (value, most, usual) => Math.min(Math.max(Math.round(Number(value)) || usual, 1), most);
+// A service that answers "not found" has nothing on the words; any other failure is said as it is.
+const medicalRun = (source, work) => async (input) => {
+    try {
+        return await work(input || {});
+    } catch (error) {
+        if (error?.code === 'REMOTE_NOT_FOUND') return { content: `${source} has nothing on that. Try other words, such as the generic name.` };
+        return { content: `${source} could not be read just now (${error?.code === 'REMOTE_BUSY' ? 'it is busy' : 'it did not answer as expected'}). Say so; do not answer from memory as if it had been read.`, failed: 'failed' };
+    }
+};
+const xmlText = (text) => String(text ?? '').replace(/<[^>]+>/g, '').replace(/&#x([\da-f]+);/gi, (whole, hex) => String.fromCodePoint(parseInt(hex, 16))).replace(/&#(\d+);/g, (whole, number) => String.fromCodePoint(Number(number)))
+    .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, '\'').replace(/&amp;/g, '&').replace(/\s+/g, ' ').trim();
+const EUTILS = 'https://eutils.ncbi.nlm.nih.gov/entrez/eutils';
+const PUBMED_SEARCH = {
+    name: 'pubmed_search',
+    label: 'PubMed',
+    doing: 'Searching PubMed…',
+    description: 'Searches PubMed, the US National Library of Medicine\'s index of medical papers, and returns each paper\'s title, authors, journal, year, kind, abstract, PMID and DOI. Use it for any claim about what studies found, and cite the PMID. Give pmids instead of query to read those papers\' whole abstracts.',
+    parameters: {
+        type: 'object',
+        properties: {
+            query: { type: 'string', description: 'The words to search, in English, such as semaglutide heart failure' },
+            kind: { type: 'string', enum: ['any', 'review', 'systematic review', 'meta-analysis', 'randomized controlled trial', 'clinical trial', 'practice guideline'], description: 'Only papers of this kind' },
+            from_year: { type: 'integer', description: 'Only papers from this year on' },
+            sort: { type: 'string', enum: ['relevance', 'newest'] },
+            max: { type: 'integer', minimum: 1, maximum: 15, description: 'How many papers. Six when left out.' },
+            pmids: { type: 'array', items: { type: 'string' }, description: 'PMIDs of papers to read in full abstract, at most five' }
+        }
+    },
+    run: medicalRun('PubMed', async (input) => {
+        const wanted = (Array.isArray(input.pmids) ? input.pmids : []).map((one) => String(one).replace(/\D/g, '')).filter(Boolean).slice(0, 5);
+        let ids = wanted;
+        let total = null;
+        if (ids.length === 0) {
+            const words = medicalTerm(input.query);
+            if (!words) return { content: 'Nothing was searched. Give query.', failed: 'failed' };
+            const year = Number(input.from_year);
+            const term = [`(${words})`, input.kind && input.kind !== 'any' && `"${medicalTerm(input.kind)}"[Publication Type]`, year > 1800 && year < 2200 && `${Math.round(year)}:3000[dp]`].filter(Boolean).join(' AND ');
+            const found = (await medicalJson(`${EUTILS}/esearch.fcgi?db=pubmed&retmode=json&retmax=${medicalCount(input.max, 15, 6)}&sort=${input.sort === 'newest' ? 'pub_date' : 'relevance'}&term=${encodeURIComponent(term)}`)).esearchresult || {};
+            ids = (found.idlist || []).map(String);
+            total = Number(found.count) || 0;
+            if (ids.length === 0) return { content: 'PubMed has no papers on those words. Try fewer or other words.' };
+        }
+        const xml = await medicalText(`${EUTILS}/efetch.fcgi?db=pubmed&retmode=xml&id=${ids.join(',')}`);
+        const one = (text, tag) => xmlText(text.match(new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)</${tag}>`))?.[1]);
+        const papers = [...xml.matchAll(/<PubmedArticle>([\s\S]*?)<\/PubmedArticle>/g)].map(([, text]) => {
+            const article = text.match(/<Article\b[\s\S]*?<\/Article>/)?.[0] || text;
+            const authors = [...article.matchAll(/<Author\b[^>]*>([\s\S]*?)<\/Author>/g)].map(([, author]) => one(author, 'CollectiveName') || [one(author, 'LastName'), one(author, 'Initials')].filter(Boolean).join(' ')).filter(Boolean);
+            const abstract = [...article.matchAll(/<AbstractText\b([^>]*)>([\s\S]*?)<\/AbstractText>/g)].map(([, given, part]) => { const label = given.match(/Label="([^"]*)"/)?.[1]; return `${label ? `${xmlText(label)}: ` : ''}${xmlText(part)}`; }).join(' ');
+            const kinds = [...article.matchAll(/<PublicationType\b[^>]*>([^<]*)</g)].map(([, kind]) => xmlText(kind)).filter((kind) => !/^Journal Article$|Research Support/.test(kind));
+            const date = article.match(/<PubDate>([\s\S]*?)<\/PubDate>/)?.[1] || '';
+            const doi = article.match(/<ELocationID[^>]*EIdType="doi"[^>]*>([^<]*)</)?.[1];
+            const pmid = text.match(/<PMID\b[^>]*>(\d+)</)?.[1];
+            return [`${one(article, 'ArticleTitle')}`, `${authors.slice(0, 3).join(', ')}${authors.length > 3 ? ' et al.' : ''} ${one(article, 'Title')}, ${one(date, 'Year') || one(date, 'MedlineDate')}.${kinds.length > 0 ? ` ${kinds.join(', ')}.` : ''}`,
+                `PMID ${pmid}, https://pubmed.ncbi.nlm.nih.gov/${pmid}/${doi ? `, doi ${xmlText(doi)}` : ''}`, abstract ? clip(abstract, wanted.length > 0 ? 4000 : 900) : 'No abstract.'].join('\n');
+        });
+        return { content: [total === null ? '' : `${total.toLocaleString('en-GB')} papers match; these are the first ${papers.length}.`, ...papers].filter(Boolean).join('\n\n') };
+    })
+};
+const TRIALS_SEARCH = {
+    name: 'trials_search',
+    label: 'Clinical trials',
+    doing: 'Searching ClinicalTrials.gov…',
+    description: 'Searches ClinicalTrials.gov, the US registry of clinical studies around the world: each study\'s number, title, status, phase, size, sponsor, dates, treatments and countries. Give nct_id instead to read one study with who may join and what is measured.',
+    parameters: {
+        type: 'object',
+        properties: {
+            condition: { type: 'string', description: 'The disease or condition' },
+            treatment: { type: 'string', description: 'The drug, device or other treatment' },
+            status: { type: 'string', enum: ['any', 'recruiting', 'active', 'completed', 'not yet recruiting', 'terminated'] },
+            phase: { type: 'string', enum: ['any', '1', '2', '3', '4'] },
+            country: { type: 'string' },
+            max: { type: 'integer', minimum: 1, maximum: 15, description: 'How many studies. Six when left out.' },
+            nct_id: { type: 'string', description: 'One study, such as NCT06732414' }
+        }
+    },
+    run: medicalRun('ClinicalTrials.gov', async (input) => {
+        const api = 'https://clinicaltrials.gov/api/v2/studies';
+        const line = (study, whole) => {
+            const part = study.protocolSection || {};
+            const id = part.identificationModule || {};
+            const status = part.statusModule || {};
+            const places = part.contactsLocationsModule?.locations || [];
+            const countries = [...new Set(places.map((place) => place.country).filter(Boolean))];
+            const treatments = (part.armsInterventionsModule?.interventions || []).map((one) => one.name).filter(Boolean);
+            const outcomes = (part.outcomesModule?.primaryOutcomes || []).map((one) => `${one.measure}${one.timeFrame ? ` (${one.timeFrame})` : ''}`);
+            return [`${id.nctId}: ${id.briefTitle}, https://clinicaltrials.gov/study/${id.nctId}`,
+                [String(status.overallStatus || '').toLowerCase().replace(/_/g, ' '), (part.designModule?.phases || []).join(', ').replace(/PHASE/g, 'phase '), part.designModule?.enrollmentInfo?.count && `${part.designModule.enrollmentInfo.count} people`, part.sponsorCollaboratorsModule?.leadSponsor?.name, status.startDateStruct?.date && `from ${status.startDateStruct.date}`, status.primaryCompletionDateStruct?.date && `main results due ${status.primaryCompletionDateStruct.date}`, study.hasResults && 'results posted'].filter(Boolean).join('; '),
+                treatments.length > 0 && `Treatments: ${clip(treatments.join(', '), 300)}`, countries.length > 0 && `Where: ${clip(countries.join(', '), 200)}`,
+                clip(String(part.descriptionModule?.briefSummary || '').replace(/\s+/g, ' '), whole ? 2500 : 350),
+                whole && outcomes.length > 0 && `Measured: ${clip(outcomes.join('; '), 1200)}`, whole && part.eligibilityModule?.eligibilityCriteria && `Who may join: ${clip(part.eligibilityModule.eligibilityCriteria, 3500)}`].filter(Boolean).join('\n');
+        };
+        const number = String(input.nct_id ?? '').toUpperCase().match(/NCT\d{8}/)?.[0];
+        if (number) return { content: line(await medicalJson(`${api}/${number}?format=json`), true) };
+        const condition = medicalTerm(input.condition);
+        const treatment = medicalTerm(input.treatment);
+        if (!condition && !treatment) return { content: 'Nothing was searched. Give condition, treatment or nct_id.', failed: 'failed' };
+        const states = { recruiting: 'RECRUITING', active: 'ACTIVE_NOT_RECRUITING', completed: 'COMPLETED', 'not yet recruiting': 'NOT_YET_RECRUITING', terminated: 'TERMINATED' };
+        const query = new URLSearchParams({ format: 'json', countTotal: 'true', pageSize: String(medicalCount(input.max, 15, 6)) });
+        if (condition) query.set('query.cond', condition);
+        if (treatment) query.set('query.intr', treatment);
+        if (medicalTerm(input.country)) query.set('query.locn', medicalTerm(input.country));
+        if (states[input.status]) query.set('filter.overallStatus', states[input.status]);
+        if (/^[1-4]$/.test(String(input.phase ?? ''))) query.set('filter.advanced', `AREA[Phase]PHASE${input.phase}`);
+        const found = await medicalJson(`${api}?${query}`);
+        const studies = found.studies || [];
+        if (studies.length === 0) return { content: 'ClinicalTrials.gov has no studies on those words.' };
+        return { content: [`${Number(found.totalCount || studies.length).toLocaleString('en-GB')} studies match; these are the first ${studies.length}.`, ...studies.map((study) => line(study, false))].join('\n\n') };
+    })
+};
+const LABEL_PARTS = {
+    uses: ['indications_and_usage'], dosage: ['dosage_and_administration', 'dosage_forms_and_strengths'], warnings: ['boxed_warning', 'contraindications', 'warnings_and_cautions', 'warnings'],
+    interactions: ['drug_interactions', 'drug_interactions_table'], side_effects: ['adverse_reactions'], special_groups: ['pregnancy', 'pediatric_use', 'geriatric_use', 'use_in_specific_populations'], ingredients: ['active_ingredient', 'description', 'inactive_ingredient', 'spl_unclassified_section']
+};
+const DRUG_FACTS = {
+    name: 'drug_facts',
+    label: 'FDA drug data',
+    doing: 'Reading FDA drug data…',
+    description: 'Reads openFDA, the US Food and Drug Administration\'s public data on one drug: its official label (uses, dosage, warnings, interactions, side_effects, special_groups, ingredients), reports of side effects (reports), recalls, shortages, and approval. Give a generic or brand name. It is for the US, and openFDA says its data is not checked for use in care.',
+    parameters: { type: 'object', properties: { drug: { type: 'string', description: 'Generic or brand name' }, about: { type: 'string', enum: [...Object.keys(LABEL_PARTS), 'reports', 'recalls', 'shortages', 'approval'], description: 'What to read' } }, required: ['drug', 'about'] },
+    run: medicalRun('openFDA', async (input) => {
+        const drug = medicalTerm(input.drug, 80);
+        if (!drug) return { content: 'Nothing was read. Give drug.', failed: 'failed' };
+        const named = (prefix = '') => encodeURIComponent(`(${prefix}openfda.generic_name:"${drug}" OR ${prefix}openfda.brand_name:"${drug}")`);
+        const api = 'https://api.fda.gov/drug';
+        const note = 'From openFDA, whose data is not checked for use in care: say so, and that a pharmacist or doctor decides. Other forms and strengths of a drug have labels of their own.';
+        const list = (value) => (Array.isArray(value) ? value : value ? [value] : []);
+        if (input.about === 'reports') {
+            const found = (await medicalJson(`${api}/event.json?search=${named('patient.drug.')}&count=patient.reaction.reactionmeddrapt.exact&limit=20`)).results || [];
+            return { content: `Reactions most often reported with ${drug} (a report does not show that the drug caused it, and the counts are not rates):\n${found.map((one) => `- ${one.term.toLowerCase()}: ${Number(one.count).toLocaleString('en-GB')}`).join('\n')}\n\n${note}` };
+        }
+        if (input.about === 'recalls') {
+            const found = (await medicalJson(`${api}/enforcement.json?search=${named()}&limit=8&sort=report_date:desc`)).results || [];
+            return { content: `The newest recalls of ${drug}:\n${found.map((one) => `- ${one.report_date}: ${one.classification}, ${one.status}. ${one.recalling_firm}. ${clip(one.reason_for_recall, 300)} ${clip(one.product_description, 160)}`).join('\n')}\n\n${note}` };
+        }
+        if (input.about === 'shortages') {
+            const found = (await medicalJson(`${api}/shortages.json?search=${encodeURIComponent(`(generic_name:"${drug}" OR openfda.brand_name:"${drug}")`)}&limit=10`)).results || [];
+            return { content: `Shortage records of ${drug}:\n${found.map((one) => `- ${one.generic_name}, ${one.company_name}: ${one.status}${one.availability ? `, ${one.availability}` : ''}${one.shortage_reason ? `, ${one.shortage_reason}` : ''} (updated ${one.update_date})`).join('\n')}\n\n${note}` };
+        }
+        if (input.about === 'approval') {
+            const found = (await medicalJson(`${api}/drugsfda.json?search=${named()}&limit=5`)).results || [];
+            return { content: `FDA applications for ${drug}:\n${found.map((one) => {
+                const first = list(one.submissions).find((submission) => submission.submission_type === 'ORIG');
+                const product = list(one.products)[0] || {};
+                return `- ${one.application_number}, ${one.sponsor_name}: ${product.brand_name || ''} ${list(product.active_ingredients).map((part) => `${part.name} ${part.strength || ''}`).join(', ')}, ${product.dosage_form || ''}, ${product.marketing_status || ''}${first ? `, first approved ${first.submission_status_date}` : ''}`;
+            }).join('\n')}\n\n${note}` };
+        }
+        const about = LABEL_PARTS[input.about] ? input.about : 'uses';
+        // Many labels hold a name: metformin is also in a dozen combinations, whose doses are not its own. The drug by
+        // itself is found first, and a combination is read only when there is nothing else, and then said to be one.
+        const names = ((await medicalJson(`${api}/label.json?search=${named()}&count=openfda.generic_name.exact&limit=100`)).results || []).map((one) => String(one.term)).filter((name) => !name.includes('"'));
+        const mixed = (name) => /,|;|\/|\band\b|\bwith\b/i.test(name);
+        const holds = (name) => name.toLowerCase().includes(drug.toLowerCase());
+        const generic = names.some(holds) ? names.find((name) => holds(name) && !mixed(name)) || names.find(holds) : names.find((name) => !mixed(name)) || names[0];
+        if (!generic) return { content: `openFDA has no label for ${drug}.` };
+        const label = ((await medicalJson(`${api}/label.json?search=${named()}${encodeURIComponent(` AND openfda.generic_name.exact:"${generic}"`)}&limit=1`)).results || [])[0];
+        if (!label) return { content: `openFDA has no label for ${drug}.` };
+        const others = names.filter((name) => name !== generic && mixed(name)).length;
+        const which = mixed(generic) && !holds(generic) ? `${drug} is a combination: ${generic.toLowerCase()}.` : mixed(generic) && !/ and |,|;|\//i.test(drug) ? `This is the label of a combination (${generic.toLowerCase()}), not of ${drug} alone: its doses are not ${drug}'s.` : others > 0 && holds(generic) ? `Combinations with ${drug} have labels of their own, which this is not.` : '';
+        const parts = LABEL_PARTS[about].flatMap((key) => list(label[key]).map((text) => `${key.replace(/_/g, ' ').toUpperCase()}\n${clip(String(text).replace(/\s+/g, ' '), 3500)}`));
+        const titles = [list(label.openfda?.brand_name)[0], list(label.openfda?.generic_name)[0], list(label.openfda?.manufacturer_name)[0]].filter(Boolean).join(', ');
+        return { content: [`The label of ${titles || drug}, effective ${label.effective_time || 'unknown'}:`, which, parts.length > 0 ? clip(parts.join('\n\n'), 9000) : `This label has no section on ${about.replace(/_/g, ' ')}.`, note].filter(Boolean).join('\n\n') };
+    })
+};
+const ICD10_LOOKUP = {
+    name: 'icd10_lookup',
+    label: 'ICD-10 codes',
+    doing: 'Looking up ICD-10 codes…',
+    description: 'Looks up ICD-10-CM diagnosis codes in the US National Library of Medicine\'s tables, by words (such as type 2 diabetes neuropathy) or by a code or the start of one (such as E11.4). Use it for every code you give, instead of remembering it.',
+    parameters: { type: 'object', properties: { terms: { type: 'string' }, max: { type: 'integer', minimum: 1, maximum: 40, description: 'How many codes. Fifteen when left out.' } }, required: ['terms'] },
+    run: medicalRun('The ICD-10 table', async (input) => {
+        const terms = medicalTerm(input.terms, 120);
+        if (!terms) return { content: 'Nothing was looked up. Give terms.', failed: 'failed' };
+        const [total, , , rows] = await medicalJson(`https://clinicaltables.nlm.nih.gov/api/icd10cm/v3/search?sf=code,name&df=code,name&maxList=${medicalCount(input.max, 40, 15)}&terms=${encodeURIComponent(terms)}`);
+        if (!Array.isArray(rows) || rows.length === 0) return { content: 'No ICD-10-CM code matches. Try fewer words.' };
+        return { content: `${Number(total).toLocaleString('en-GB')} codes match; these are the first ${rows.length}.\n${rows.map(([code, name]) => `- ${code}: ${name}`).join('\n')}` };
+    })
+};
+const CMS_DATASETS = { part_d: '7e0b4365-fd63-4a29-8f5e-e0ac9f66a81b', part_b: '76a714ad-3a2c-43ac-b76d-9dadf8f7d890', medicaid: 'be64fce3-e835-4589-b46b-024198e524a6' };
+const MEDICARE_SPENDING = {
+    name: 'medicare_drug_spending',
+    label: 'Medicare drug spending',
+    doing: 'Reading Medicare drug spending…',
+    description: 'Reads the US Centers for Medicare and Medicaid Services\' yearly figures on one drug: total spending, claims, people and average cost, over five years, in Medicare Part D (drugs from a pharmacy), Part B (drugs given in a clinic) or Medicaid.',
+    parameters: { type: 'object', properties: { drug: { type: 'string', description: 'Brand or generic name' }, program: { type: 'string', enum: Object.keys(CMS_DATASETS), description: 'part_d when left out' } }, required: ['drug'] },
+    run: medicalRun('The CMS data', async (input) => {
+        const drug = medicalTerm(input.drug, 80);
+        if (!drug) return { content: 'Nothing was read. Give drug.', failed: 'failed' };
+        const program = CMS_DATASETS[input.program] ? input.program : 'part_d';
+        const rows = await medicalJson(`https://data.cms.gov/data-api/v1/dataset/${CMS_DATASETS[program]}/data?size=40&keyword=${encodeURIComponent(drug)}`);
+        const mine = (Array.isArray(rows) ? rows : []).filter((row) => !row.Mftr_Name || row.Mftr_Name === 'Overall').slice(0, 6);
+        if (mine.length === 0) return { content: `The ${program.replace('_', ' ')} figures have nothing on ${drug}.` };
+        const money = (value) => (Number.isFinite(Number(value)) && value !== '' ? `$${Math.round(Number(value)).toLocaleString('en-US')}` : 'not given');
+        const count = (value) => (Number.isFinite(Number(value)) && value !== '' ? Number(value).toLocaleString('en-US') : 'not given');
+        return { content: mine.map((row) => {
+            const years = [...new Set(Object.keys(row).map((key) => key.match(/^Tot_Spndng_(\d{4})$/)?.[1]).filter(Boolean))].sort();
+            return `${row.Brnd_Name} (${row.Gnrc_Name})${row.HCPCS_Cd ? `, ${row.HCPCS_Cd}` : ''}, ${program.replace('_', ' ')}:\n${years.map((year) => `- ${year}: ${money(row[`Tot_Spndng_${year}`])} in all, ${count(row[`Tot_Clms_${year}`])} claims${row[`Tot_Benes_${year}`] ? `, ${count(row[`Tot_Benes_${year}`])} people` : ''}, ${money(row[`Avg_Spnd_Per_Clm_${year}`] ?? row[`Avg_Spndng_Per_Clm_${year}`])} a claim`).join('\n')}`;
+        }).join('\n\n') + '\n\nFrom CMS. Spending is before rebates from makers.' };
+    })
+};
 const SKILL_FUNCTIONS = {
+    'medical-pubmed-literature-search': [PUBMED_SEARCH],
+    'medical-evidence-synthesis-ai': [PUBMED_SEARCH, TRIALS_SEARCH],
+    'medical-systematic-review-assistant': [PUBMED_SEARCH, TRIALS_SEARCH],
+    'medical-clinical-guideline-navigator': [PUBMED_SEARCH],
+    'medical-precision-medicine-therapeutics': [PUBMED_SEARCH, TRIALS_SEARCH, DRUG_FACTS],
+    'medical-clinical-trials-search': [TRIALS_SEARCH],
+    'medical-fda-drug-information': [DRUG_FACTS],
+    'medical-drug-interaction-checker': [DRUG_FACTS],
+    'medical-supplement-drug-interactions': [DRUG_FACTS, PUBMED_SEARCH],
+    'medical-medication-administration-safety': [DRUG_FACTS],
+    'medical-pediatric-drug-dosing': [DRUG_FACTS],
+    'medical-icd10-code-lookup': [ICD10_LOOKUP],
+    'medical-raf-score-calculator': [ICD10_LOOKUP],
+    'medical-prior-authorization-review': [ICD10_LOOKUP, DRUG_FACTS],
+    'medical-medicare-drug-stats': [MEDICARE_SPENDING],
     'anthropic-algorithmic-art': ART_FUNCTIONS,
     'cadsmith-make-model': [CAD_BUILD, CAD_CHANGE, CAD_EXPORT],
     'cadsmith-edit-model': [CAD_BUILD, CAD_CHANGE, CAD_EXPORT],
@@ -3324,7 +3559,17 @@ addEventListener('load', async () => {
   const stage = document.getElementById('stage') || document.querySelector('.iso-stage') || document.body;
   const shapes = [...stage.querySelectorAll('path,circle,ellipse,line,rect,polygon,polyline')];
   const drawn = shapes.filter((one) => one.tagName !== 'path' || (one.getAttribute('d') || '').length > 4).length;
-  const bad = /NaN|undefined|Infinity/.test(stage.innerHTML.replace(/aria-[a-z]+="[^"]*"/g, ''));
+  // Only what is drawn is read for bad values: a page's scripts may hold those words and be right.
+  const lost = [];
+  let bad = 0;
+  for (const one of stage.querySelectorAll('svg, svg *')) {
+    for (const given of one.attributes) {
+      if (/^(aria-|class$|id$|data-)/.test(given.name) || !/NaN|undefined|Infinity/.test(given.value)) continue;
+      bad += 1;
+      const part = one.closest('[data-part]');
+      if (lost.length < 3) lost.push('<' + one.tagName + (one.getAttribute('class') ? ' class="' + one.getAttribute('class') + '"' : '') + ' ' + given.name + '="' + given.value.slice(0, 70) + '">' + (part ? ' in part ' + part.getAttribute('data-part') : ''));
+    }
+  }
   const box = stage.getBoundingClientRect();
   for (let y = 1; y < 8; y += 1) {
     for (let x = 1; x < 8; x += 1) {
@@ -3345,7 +3590,7 @@ addEventListener('load', async () => {
   if (shown && !shown.hidden) say(shown.textContent);
   const out = document.createElement('pre');
   out.id = 'figure-probe';
-  out.textContent = JSON.stringify({ errors: errors.slice(0, 4), drawn, bad });
+  out.textContent = JSON.stringify({ errors: errors.slice(0, 4), drawn, bad, lost });
   document.body.append(out);
 });
 `;
@@ -3361,7 +3606,7 @@ export const probeFaults = (probe) => {
     if (!probe) return [];
     if (probe.errors?.length > 0) return [`run: the figure fails when it is opened in a browser: ${probe.errors.join('; ')}`];
     if (probe.drawn < 3) return ['run: the figure draws nothing on the stage when it is opened in a browser.'];
-    return probe.bad ? ['run: something is drawn at NaN, undefined or Infinity.'] : [];
+    return probe.bad ? [`run: ${Number(probe.bad) > 1 ? `${probe.bad} things are` : 'something is'} drawn at NaN, undefined or Infinity${(probe.lost || []).length > 0 ? `: ${probe.lost.join('; ')}` : ''}.`] : [];
 };
 const cannotShow = (faults) => faults.some((fault) => /^run: the figure (fails|draws nothing)/.test(fault));
 let hairlineWait = HAIRLINE_WAIT;
@@ -3482,6 +3727,13 @@ rm -f build.mjs
 if [ $built -ne 0 ] || [ -z "$page" ]; then echo "BUILD $built"; tail -c 3000 build.txt; rm -f build.txt probe.js; exit 3; fi
 cp "$there/$page" page.html
 echo "PAGE $page"
+# A value that is not a number is found where it is drawn: the kit of this computer, which is thrown away, is made to
+# stop at the first one, and the script is run once more to see its line.
+if node -e 'const t=require("fs").readFileSync("page.html","utf8").replace(/<(script|style)[\s\S]*?<\/\1>/g,"");process.exit(/(NaN|Infinity)/.test((t.match(/ (d|cx|cy|x|y|points|transform)="[^"]*"/g)||[]).join(" "))?0:1)'; then
+  sed -i 's/^const tenth = (value) => {/&if (!Number.isFinite(value)) throw new Error("drawn at " + value);/' $home/kit/iso-kit.mjs
+  (cd $there && timeout 60 node build.mjs 2>&1) | grep -v "const tenth" | grep -E "drawn at|build\.mjs:[0-9]+" | sed -E 's#(file://)?/root/skills/anatomy/(examples/figure/)?##g' | head -6 | tr '\n' ' ' | sed 's/^/WHERE /'
+  echo
+fi
 node -e 'const fs=require("fs");const p=fs.readFileSync("page.html","utf8");fs.writeFileSync("check.html",p.replace("</head>",()=>"<script>"+fs.readFileSync("probe.js","utf8")+"</script></head>"))'
 timeout 40 chromium --headless --no-sandbox --disable-gpu --window-size=1000,900 --virtual-time-budget=9000 --dump-dom "file://$PWD/check.html" 2>/dev/null | node -e 'let t="";process.stdin.on("data",(d)=>t+=d).on("end",()=>{const m=t.match(/<pre id="figure-probe">([^<]*)<\/pre>/);console.log("PROBE "+(m?m[1].replace(/&quot;/g,"\"").replace(/&lt;/g,"<").replace(/&gt;/g,">").replace(/&amp;/g,"&"):"none"))})'
 CHROME_PATH=$(command -v chromium) timeout 90 node $home/scripts/lines.mjs page.html 2>&1 | grep -A 8 "^line ends:"
@@ -3531,7 +3783,7 @@ const buildAnatomy = async (given, { show, kept, chat, userId }) => {
     const built = (answer.files || []).find((one) => one.path === 'page.html');
     const mend = 'Mend it with anatomy_change, sending only the lines that change.';
     if (answer.timedOut || !built) {
-        const said = lines.filter((line) => !/^(BUILD|PAGE|PROBE) |^\s+at .*\(?node:internal|^\s+at (async )?ModuleJob|^Node\.js v/.test(line)).join('\n').replace(/(file:\/\/)?\/root\/skills\/anatomy\/(examples\/figure\/)?/g, '').trim();
+        const said = lines.filter((line) => !/^(BUILD|PAGE|PROBE|WHERE) |^\s+at .*\(?node:internal|^\s+at (async )?ModuleJob|^Node\.js v/.test(line)).join('\n').replace(/(file:\/\/)?\/root\/skills\/anatomy\/(examples\/figure\/)?/g, '').trim();
         const why = answer.timedOut || lines.includes('BUILD 124') ? 'the build script ran for too long'
             : lines.includes('BUILD 0') ? 'the build script wrote no page. It must write one .html file next to itself, as the examples do with writeFileSync and k.pageHtml'
                 : 'the build script failed';
@@ -3545,12 +3797,14 @@ const buildAnatomy = async (given, { show, kept, chat, userId }) => {
     } catch {
         probe = null;
     }
+    const where = clip((lines.find((line) => line.startsWith('WHERE ')) || '').slice(6).replace(/\s+/g, ' ').trim(), 500);
     const at = lines.findIndex((line) => /^line ends: \d+/.test(line));
     const floating = at < 0 ? null : Number(lines[at].match(/\d+/)[0]);
     const solids = (page.match(/class="iso-solid/g) || []).length;
     const strokes = (page.match(/class="iso-line/g) || []).length;
     const faults = [
         ...probeFaults(probe),
+        ...(where ? [`where: ${where}`] : []),
         ...(page.length > MAX_SHOWN_PAGE || page.includes('```') ? [`run: the figure fails to fit in the chat: its page is ${page.length.toLocaleString('en-GB')} characters${page.includes('```') ? ' and holds three backticks in a row' : ''}.`] : []),
         ...(solids < 3 ? ['kit: the page draws no solids with the kit (k.solidSvg of k.slabOf, k.cylinder or k.extrude), so it is a flat drawing.'] : []),
         ...(floating > 0 ? [`lines: ${[lines[at], ...lines.slice(at + 1, at + 8).filter((line) => /^\s+\S/.test(line))].join('\n')}\nEvery line ends on a stroke, a dot or an outline, or is marked free, as scripts/lines.mjs says.`] : [])
@@ -4442,7 +4696,11 @@ const findSkillTool = (others) => ({
     },
     run: async (input) => {
         const found = rankSkills(others, input?.query);
-        if (found.length === 0) return { content: 'No skill in the library matches. Answer without one.' };
+        // What a skill cannot do, a tool the person connects may: the ones made by the app's own maker are named as well.
+        const words = [...new Set(String(input?.query ?? '').toLowerCase().match(/[a-z0-9]{3,}/g) || [])].filter((word) => !FILLER_WORDS.has(word));
+        const tools = TOOL_CATALOGUE.map((entry) => ({ entry, hits: words.filter((word) => wordIn(`${entry.name} ${entry.does}`, word)).length })).filter((one) => one.hits > 0 && one.hits * 2 >= words.length).sort((a, b) => b.hits - a.hits).slice(0, 2).map((one) => one.entry);
+        const connect = tools.length > 0 ? [`Tools the user can connect on the Tools page, if they have not yet: ${tools.map((entry) => `${entry.name} (${entry.does.charAt(0).toLowerCase()}${entry.does.slice(1)})`).join('; ')}.`] : [];
+        if (found.length === 0) return { content: ['No skill in the library matches. Answer without one.', ...connect].join('\n') };
         // The skills the best matches go with come too, one step out, as a note-taking app shows a page's links.
         const offered = new Set(others.map((skill) => skill.id));
         const shown = new Set(found.map((skill) => skill.id));
@@ -4456,7 +4714,7 @@ const findSkillTool = (others) => ({
         }
         const line = (skill) => `- ${skill.name} (${SKILL_SOURCES[skill.source]?.name || skill.source}): ${skill.description}`;
         const lines = [...found.map(line), ...along.map((one) => `${line(one.skill)} Goes with ${one.with}.`)];
-        return { content: ['These skills are not turned on in this chat. Tell the user by name which one would help and that they can turn it on under Skills, then answer as well as you can without it.', ...lines].join('\n') };
+        return { content: ['These skills are not turned on in this chat. Tell the user by name which one would help and that they can turn it on under Skills, then answer as well as you can without it.', ...lines, ...connect].join('\n') };
     }
 });
 // A skill may end with a reminder, which is put last so it is the last thing the model reads.
@@ -5288,6 +5546,7 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
         let reserve = chatTools.some((tool) => tool.fn === 'run_program') ? Math.max(REPLY_RESERVE * 2, Math.min(PROGRAM_ROOM, Math.floor(capacity / 4))) : REPLY_RESERVE * 2;
         let programming = false;
         let cutsInVain = 0;
+        let tooLong = 0;
         let sentRoom = REPLY_SENT_CHARS;
         // Calls that failed, so one made again and again with the same input is not run without end.
         const failures = new Map();
@@ -5413,6 +5672,27 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
                             round -= 1;
                             continue;
                         }
+                    }
+                    // Mollama counts a token as four characters, and code takes more: a service that says the request is
+                    // longer than it can read is believed, what was read is put away, and the step is asked again.
+                    if (!gone && tooLong < 4 && mapOllamaError(error).code === 'TOO_LONG') {
+                        tooLong += 1;
+                        // Each time at least a seventh of what was sent has to go, or as much as the service says is too much.
+                        const words = String(error?.detail || error?.error || error?.message || '');
+                        const sentTokens = Number(words.match(/"n_prompt_tokens":\s*(\d+)|request \((\d+) tokens\)/)?.slice(1).find(Boolean)) || 0;
+                        const itsRoom = Number(words.match(/"n_ctx":\s*(\d+)|size \((\d+) tokens\)/)?.slice(1).find(Boolean)) || capacity;
+                        uncounted = Math.min(Math.max(uncounted, capacity - reserve - Math.floor(counted * 0.85), sentTokens > counted ? sentTokens - counted + Math.max(0, capacity - itsRoom) : 0), capacity - reserve - 500);
+                        const before = promptTokens(messages);
+                        round -= 1;
+                        makeRoom();
+                        if (promptTokens(messages) < before) {
+                            reply.content = reply.content.slice(0, reply.content.length - said.length);
+                            write({ type: 'replace', text: reply.content });
+                            write({ type: 'note', text: 'That was more than the model can read at once. Making room and trying again…' });
+                            correcting = true;
+                            continue;
+                        }
+                        round += 1;
                     }
                     // A small model sometimes writes a function call that Ollama cannot read, which ends the reply with
                     // an error. It is asked once more, as a second attempt usually comes out right.

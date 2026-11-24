@@ -44,14 +44,6 @@ https://github.com/davekilleen/dex
 
 The files of each skill's folder are included, copied unchanged at commit a74e5cc8b7f0. Files a skill names outside its own folder are not.
 
-## upstash/context7
-
-https://github.com/upstash/context7
-
-3 skills, in `context7`. Licence: MIT. Copyright (c) 2021 Upstash, Inc..
-
-The files of each skill's folder are included, copied unchanged at commit b1e3611e32a8.
-
 ## mvanhorn/last30days-skill
 
 https://github.com/mvanhorn/last30days-skill

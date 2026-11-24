@@ -258,7 +258,7 @@ const RULES = [
     ['DISK_FULL', /no space left|not enough (disk )?space|insufficient disk/i],
     ['OUT_OF_MEMORY', /requires more system memory|out of memory|insufficient memory|not enough memory|cuda error.*memory/i],
     ['NO_TOOL_SUPPORT', /does not support tools/i],
-    ['TOO_LONG', /context length|context window|exceeds? (the )?(maximum )?context|prompt is too long/i],
+    ['TOO_LONG', /context length|context window|exceeds? (the )?(maximum |available )?context|prompt is too long/i],
     ['DOWNLOAD_INTERRUPTED', /unexpected eof|connection reset|stalled|max retries exceeded|pull.*interrupted/i],
     ['MODEL_MISSING', /model.*not found|not found.*model|try pulling it first|file does not exist|manifest.*(unknown|not found)/i],
     ['CALL_UNREADABLE', UNREADABLE_CALL]
@@ -2078,10 +2078,11 @@ export const toolFault = (error, withKey = false) => {
 };
 
 // Online apps whose makers run a tool server of their own that any app may connect to. Each address was read from
-// the maker's documentation and answered when tried on 2026-11-17. "signIn" is what the app asks for: an account
+// the maker's documentation and answered when tried on 2026-11-17, or 2026-11-24 for the image and video ones and ScrapeCreators. "signIn" is what the app asks for: an account
 // (its own sign-in page), a key the person pastes, or nothing.
 // An app that needs a key also says where the key is made and how, in the order a person does it.
-const app = (name, group, address, does, signIn = 'account', key = null) => ({ name, group, address, does, signIn, key });
+// One whose use takes credits or a plan of the person's says so in "cost".
+const app = (name, group, address, does, signIn = 'account', key = null, cost = null) => ({ name, group, address, does, signIn, key, cost });
 export const TOOL_CATALOGUE = [
     app('Notion', 'Notes and docs', 'https://mcp.notion.com/mcp', 'Search, read, create and edit pages and databases'),
     app('Atlassian', 'Notes and docs', 'https://mcp.atlassian.com/v2/mcp', 'Search and edit Jira issues and Confluence pages'),
@@ -2125,6 +2126,14 @@ export const TOOL_CATALOGUE = [
     app('Webflow', 'Design', 'https://mcp.webflow.com/mcp', 'Edit sites, pages and collection items'),
     app('Wix', 'Design', 'https://mcp.wix.com/mcp', 'Manage Wix sites'),
     app('WordPress.com', 'Design', 'https://public-api.wordpress.com/wpcom/v2/mcp/v1', 'Manage posts, pages and site settings'),
+    app('Recraft', 'Images and video', 'https://mcp.recraft.ai/mcp', 'Make and edit images, icons and vector drawings', 'account', null, 'Uses your Recraft credits. A free account has a small allowance.'),
+    app('fal', 'Images and video', 'https://mcp.fal.ai/mcp-relay', 'Make images, video and audio with many models', 'account', null, 'Uses your fal credits, paid by use.'),
+    app('Runway', 'Images and video', 'https://mcp.runwayml.com/mcp', 'Make images and video', 'account', null, 'Uses your Runway credits.'),
+    app('invideo', 'Images and video', 'https://mcp.invideo.io/mcp', 'Make and edit video', 'account', null, 'Uses your invideo plan and credits.'),
+    app('HeyGen', 'Images and video', 'https://mcp.heygen.com/mcp/v1/', 'Make video with a presenter, and translate video', 'account', null, 'Uses the credits of your HeyGen plan.'),
+    app('Synthesia', 'Images and video', 'https://mcp.synthesia.io/mcp', 'Make and edit video with a presenter', 'account', null, 'Uses your Synthesia credits. A new account has some free.'),
+    app('Higgsfield', 'Images and video', 'https://mcp.higgsfield.ai/mcp', 'Make images and video', 'account', null, 'Always uses your Higgsfield credits, also on plans with free use on its site.'),
+    app('ScrapeCreators', 'Search and data', 'https://api.scrapecreators.com/mcp', 'Read public posts, comments and ads on TikTok, Instagram, YouTube, Reddit and X', 'account', null, 'Uses your ScrapeCreators credits. A new account has some free.'),
     app('Calendly', 'Messages and customers', 'https://mcp.calendly.com', 'Read availability and scheduled events'),
     app('Stripe', 'Payments and shops', 'https://mcp.stripe.com', 'Manage customers, invoices and subscriptions'),
     app('Hugging Face', 'Search and data', 'https://huggingface.co/mcp', 'Search models, datasets, Spaces and papers', 'none', {
