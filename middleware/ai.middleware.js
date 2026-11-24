@@ -38,6 +38,11 @@ const ERROR_TABLE = {
         message: 'This model needs more memory than this computer has free, and loading it could freeze the whole computer.',
         action: 'Pick a smaller model, or close large apps and unload other models first.'
     },
+    MODEL_IN_USE: {
+        status: 409,
+        message: 'This model is answering right now, so it was not removed from memory.',
+        action: 'Wait for the reply to finish, or stop it and remove the model.'
+    },
     OUT_OF_MEMORY: {
         status: 422,
         message: 'This model needs more memory than this device has free.',

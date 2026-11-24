@@ -204,6 +204,7 @@ const sendOllamaError = (res, error) => {
         body.freeMb = error.freeMb;
         body.message = `This model needs about ${Math.ceil(error.neededMb / 1024)} GB and this device has ${Math.floor(error.freeMb / 1024)} GB free.`;
     }
+    if (error.loaded) Object.assign(body, { loaded: error.loaded, fitsEmpty: error.fitsEmpty !== false });
     return res.status(error.status).json(body);
 };
 
@@ -335,7 +336,7 @@ const loadCost = async (ollama, model, { sending = false, anyway = false } = {})
             return freeOf(one.id, computers[at], loaded);
         }));
         const fit = fitPool(entry, now);
-        return { loaded: false, ahead: false, tight: !fit.fits, neededMb: fit.memoryNeededMb, hasMb: fit.memoryMb, measured: true, name: parts.name };
+        return { loaded: false, ahead: false, tight: !fit.fits, neededMb: fit.memoryNeededMb, hasMb: fit.memoryMb, measured: true, fitsEmpty: true, name: parts.name };
     }
 
     const device = await getCurrentDevice();
@@ -358,12 +359,144 @@ const loadCost = async (ollama, model, { sending = false, anyway = false } = {})
     // It would fit in place of what is loaded, which no reply may be using (endLoaded leaves one that is).
     const inPlace = !ahead && !pooled && running.length > 0 && light(fitModel(entry, target.kind === 'companion' ? await freeOf(target.id, whole, running) : whole));
     const hasMb = usableGpu(hardware.gpuMemoryMb) + Math.max(0, hardware.memoryMb - (hardware.gpuShared ? hardware.gpuMemoryMb : 0) - RAM_RESERVE_MB);
-    return { loaded: false, ahead, inPlace, tight: !fit.fits, neededMb: fit.memoryNeededMb, hasMb, measured, pooled: pooled?.model || null, name: device ? shownName(device) : 'This computer' };
+    return { loaded: false, ahead, inPlace, tight: !fit.fits, neededMb: fit.memoryNeededMb, hasMb, measured, fitsEmpty: fitModel(entry, whole).fits, pooled: pooled?.model || null, name: device ? shownName(device) : 'This computer' };
 };
 const memoryRefusal = (model, cost) => {
     const gb = (mb) => Math.round(mb / 1024);
-    return new OllamaError('NOT_ENOUGH_MEMORY', `${model} needs about ${gb(cost.neededMb)} GB and ${cost.name} has about ${gb(cost.hasMb)} GB ${cost.measured ? 'free' : 'for models'}${cost.pooled ? `, with ${cost.pooled} running in your pool` : ''}. Loading it could freeze the whole computer.`);
+    return new OllamaError('NOT_ENOUGH_MEMORY', `${model} needs about ${gb(cost.neededMb)} GB and ${cost.name} has about ${gb(cost.hasMb)} GB ${cost.measured ? 'free' : 'for models'}${cost.pooled ? `, with ${cost.pooled} running in your pool` : ''}. ${cost.fitsEmpty ? '' : 'It is larger than this computer can hold, even with nothing else in memory. '}Loading it could freeze the whole computer.`);
 };
+
+// When a model last did something for Mollama, so an idle one can say for how long.
+const modelUse = new Map();
+const useKey = (target, model) => `${target} ${model}`;
+// Models being loaded ahead of a message, by the same key.
+const loadingAhead = new Map();
+
+// What one computer holds in memory right now: each model, what it takes, what it is doing and for how long it has not.
+const memoryOf = async (device, names = new Map()) => {
+    const local = device.kind === 'local';
+    const id = String(device.id);
+    const target = local ? null : id;
+    const online = isOnline(device);
+    const hardware = effectiveHardware(device);
+    const role = local ? 'off' : device.poolRole || 'off';
+    const about = {
+        id, name: shownName(device), kind: device.kind, online, paused: Boolean(device.paused), role, gpuName: hardware.gpuName, gpuShared: hardware.gpuShared,
+        memory: { totalMb: hardware.memoryMb, freeMb: null, gpuTotalMb: hardware.gpuMemoryMb || 0, gpuFreeMb: null }, models: [], answered: false, lending: null
+    };
+    if (!online || about.paused) return about;
+
+    const client = local ? createOllamaClient(await resolveOllamaHost()) : createOllamaClient(DEVICE_HOST, deviceGateway.fetcher(id));
+    const quick = (promise) => Promise.race([promise, new Promise((resolve) => setTimeout(resolve, 8000, null).unref?.())]).catch(() => null);
+    const [running, said, settings] = await Promise.all([quick(client.running()), local ? null : quick(deviceGateway.ask(id, 'memory')), getSettings()]);
+    about.answered = Boolean(running);
+    about.memory.freeMb = Number(said?.freeMb) > 0 ? said.freeMb : null;
+    about.memory.gpuFreeMb = Number.isFinite(said?.gpuFreeMb) ? said.gpuFreeMb : null;
+
+    const now = Date.now();
+    const keepMs = settings.keepAliveMinutes * 60 * 1000;
+    const doing = async (where, model, fallback = null) => {
+        const [chatId] = repliesOn(where, model);
+        const live = chatId ? liveReplies.get(chatId) : null;
+        const chat = chatId ? await Chat.findOne({ _id: chatId, service: SERVICE }).select('title') : null;
+        const used = modelUse.get(useKey(where, model)) || fallback;
+        const progress = live ? replyProgress(live) : null;
+        return {
+            state: live ? (progress.phase === 'waiting' ? 'waiting' : 'answering') : 'idle',
+            chat: chat ? { id: chat.id, title: chat.title } : null,
+            progress,
+            replies: repliesOn(where, model).length,
+            usedAt: live ? null : used,
+            idleMs: live || !used ? null : Math.max(0, now - used)
+        };
+    };
+    const label = (name) => names.get(name) || knownModels.get(name)?.name || friendlyName(name);
+    for (const entry of running?.models || []) {
+        const ends = entry.expires_at ? new Date(entry.expires_at).getTime() : null;
+        // Ollama keeps a model for the set time after its last use, so its end says when that was.
+        const last = ends && ends - keepMs <= now && ends > now ? ends - keepMs : null;
+        const busy = await doing(target, entry.name, last);
+        const gpuMb = Math.round((entry.size_vram || 0) / MB);
+        const sizeMb = Math.round((entry.size || 0) / MB);
+        about.models.push({ name: entry.name, displayName: label(entry.name), source: 'ollama', sizeMb, gpuMb, ramMb: Math.max(0, sizeMb - gpuMb), context: entry.context_length || null, endsAt: busy.state === 'idle' ? ends : null, helpers: [], ...busy });
+    }
+    // A model on its way in: a reply is waiting for it, or it is being loaded ahead of one.
+    const coming = new Set([...liveReplies.values()].filter((live) => String(live.target) === String(target) && live.model && !about.models.some((one) => one.name === live.model)).map((live) => live.model));
+    for (const key of loadingAhead.keys()) if (key.startsWith(`${target} `)) coming.add(key.slice(`${target} `.length));
+    for (const name of coming) {
+        if (about.models.some((one) => one.name === name)) continue;
+        about.models.push({ name, displayName: label(name), source: 'ollama', sizeMb: null, gpuMb: null, ramMb: null, context: null, endsAt: null, helpers: [], ...await doing(target, name), state: 'loading', usedAt: null, idleMs: null });
+    }
+
+    if (role !== 'off') {
+        const main = role === 'main' ? device : (await ownDevices(device.registeredBy)).find((one) => one.poolRole === 'main' && isOnline(one));
+        const state = main ? poolStateOf(main.id) : null;
+        const model = state?.running || state?.starting || null;
+        if (model && role === 'lend') about.lending = { model, displayName: label(model), main: shownName(main) };
+        if (model && role === 'main') {
+            const pool = await poolRecord(device.registeredBy);
+            const busy = await doing(pool.id, model);
+            const helpers = (await ownDevices(device.registeredBy)).filter((one) => one.poolRole === 'lend' && isOnline(one)).map(shownName);
+            const starting = !state.running || poolStarts.has(main.id);
+            const size = ((await quick(client.list()))?.models || []).find((one) => one.name === model)?.size || 0;
+            about.models.push({
+                name: model, displayName: label(model), source: 'pool', sizeMb: size ? Math.round(size / MB) : null, gpuMb: null, ramMb: null, context: POOL_CONTEXT, helpers,
+                ...busy, state: starting ? 'loading' : busy.state, endsAt: !starting && busy.usedAt ? busy.usedAt + POOL_IDLE_MS : null
+            });
+        }
+    }
+    return about;
+};
+// The models on the computers a refused message would have used, so the person can make room for it.
+const inTheWay = async (asked) => {
+    const target = currentTarget();
+    const device = target.kind === 'pool' ? null : await getCurrentDevice();
+    const parts = target.kind === 'pool' ? await poolTarget(target.id) : null;
+    const devices = parts ? await Device.find({ _id: { $in: [parts.main, ...parts.lenders].map((one) => one.id) } }) : [device].filter(Boolean);
+    const pooled = device ? await pooledOn(device) : null;
+    if (pooled && pooled.main !== String(device.id)) devices.push(await Device.findById(pooled.main));
+    const held = await Promise.all(devices.map((one) => memoryOf(one)));
+    return held.flatMap((one) => one.models.filter((model) => !(model.name === asked && model.state === 'loading')).map((model) => ({ ...model, device: one.id, deviceName: one.name })));
+};
+
+export const listMemory = asyncHandler(async (req, res) => {
+    const local = localEnabled() ? await getLocalDevice() : null;
+    const devices = [...(local ? [local] : []), ...await ownDevices(req.user.id)];
+    const { keepAliveMinutes } = await getSettings();
+    res.status(200).json({ success: true, at: Date.now(), keepAliveMinutes, poolIdleMinutes: POOL_IDLE_MS / 60000, computers: await Promise.all(devices.map((device) => memoryOf(device))) });
+});
+
+// Takes one model out of a computer's memory. One that is answering is left alone unless its reply is to be stopped.
+export const freeMemory = asyncHandler(async (req, res) => {
+    const device = await allowedDevice(req, req.params.id);
+    if (!device) return res.status(404).json({ success: false, message: 'Device not found' });
+    const { model, pooled = false, stop = false } = req.body;
+    const local = device.kind === 'local';
+    const id = String(device.id);
+    if (!isOnline(device)) return sendOllamaError(res, new OllamaError('DEVICE_OFFLINE'));
+    try {
+        const where = pooled ? (await poolRecord(device.registeredBy)).id : local ? null : id;
+        const replies = repliesOn(where, model);
+        const working = replies.length > 0 || (pooled ? queue.busyIn(`pool:${where}`) : false);
+        if (working && !stop) throw new OllamaError('MODEL_IN_USE');
+        if (replies.length > 0) await endReplies(replies, { wait: 5000 });
+        let removed;
+        if (pooled) {
+            deviceGateway.order(id, { type: 'pool', action: 'stop' });
+            removed = await waitUntil(() => !poolStateOf(id)?.running, 8000);
+        } else {
+            const client = local ? createOllamaClient(await resolveOllamaHost()) : createOllamaClient(DEVICE_HOST, deviceGateway.fetcher(id));
+            await client.unload(model);
+            removed = await waitUntil(async () => !(await client.running()).models.some((one) => one.name === model), 8000);
+        }
+        if (removed) modelUse.delete(useKey(where, model));
+        logger.info('[Memory] Model removed', { deviceId: id, model, pooled, removed, userId: req.user.id });
+        getNotificationService().sendToUser(String(req.user.id), { type: 'models:changed', data: { id: null, removed: false } });
+        res.status(200).json({ success: true, removed, computer: await memoryOf(device) });
+    } catch (error) {
+        sendOllamaError(res, mapOllamaError(error));
+    }
+});
 
 const diskNow = async () => {
     const target = currentTarget();
@@ -1179,6 +1312,8 @@ const presentPools = async (userId) => {
 // How much a pooled model may read. It is started with this much room, and the chat is told it, so it folds older
 // messages and puts away old tool results before it would overflow (llama.cpp refuses a prompt past its context).
 const POOL_CONTEXT = 16384;
+// The desktop app ends a pooled model idle this long (its own POOL_IDLE_MS).
+const POOL_IDLE_MS = 15 * 60 * 1000;
 const poolRecord = (userId) => Device.findOneAndUpdate(
     { service: SERVICE, kind: 'pool', hostname: `${userId}:pool` },
     { $setOnInsert: { name: 'Pool', registeredBy: userId } },
@@ -3563,7 +3698,6 @@ const presentChat = (chat, facts = null) => ({
     instructions: instructionsOf(chat),
     skills: skillsOf(chat).map((skill) => skill.id),
     tools: chat.tools || [],
-    webSearch: chat.webSearch !== false,
     summary: chat.summary,
     memoryThrough: memoryStart(chat),
     memory: memoryStart(chat) > 0 ? chat.memory : '',
@@ -3621,7 +3755,7 @@ const chooseModel = async (ollama, userId) => {
 };
 
 const applyChatFields = (chat, body) => {
-    for (const key of ['title', 'model', 'system', 'options', 'webSearch']) {
+    for (const key of ['title', 'model', 'system', 'options']) {
         if (key in body) chat[key] = body[key];
     }
     if ('skills' in body) chat.skills = body.skills ? skillsFor(chat.owner).filter((skill) => body.skills.includes(skill.id)).map((skill) => skill.id).slice(0, MAX_CHAT_SKILLS) : undefined;
@@ -3762,10 +3896,11 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
         ollama = await getOllama();
         if (!(await ollama.status()).available) throw new OllamaError(downCode());
         if (!chat.model) chat.model = await chooseModel(ollama, userId);
+        live.model = chat.model;
         facts = await modelFacts(ollama, chat.model);
         if (!facts.online) {
             const cost = await loadCost(ollama, chat.model, { sending: true, anyway: body.anyway === true }).catch(() => null);
-            if (cost?.tight && !body.anyway) throw memoryRefusal(chat.model, cost);
+            if (cost?.tight && !body.anyway) throw Object.assign(memoryRefusal(chat.model, cost), { loaded: await inTheWay(chat.model).catch(() => []), fitsEmpty: cost.fitsEmpty });
         }
 
         prompt = buildMessages(chat, facts.capabilities.includes('tools'), facts.capabilities.includes('vision'));
@@ -3858,9 +3993,8 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
         if (gone) return;
         const loaded = await ollama.running().then((list) => list.models.some((entry) => entry.name === chat.model)).catch(() => true);
         write({ type: 'start', sharing: queue.runningIn(lane) - 1, loaded });
-        // Web search is two tools, handed to a model that can use tools when the chat has search on. The model decides
-        // when to use them; nothing of Mollama's own is added to tell it how.
-        const searching = webSearchReady() && chat.webSearch !== false && facts.capabilities.includes('tools');
+        // Web search is two tools, always handed to a model that can use tools. The model decides when to use them; nothing of Mollama's own is added to tell it how.
+        const searching = webSearchReady() && facts.capabilities.includes('tools');
         const messages = [...prompt];
         // With web search on, its own page reader does the built-in one's job, so only one of the two is offered.
         const { listed } = sortSkills(chat, facts.capabilities.includes('tools'));
@@ -4288,6 +4422,7 @@ const takeTurns = async (chat, body, userId, res) => {
                 logger.error('[Chat] Turn failed', { chatId: id, message: String(error?.message || '').slice(0, 200) });
                 if (turn.res && !turn.res.headersSent) turn.res.status(500).json({ success: false, message: 'The message could not be sent.' });
             }
+            if (turn.live.model || turn.chat?.model) modelUse.set(useKey(turn.live.target, turn.live.model || turn.chat.model), Date.now());
             for (const listener of turn.live.listeners) {
                 if (!listener.writableEnded) listener.end();
             }
@@ -4407,9 +4542,11 @@ export const loadModel = asyncHandler(async (req, res) => {
         if (loading) {
             const facts = await modelFacts(ollama, model);
             const numCtx = Math.min(facts.contextLength, AUTO_CONTEXT_LIMIT, webSearchReady() ? SEARCH_CONTEXT : CONTEXT_STEPS[0]);
-            ollama.load(model, `${settings.keepAliveMinutes}m`, numCtx).catch((error) => {
+            const key = useKey(currentTarget().id, model);
+            loadingAhead.set(key, Date.now());
+            ollama.load(model, `${settings.keepAliveMinutes}m`, numCtx).then(() => modelUse.set(key, Date.now()), (error) => {
                 logger.warn('[Models] Model could not be loaded ahead of time', { model, code: mapOllamaError(error).code });
-            });
+            }).finally(() => loadingAhead.delete(key));
         }
         res.status(202).json({ success: true, model, ready: loaded, loading, inPlace: able && !loading && Boolean(cost?.inPlace) });
     } catch (error) {

@@ -13,6 +13,8 @@ router.validRoutes = [
     '/api/v1/devices/:id',
     '/api/v1/devices/:id/detect',
     '/api/v1/devices/link',
+    '/api/v1/devices/memory',
+    '/api/v1/devices/:id/memory',
     '/api/v1/devices/pools',
     '/api/v1/devices/pools/check',
     '/api/v1/devices/:id/pool',
@@ -81,6 +83,8 @@ router.use('/models', aiController.announceChanges('models:changed', ['/load']))
 router.use('/chats', aiController.announceChanges('chat:changed'));
 
 router.get('/devices', ...signedIn, aiController.listDevices);
+router.get('/devices/memory', ...signedIn, aiController.listMemory);
+router.post('/devices/:id/memory', ...signedIn, withDeviceId, validateRequest(deviceSchemas.memory), aiController.freeMemory);
 router.get('/devices/pools', ...signedIn, aiController.listPools);
 router.post('/devices/pools/check', ...signedIn, aiController.checkPools);
 router.post('/devices/link', ...signedIn, validateRequest(deviceSchemas.link), aiController.linkDevice);

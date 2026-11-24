@@ -132,6 +132,12 @@ export const deviceSchemas = {
         })
     }),
 
+    memory: Joi.object({
+        model: Joi.string().trim().min(1).max(200).required(),
+        pooled: Joi.boolean(),
+        stop: Joi.boolean()
+    }),
+
     pool: Joi.object({
         role: Joi.string().valid('off', 'lend', 'main').required()
     }),
