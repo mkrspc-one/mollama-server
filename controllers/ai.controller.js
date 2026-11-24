@@ -2197,50 +2197,129 @@ const toolInput = (name, raw) => {
 
 const clip = (text, limit) => String(text ?? '').slice(0, limit);
 
-// Some models write their tool calls as text instead of making them. Calls written at the end of a reply are run as calls.
-export const writtenToolCalls = (text) => {
-    const original = String(text ?? '');
-    const source = original.replace(/<\/?tool_call>|```(?:json)?/gi, (mark) => ' '.repeat(mark.length));
-    const objects = [];
+// Some models write their calls as text instead of making them, or in marks of their own family that the program
+// running them did not read. A call is read from the end of a reply in each of the common forms, only for a function
+// the model was offered, and only with the input that function needs, so words about a function are never taken for one.
+const CALL_MARKS = /<\/?(?:tool_calls?|function_calls?|tools?|function)>|```[\w-]*|\[\/?TOOL_CALLS\]|<\|[\w/]+\|>|<｜[^｜>]{1,40}｜>|[[\],;\s]/gi;
+// The JSON value that starts at a place, and where it ends.
+const jsonAt = (text, from) => {
+    let start = from;
+    while (/\s/.test(text[start] || '')) start += 1;
+    if (!'{['.includes(text[start] || ' ')) return null;
     let depth = 0;
-    let start = -1;
     let quoted = false;
-    for (let index = 0; index < source.length; index++) {
-        const char = source[index];
-        if (depth === 0) {
-            if (char === '{') {
-                depth = 1;
-                start = index;
-            }
-            continue;
-        }
+    for (let at = start; at < text.length; at += 1) {
+        const char = text[at];
         if (quoted) {
-            if (char === '\\') index += 1;
+            if (char === '\\') at += 1;
             else if (char === '"') quoted = false;
         } else if (char === '"') quoted = true;
-        else if (char === '{') depth += 1;
-        else if (char === '}' && --depth === 0) objects.push({ start, end: index + 1 });
-    }
-    if (depth > 0) return { calls: [], text: original };
-
-    const calls = [];
-    let cut = source.length;
-    for (const object of objects.reverse()) {
-        if (/[^\s,[\]]/.test(source.slice(object.end, cut))) break;
-        let parsed;
-        try {
-            parsed = JSON.parse(source.slice(object.start, object.end));
-        } catch {
-            break;
+        else if ('{['.includes(char)) depth += 1;
+        else if ('}]'.includes(char) && --depth === 0) {
+            try {
+                return { value: JSON.parse(text.slice(start, at + 1)), start, end: at + 1 };
+            } catch {
+                return { value: undefined, start, end: at + 1 };
+            }
         }
-        const args = parsed?.arguments ?? parsed?.parameters;
-        if (!['web_search', 'web_fetch'].includes(parsed?.name) || !args || typeof args !== 'object') break;
-        calls.unshift({ function: { name: parsed.name, arguments: args } });
-        cut = object.start;
     }
-    if (calls.length === 0) return { calls, text: original };
-    return { calls, text: original.slice(0, cut).replace(/(?:\s|\[|<tool_call>|```(?:json)?)+$/i, '') };
+    return null;
 };
+const pythonValue = (text) => {
+    const raw = text.trim();
+    if (/^(?:True|False|None)$/.test(raw)) return { True: true, False: false, None: null }[raw];
+    const quoted = raw.match(/^("""|''')([\s\S]*)\1$/) || raw.match(/^(["'])([\s\S]*)\1$/);
+    if (quoted) return quoted[1].length === 3 ? quoted[2] : quoted[2].replace(/\\(n|t|r|["'\\])/g, (whole, one) => ({ n: '\n', t: '\t', r: '\r' }[one] ?? one));
+    try {
+        return JSON.parse(raw.replace(/'/g, '"'));
+    } catch {
+        return raw;
+    }
+};
+export const readTextCalls = (text, tools) => {
+    const source = String(text ?? '');
+    const known = new Map((tools || []).map((tool) => [tool.function.name, tool.function]));
+    const found = [];
+    const add = (start, end, name, given, marked) => {
+        const one = known.get(String(name ?? '').trim());
+        let args = given;
+        if (typeof args === 'string') {
+            try {
+                args = JSON.parse(args);
+            } catch {
+                return;
+            }
+        }
+        if (!one || !args || typeof args !== 'object' || Array.isArray(args)) return;
+        if ((one.parameters?.required || []).some((need) => args[need] === undefined)) return;
+        found.push({ start, end, marked, call: { function: { name: one.name, arguments: args } } });
+    };
+    const typed = (name, key, raw) => {
+        const type = known.get(name)?.parameters?.properties?.[key]?.type;
+        if (!type || type === 'string') return raw;
+        try {
+            return JSON.parse(raw);
+        } catch {
+            return raw;
+        }
+    };
+    const inner = (raw) => raw.replace(/^\r?\n/, '').replace(/\r?\n[ \t]*$/, '');
+    // Qwen Coder and others: <function=name><parameter=key>value</parameter></function>
+    for (const one of source.matchAll(/<function=([\w.-]+)>([\s\S]*?)<\/function>/g)) add(one.index, one.index + one[0].length, one[1], Object.fromEntries([...one[2].matchAll(/<parameter=([\w.-]+)>([\s\S]*?)<\/parameter>/g)].map(([, key, raw]) => [key, typed(one[1], key, inner(raw))])), true);
+    // GLM: <tool_call>name <arg_key>key</arg_key><arg_value>value</arg_value></tool_call>
+    for (const one of source.matchAll(/<tool_call>\s*([\w.-]+)\s*((?:<arg_key>[\s\S]*?<\/arg_value>\s*)+)<\/tool_call>/g)) add(one.index, one.index + one[0].length, one[1], Object.fromEntries([...one[2].matchAll(/<arg_key>([\s\S]*?)<\/arg_key>\s*<arg_value>([\s\S]*?)<\/arg_value>/g)].map(([, key, raw]) => [key.trim(), typed(one[1], key.trim(), inner(raw))])), true);
+    // DeepSeek: <｜tool▁call▁begin｜>function<｜tool▁sep｜>name ```json {...} ``` and the newer name<｜tool▁sep｜>{...}
+    for (const one of source.matchAll(/<｜tool▁call▁begin｜>(?:function)?(?:<｜tool▁sep｜>)?\s*([\w.-]+)\s*(?:<｜tool▁sep｜>)?\s*(?:```json)?\s*/g)) {
+        const read = jsonAt(source, one.index + one[0].length);
+        if (read) add(one.index, read.end, one[1], read.value, true);
+    }
+    // Mistral: [TOOL_CALLS]name[ARGS]{...}
+    for (const one of source.matchAll(/\[TOOL_CALLS\]\s*([\w.-]+)(?:\[CALL_ID\]\w+)?\[ARGS\]/g)) {
+        const read = jsonAt(source, one.index + one[0].length);
+        if (read) add(one.index, read.end, one[1], read.value, true);
+    }
+    // JSON, alone or between any family's marks: {"name": ..., "arguments": {...}} and its variants.
+    for (let at = 0; at < source.length; at += 1) {
+        if (source[at] !== '{') continue;
+        const read = jsonAt(source, at);
+        if (!read) break;
+        const value = read.value;
+        const one = value && typeof value === 'object' ? (value.function && typeof value.function === 'object' ? value.function : value) : null;
+        const name = one && (one.name ?? one.tool ?? one.tool_name ?? one.function_name ?? (typeof one.function === 'string' ? one.function : undefined));
+        if (one && typeof name === 'string') {
+            const before = source.slice(Math.max(0, read.start - 40), read.start);
+            add(read.start, read.end, name, one.arguments ?? one.parameters ?? one.args ?? one.input ?? one.tool_input, /<tool_calls?>\s*\[?\s*$|\[TOOL_CALLS\]\s*\[?\s*$|<\|(?:python_tag|tool_call)\|>\s*\[?\s*$/i.test(before));
+        }
+        at = read.end - 1;
+    }
+    // Python: name(key="value"), as Llama 4 and Gemma write it, alone on the last lines.
+    const tail = source.match(/(?:^|\n)\s*(?:```(?:tool_code|python)?\s*\n)?\s*\[?\s*([A-Za-z_]\w*)\(([\s\S]*)\)\s*\]?\s*(?:```)?\s*$/);
+    if (tail && known.has(tail[1]) && !found.length) {
+        const args = Object.fromEntries([...tail[2].matchAll(/(\w+)\s*=\s*("""[\s\S]*?"""|'''[\s\S]*?'''|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|\[[^\]]*\]|\{[^}]*\}|[^,]+)(?:,|$)/g)].map(([, key, raw]) => [key, pythonValue(raw)]));
+        add(tail.index, source.length, tail[1], args, false);
+    }
+    // The last of them decide: calls next to each other at the end, or one in marks with the model's own guess at what
+    // came back written after it, which goes.
+    const ordered = found.sort((x, y) => x.start - y.start || y.end - x.end).filter((one, at, all) => !all.some((other, place) => place !== at && other.start <= one.start && other.end >= one.end && (other.start < one.start || other.end > one.end || place < at)));
+    const bare = (from, to) => source.slice(from, to).replace(CALL_MARKS, '') === '';
+    if (ordered.length === 0) return { calls: [], text: source };
+    let first;
+    let last;
+    if (bare(ordered.at(-1).end, source.length)) {
+        last = ordered.length - 1;
+        first = last;
+        while (first > 0 && bare(ordered[first - 1].end, ordered[first].start)) first -= 1;
+    } else {
+        first = ordered.findIndex((one) => one.marked);
+        if (first < 0) return { calls: [], text: source };
+        last = first;
+        while (last + 1 < ordered.length && bare(ordered[last].end, ordered[last + 1].start)) last += 1;
+    }
+    const before = source.slice(0, ordered[first].start).replace(/(?:\s|\[|<\/?(?:tool_calls?|function_calls?|tools?)>|```[\w-]*|\[TOOL_CALLS\]|<\|[\w/]+\|>|<｜[^｜>]{1,40}｜>)+$/i, '');
+    return { calls: ordered.slice(first, last + 1).map((one) => one.call), text: before };
+};
+// The same, for the two search functions alone.
+export const writtenToolCalls = (text) => readTextCalls(text, SEARCH_TOOLS);
 
 // A model sometimes gets a function's name slightly wrong: open_skill_skill, openSkill, websearch.
 const nearestFunction = (name, names) => {
@@ -2322,9 +2401,21 @@ const applyQueueSettings = async () => {
     return settings;
 };
 
+const WORD_ROOM = 8192;
+let wordRoom = WORD_ROOM;
+// For tests of models that use no functions at all; null puts the usual room back.
+export const setWordRoom = (tokens) => { wordRoom = tokens ?? WORD_ROOM; };
 const modelFacts = async (ollama, name) => {
     const shown = await ollama.show(name);
-    return { contextLength: contextLength(shown) || 4096, capabilities: shown.capabilities || [], online: Object.keys(shown?.model_info || {}).some((key) => key.startsWith('cloud.')) };
+    // A model's template is what its functions are written into. One with no place for them never sees them, whatever
+    // Ollama lists, so they are put in words instead. A model with a renderer of its own has no template to read.
+    const template = String(shown?.template || '');
+    const listed = shown.capabilities || [];
+    // A model that lists no functions is told of them in words too, when it has room for them and its work besides.
+    const room = contextLength(shown) || 4096;
+    const untold = listed.includes('completion') && !listed.includes('tools') && !listed.includes('embedding') && room >= wordRoom;
+    const wordy = listed.includes('tools') && !shown?.renderer && template.length > 60 && /\{\{|\{%/.test(template) && !/\btools\b/i.test(template);
+    return { contextLength: room, capabilities: untold ? [...listed, 'tools'] : listed, wordy: wordy || untold, online: Object.keys(shown?.model_info || {}).some((key) => key.startsWith('cloud.')) };
 };
 
 // How much a model may be given to read. A model on a computer is held to a limit that protects the computer's memory;
@@ -4707,6 +4798,79 @@ const keepCut = (cut, { chat, userId, ranOut }) => {
     const advice = cut.name === 'run_program' ? 'Write the program in parts: the first part with run_program, then change_program with add.' : cut.name === 'change_program' ? 'Send less in one call.' : 'Call it again with less in it, or leave out what it can do without.';
     return { kept: 0, note: `${what} ${advice}` };
 };
+// Functions in words: how a model whose template has no place for functions is told of them, calls them, and is given
+// back what they returned. What a call sends is written between marks as it is, because a small model seldom writes a
+// long program as valid JSON.
+const learnedWordy = new Set();
+export const forgetWordy = () => learnedWordy.clear();
+const functionWords = (tools) => ['FUNCTIONS', 'You can call the functions listed below. To call one, write it exactly like this and then stop; what it returns is given to you in the next message:',
+    '<call name="open_skill">\n<arg name="skill">Anatomy</arg>\n</call>',
+    'What is between the arg marks is taken as it is: write code and text there without quoting or escaping. A list of changes is written as <arg name="change"><change><find>old text</find><replace>new text</replace></change></arg>; any other list or object as JSON. Never write what a function returns yourself. Do not describe a call: make it.',
+    ...tools.map(({ function: one }) => {
+        const given = one.parameters?.properties || {};
+        const needed = new Set(one.parameters?.required || []);
+        return `- ${one.name}(${Object.entries(given).map(([name, part]) => `${name}${needed.has(name) ? '' : '?'}${part.enum ? `: ${clip(part.enum.join(' | '), 400)}` : part.type && part.type !== 'string' ? `: ${part.type}` : ''}${part.description ? ` (${clip(part.description, 140)})` : ''}`).join(', ')}): ${one.description}`;
+    })].join('\n');
+const callWords = (call) => {
+    const given = toolArguments(call.function?.arguments) || {};
+    const value = (name, one) => (name === 'change' && Array.isArray(one) ? one.map((part) => `<change><find>${part?.find ?? ''}</find><replace>${part?.replace ?? ''}</replace></change>`).join('\n') : typeof one === 'string' ? one : JSON.stringify(one));
+    return `<call name="${call.function?.name}">\n${Object.entries(given).map(([name, one]) => `<arg name="${name}">${value(name, one)}</arg>`).join('\n')}\n</call>`;
+};
+export const wordShape = (messages, tools) => {
+    const out = [];
+    for (const message of messages) {
+        if (message.role === 'assistant' && message.tool_calls?.length > 0) out.push({ role: 'assistant', content: [message.content, ...message.tool_calls.map(callWords)].filter(Boolean).join('\n') });
+        else if (message.role === 'tool') {
+            const text = `${message.tool_name || 'The function'} returned:\n${message.content}`;
+            const last = out.at(-1);
+            if (last?.returned) last.content += `\n\n${text}`;
+            else out.push({ role: 'user', content: text, returned: true });
+            if (message.images?.length > 0) out.at(-1).images = [...(out.at(-1).images || []), ...message.images];
+        } else out.push({ ...message });
+    }
+    if (out[0]?.role === 'system') out[0].content = `${out[0].content}\n\n${functionWords(tools)}`;
+    else out.unshift({ role: 'system', content: functionWords(tools) });
+    return out.map(({ returned, ...message }) => message);
+};
+// The calls a reply ends with, what was said before them, and a call cut off before its end. What a model writes after
+// a call is its own guess at what came back, and goes.
+export const readWordCalls = (text, tools, ranOut = false) => {
+    const source = String(text ?? '');
+    const first = source.search(/<call\s+name=/i);
+    if (first < 0) return { calls: [], text: source, cut: null };
+    const calls = [];
+    let cut = null;
+    let end = first;
+    for (const found of source.slice(first).matchAll(/<call\s+name=["']?([\w.-]+)["']?\s*>([\s\S]*?)(<\/call>|$)/gi)) {
+        const start = first + found.index;
+        if (calls.length > 0 && source.slice(end, start).replace(/```\w*/g, '').trim()) break;
+        const name = found[1];
+        const given = tools.find((tool) => tool.function.name === name)?.function.parameters?.properties || {};
+        const args = {};
+        let open = null;
+        for (const [, key, inner, close] of found[2].matchAll(/<arg\s+name=["']?([\w.-]+)["']?\s*>([\s\S]*?)(<\/arg>|$)/gi)) {
+            let value = inner.replace(/^\r?\n/, '').replace(/\s+$/, '');
+            const fenced = value.match(/^```[\w-]*\n([\s\S]*?)\n?```$/);
+            if (fenced) value = fenced[1];
+            if (!close) open = { key, value };
+            if (/<find>/i.test(value) && key === 'change') args[key] = [...value.matchAll(/<find>([\s\S]*?)<\/find>\s*<replace>([\s\S]*?)<\/replace>/gi)].map(([, find, replace]) => ({ find: find.replace(/^\r?\n|\r?\n$/g, ''), replace: replace.replace(/^\r?\n|\r?\n$/g, '') }));
+            else if (given[key]?.type && given[key].type !== 'string') {
+                try {
+                    args[key] = JSON.parse(value);
+                } catch {
+                    args[key] = given[key].type === 'array' ? value.split(/\r?\n|,\s*/).map((one) => one.trim()).filter(Boolean) : value;
+                }
+            } else args[key] = value;
+        }
+        if (!found[3] && ranOut) {
+            cut = { name, text: open ? `{${JSON.stringify(open.key)}:${JSON.stringify(open.value).slice(0, -1)}` : '{' };
+            break;
+        }
+        calls.push({ function: { name, arguments: args } });
+        end = start + found[0].length;
+    }
+    return { calls, cut, text: source.slice(0, first).replace(/(?:\s|```\w*)+$/, '') };
+};
 const asChatTool = (entry, shown) => ({
     fn: entry.name,
     label: entry.label,
@@ -4890,6 +5054,8 @@ export const componentFaults = (text) => {
             faults.push('A component block holds only component tags, and one of yours holds something else. Program code goes in an ordinary code fence, and words go outside the block.');
             continue;
         }
+        // An Image is a still picture, so a script in one never runs.
+        if (/<Image\b[^>]*>[\s\S]*?<script\b[\s\S]*?<\/Image\s*>/i.test(block)) faults.push('An Image is a still picture: the script in it never runs. Put a figure that moves in a Frame, as a whole web page, or build it with the function of a skill that draws figures.');
         // What is written inside these is their own text (a page, code, a drawing), not tags of the chat's.
         const tagsOnly = WHOLE_TEXT_TAGS.reduce((kept, name) => kept.replace(new RegExp(`(<${name}\\b[^>]*>)[\\s\\S]*?(</${name}\\s*>)`, 'gi'), '$1$2'), block);
         for (const match of tagsOnly.matchAll(/<([A-Za-z][\w]*)\b((?:"[^"]*"|'[^']*'|[^>"'])*)>/g)) {
@@ -5661,14 +5827,21 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
                     keep_alive: `${settings.keepAliveMinutes}m`
                 };
                 if (facts.capabilities.includes('thinking')) request.think = true;
-                if (searching || chatTools.length > 0) request.tools = [...(searching ? SEARCH_TOOLS : []), ...chatTools.map((tool) => tool.definition)];
+                const functions = searching || chatTools.length > 0 ? [...(searching ? SEARCH_TOOLS : []), ...chatTools.map((tool) => tool.definition)] : [];
+                const wordKey = `${currentTarget()?.id ?? ''} ${chat.model}`;
+                const inWords = functions.length > 0 && (facts.wordy || learnedWordy.has(wordKey));
+                let seen = 0;
+                if (inWords) {
+                    request.messages = wordShape(messages, functions);
+                    uncounted = Math.max(uncounted, estimateTokens(functionWords(functions)));
+                } else if (functions.length > 0) request.tools = functions;
 
                 room = Math.max(room, sizeFor(messages, thinkRoom + uncounted + (programming ? reserve : 0)));
                 const calls = [];
                 let cutCall = null;
                 // A pooled or online model has all of its room at once; Ollama sets aside more as the reply needs it.
                 live.context = {
-                    total: capacity, room: facts.online || pooled ? capacity : request.options.num_ctx, parts: contextParts(messages, { start: prompt.length, tools: request.tools, marks }),
+                    total: capacity, room: facts.online || pooled ? capacity : request.options.num_ctx, parts: contextParts(messages, { start: prompt.length, tools: functions.length > 0 ? functions : undefined, marks }),
                     scale: live.context?.scale || 1, writing: 0, keptFree: reserve, putAway: marks.filter((mark) => mark.away).length, steps: round
                 };
                 let wrote = 0;
@@ -5709,6 +5882,7 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
                         // The first request of a reply holds the conversation alone. Later ones also hold what its tools
                         // returned, which is gone once the reply is written, so they are not what the chat is measured by.
                         promptEvalCount = promptEvalCount || part.prompt_eval_count || null;
+                        seen = part.prompt_eval_count || 0;
                         // A count far from the estimate leaves out what the service had already read, so it is not used.
                         const guess = Object.values(live.context.parts).reduce((sum, tokens) => sum + tokens, 0);
                         const scale = part.prompt_eval_count / guess;
@@ -5734,6 +5908,13 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
                             continue;
                         }
                     }
+                    // Some services and models refuse a request that has functions in it: they are put in words instead.
+                    if (!gone && !inWords && functions.length > 0 && mapOllamaError(error).code === 'NO_TOOL_SUPPORT') {
+                        learnedWordy.add(wordKey);
+                        round -= 1;
+                        correcting = true;
+                        continue;
+                    }
                     // Mollama counts a token as four characters, and code takes more: a service that says the request is
                     // longer than it can read is believed, what was read is put away, and the step is asked again.
                     if (!gone && tooLong < 4 && mapOllamaError(error).code === 'TOO_LONG') {
@@ -5757,7 +5938,7 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
                     }
                     // A small model sometimes writes a function call that Ollama cannot read, which ends the reply with
                     // an error. It is asked once more, as a second attempt usually comes out right.
-                    if (gone || reasked || !request.tools || !UNREADABLE_CALL.test(String(error?.error || error?.message || ''))) throw error;
+                    if (gone || reasked || functions.length === 0 || !UNREADABLE_CALL.test(String(error?.error || error?.message || ''))) throw error;
                     unread = true;
                 }
                 if (unread) {
@@ -5768,10 +5949,24 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
                     correcting = true;
                     continue;
                 }
-                if (calls.length === 0 && request.tools && !gone) {
-                    const written = writtenToolCalls(said);
-                    if (written.calls.length > 0) {
+                // A pooled model's count of its prompt shows whether its functions were in it. When they were not, it is told
+                // of them in words, now and from then on.
+                const unseen = pooled && !inWords && calls.length === 0 && !cutCall && functions.length > 0 && seen > 0 && estimateTokens(JSON.stringify(functions)) > 600
+                    && seen > counted * 0.6 && seen < counted + Math.floor(estimateTokens(JSON.stringify(functions)) * 0.35);
+                if (unseen && !gone) {
+                    learnedWordy.add(wordKey);
+                    reply.content = reply.content.slice(0, reply.content.length - said.length);
+                    write({ type: 'replace', text: reply.content });
+                    write({ type: 'note', text: 'This model was not shown its functions. Asking again with them in words…' });
+                    correcting = true;
+                    continue;
+                }
+                if (functions.length > 0 && calls.length === 0 && !cutCall && !gone) {
+                    const inMarks = readWordCalls(said, functions, inWords && endedBy === 'length');
+                    const written = inMarks.calls.length > 0 || inMarks.cut ? inMarks : readTextCalls(said, functions);
+                    if (written.calls.length > 0 || written.cut) {
                         calls.push(...written.calls);
+                        cutCall = written.cut;
                         reply.content = reply.content.slice(0, reply.content.length - said.length) + written.text;
                         write({ type: 'replace', text: reply.content });
                         said = written.text;

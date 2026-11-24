@@ -257,7 +257,7 @@ export const UNREADABLE_CALL = /tool call|invalid character .{1,12}(looking for|
 const RULES = [
     ['DISK_FULL', /no space left|not enough (disk )?space|insufficient disk/i],
     ['OUT_OF_MEMORY', /requires more system memory|out of memory|insufficient memory|not enough memory|cuda error.*memory/i],
-    ['NO_TOOL_SUPPORT', /does not support tools/i],
+    ['NO_TOOL_SUPPORT', /does not support (tools|tool use|function calling)|support tool use|(tools?|function calling|tool use) (is|are) not (supported|enabled|available)/i],
     ['TOO_LONG', /context length|context window|exceeds? (the )?(maximum |available )?context|prompt is too long/i],
     ['DOWNLOAD_INTERRUPTED', /unexpected eof|connection reset|stalled|max retries exceeded|pull.*interrupted/i],
     ['MODEL_MISSING', /model.*not found|not found.*model|try pulling it first|file does not exist|manifest.*(unknown|not found)/i],
@@ -2255,6 +2255,7 @@ const cloudFault = (status, text = '') => {
     if (status === 401 || status === 403 || (status === 400 && /api key|invalid.{0,12}key|incorrect.{0,12}key/i.test(text))) return 'KEY_REFUSED';
     if (status === 402 || (status === 429 && /insufficient|credit|balance|quota|billing|exceeded_current/i.test(text))) return 'OUT_OF_CREDIT';
     if (status === 429 || status === 529) return 'PROVIDER_BUSY';
+    if ([400, 404, 422].includes(status) && /does not support (tools|tool use|function calling)|support tool use|(tools?|function calling|tool use) (is|are) not (supported|enabled|available)/i.test(text)) return 'NO_TOOL_SUPPORT';
     if (status === 404) return 'MODEL_NOT_FOUND';
     if (status === 400 && /context|too long|too many tokens|maximum/i.test(text)) return 'TOO_LONG';
     return 'PROVIDER_DOWN';
@@ -2300,11 +2301,12 @@ const toSharedTurns = (messages) => {
     let count = 0;
     return messages.map((message) => ({ role: message.role, images: Array.isArray(message.images) ? message.images : [], message: sharedMessage(message, waiting, () => ++count) }));
 };
+// Nine letters and digits for a call's id: what some Mistral templates insist on, and any other service takes.
 const sharedMessage = (message, waiting, next) => {
-    if (message.role === 'tool') return { role: 'tool', tool_call_id: waiting.shift() || `call_${next()}`, content: String(message.content ?? '') };
+    if (message.role === 'tool') return { role: 'tool', tool_call_id: waiting.shift() || `c${String(next()).padStart(8, '0')}`, content: String(message.content ?? '') };
     if (message.role === 'assistant' && Array.isArray(message.tool_calls) && message.tool_calls.length > 0) {
         const calls = message.tool_calls.map((call) => {
-            const id = `call_${next()}`;
+            const id = `c${String(next()).padStart(8, '0')}`;
             waiting.push(id);
             return { id, type: 'function', function: { name: call.function?.name, arguments: JSON.stringify(call.function?.arguments || {}) } };
         });
