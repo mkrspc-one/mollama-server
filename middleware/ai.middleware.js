@@ -2208,17 +2208,21 @@ async function* sharedParts(response, started) {
             }
         }
     }
-    if (calls.size > 0) {
-        yield { message: { tool_calls: [...calls.values()].map((call) => {
-            let input = {};
-            try {
-                input = JSON.parse(call.text || '{}');
-            } catch {
-                input = {};
-            }
-            return { function: { name: call.name, arguments: input } };
-        }) } };
-    }
+    // A call cut off before its end is never run: what there is of it goes to the chat, which asks for the rest.
+    const whole = [];
+    let cut = null;
+    [...calls.values()].forEach((call, at, all) => {
+        let input = null;
+        try {
+            input = JSON.parse(call.text || '{}');
+        } catch {
+            input = null;
+        }
+        if (input === null || (finish === 'length' && at === all.length - 1)) cut = { name: call.name, text: call.text };
+        else whole.push({ function: { name: call.name, arguments: input } });
+    });
+    if (whole.length > 0) yield { message: { tool_calls: whole } };
+    if (cut) yield { message: { tool_cut: cut } };
     yield { done: true, done_reason: finish === 'length' ? 'length' : 'stop', eval_count: usage?.completion_tokens || 0, prompt_eval_count: usage?.prompt_tokens || 0, total_duration: (Date.now() - started) * 1e6 };
 }
 
@@ -2277,13 +2281,18 @@ const claudeRequest = (request, known) => {
     };
 };
 async function* claudeParts(stream, started) {
+    let drafting = null;
     try {
         for await (const event of stream) {
             // The moment the model starts writing a call to a tool is passed on, so the person sees what it has turned to
             // while a long call, such as a whole figure, is still being written.
-            if (event.type === 'content_block_start' && event.content_block?.type === 'tool_use') yield { message: { tool_start: event.content_block.name } };
+            if (event.type === 'content_block_start') drafting = event.content_block?.type === 'tool_use' ? { name: event.content_block.name, text: '' } : null;
+            if (event.type === 'content_block_start' && drafting) yield { message: { tool_start: drafting.name } };
             if (event.type !== 'content_block_delta') continue;
-            if (event.delta.type === 'input_json_delta' && event.delta.partial_json) yield { message: { tool_draft: event.delta.partial_json } };
+            if (event.delta.type === 'input_json_delta' && event.delta.partial_json) {
+                if (drafting) drafting.text += event.delta.partial_json;
+                yield { message: { tool_draft: event.delta.partial_json } };
+            }
             if (event.delta.type === 'thinking_delta' && event.delta.thinking) yield { message: { thinking: event.delta.thinking } };
             if (event.delta.type === 'text_delta' && event.delta.text) yield { message: { content: event.delta.text } };
         }
@@ -2292,6 +2301,7 @@ async function* claudeParts(stream, started) {
         // A call cut off by the length limit or by a refusal is never run: it may be only part of what was meant.
         const calls = ['max_tokens', 'refusal'].includes(final.stop_reason) ? [] : final.content.filter((block) => block.type === 'tool_use');
         if (calls.length > 0) yield { message: { tool_calls: calls.map((block) => ({ function: { name: block.name, arguments: block.input || {} } })) } };
+        if (final.stop_reason === 'max_tokens' && drafting) yield { message: { tool_cut: drafting } };
         const usage = final.usage || {};
         yield { done: true, done_reason: final.stop_reason === 'max_tokens' ? 'length' : 'stop', eval_count: usage.output_tokens || 0, prompt_eval_count: (usage.input_tokens || 0) + (usage.cache_read_input_tokens || 0) + (usage.cache_creation_input_tokens || 0), total_duration: (Date.now() - started) * 1e6 };
     } catch (error) {

@@ -331,11 +331,7 @@ const loadCost = async (ollama, model, { sending = false, anyway = false } = {})
         if (!parts || running.length > 0) return null;
         const computers = parts.computers.map((one, at) => ({ ...one.hardware, runs: at === 0 }));
         if (!fitPool(entry, computers)?.fits) return null;
-        const now = await Promise.all([parts.main, ...parts.lenders].map(async (one, at) => {
-            const loaded = queue.busyIn(one.id) ? [] : (await createOllamaClient(DEVICE_HOST, deviceGateway.fetcher(one.id)).running().catch(() => ({ models: [] }))).models;
-            return freeOf(one.id, computers[at], loaded);
-        }));
-        const fit = fitPool(entry, now);
+        const fit = fitPool(entry, (await poolNow(parts)).computers);
         return { loaded: false, ahead: false, tight: !fit.fits, neededMb: fit.memoryNeededMb, hasMb: fit.memoryMb, measured: true, fitsEmpty: true, name: parts.name };
     }
 
@@ -440,7 +436,7 @@ const memoryOf = async (device, names = new Map()) => {
             const starting = !state.running || poolStarts.has(main.id);
             const size = ((await quick(client.list()))?.models || []).find((one) => one.name === model)?.size || 0;
             about.models.push({
-                name: model, displayName: label(model), source: 'pool', sizeMb: size ? Math.round(size / MB) : null, gpuMb: null, ramMb: null, context: POOL_CONTEXT, helpers,
+                name: model, displayName: label(model), source: 'pool', sizeMb: size ? Math.round(size / MB) : null, gpuMb: null, ramMb: null, context: poolRoomOf(device.id, model), helpers,
                 ...busy, state: starting ? 'loading' : busy.state, endsAt: !starting && busy.usedAt ? busy.usedAt + POOL_IDLE_MS : null
             });
         }
@@ -1310,8 +1306,48 @@ const presentPools = async (userId) => {
 // A pooled model: the person's main computer runs it with the lending computers' memory. The pool is a record of its
 // own, so a chat can choose it like a computer; who is in it is worked out each time from the computers' parts.
 // How much a pooled model may read. It is started with this much room, and the chat is told it, so it folds older
-// messages and puts away old tool results before it would overflow (llama.cpp refuses a prompt past its context).
+// messages and puts away old tool results before it would overflow (llama.cpp refuses a prompt past its context). It
+// gets the larger one when every computer says what is free and the pool has the memory the extra room takes.
 const POOL_CONTEXT = 16384;
+const POOL_CONTEXT_MORE = 32768;
+const POOL_PLAN_MS = 60 * 1000;
+// What each main computer's pooled model was, or is about to be, started with; and the starts that failed with more.
+const poolRooms = new Map();
+const poolNarrow = new Set();
+const poolRoomOf = (main, model) => (poolRooms.get(String(main))?.model === model ? poolRooms.get(String(main)).ctx : POOL_CONTEXT);
+// The memory a model's conversation takes for that many tokens, kept at 8 bits, or null when its facts do not say.
+export const conversationMb = (info, tokens) => {
+    const of = (name) => Number(info?.[`${info?.['general.architecture']}.${name}`]);
+    const heads = of('attention.head_count');
+    const each = of('embedding_length') / heads;
+    const bytes = of('block_count') * (of('attention.head_count_kv') || heads) * ((of('attention.key_length') || each) + (of('attention.value_length') || each)) * 1.0625;
+    return bytes > 0 ? Math.ceil((bytes * tokens) / MB) : null;
+};
+const planPoolRoom = async (parts, model, shown, client) => {
+    const main = String(parts.main.id);
+    const held = poolRooms.get(main);
+    const own = contextLength(shown) || POOL_CONTEXT;
+    if (poolStateOf(main)?.running === model || poolStarts.has(main)) return Math.min(own, poolRoomOf(main, model));
+    if (held?.model === model && !held.started && Date.now() - held.at < POOL_PLAN_MS) return Math.min(own, held.ctx);
+    const extra = own > POOL_CONTEXT && !poolNarrow.has(`${main} ${model}`) ? conversationMb(shown?.model_info, Math.min(own, POOL_CONTEXT_MORE) - POOL_CONTEXT) : null;
+    let ctx = POOL_CONTEXT;
+    if (extra) {
+        const sizeMb = ((await client.list().catch(() => ({ models: [] }))).models.find((one) => one.name === model)?.size || 0) / MB;
+        const now = sizeMb ? await poolNow(parts) : null;
+        if (now?.measured && fitPool({ sizeMb: sizeMb + extra / 1.1, parameters: 0 }, now.computers)?.fits) ctx = Math.min(own, POOL_CONTEXT_MORE);
+    }
+    poolRooms.set(main, { model, ctx, extra: ctx > POOL_CONTEXT ? extra : 0, at: Date.now() });
+    return Math.min(own, ctx);
+};
+// The pool's computers as they are right now, the models a pooled one would replace counted as gone.
+const poolNow = async (parts) => {
+    const whole = parts.computers.map((one, at) => ({ ...one.hardware, runs: at === 0 }));
+    const computers = await Promise.all([parts.main, ...parts.lenders].map(async (one, at) => {
+        const loaded = queue.busyIn(one.id) ? [] : (await createOllamaClient(DEVICE_HOST, deviceGateway.fetcher(one.id)).running().catch(() => ({ models: [] }))).models;
+        return freeOf(one.id, whole[at], loaded);
+    }));
+    return { computers, measured: computers.every((one, at) => one !== whole[at]) };
+};
 // The desktop app ends a pooled model idle this long (its own POOL_IDLE_MS).
 const POOL_IDLE_MS = 15 * 60 * 1000;
 const poolRecord = (userId) => Device.findOneAndUpdate(
@@ -1373,12 +1409,21 @@ const startPool = async (parts, model) => {
             const gb = (mb) => Math.round(mb / 1024);
             throw new OllamaError('POOL_FAILED', `${model} needs about ${gb(fit.memoryNeededMb)} GB, and with ${parts.computers[0].name} as the primary computer the pool gives ${gb(fit.memoryMb)} GB. ${better > 0 ? `Make ${parts.computers[better].name} the primary computer, which has system memory to spare, and download the model there.` : 'Pick a smaller model.'}`);
         }
-        const split = size ? poolSplit(parts.devices, memoryNeededMb({ sizeMb: size / (1024 * 1024) })) : [];
-        const order = { type: 'pool', action: 'run', model, helpers: parts.helpers, split, ctx: POOL_CONTEXT, lean: true };
+        const plan = poolRooms.get(String(parts.main.id));
+        const ctx = poolRoomOf(parts.main.id, model);
+        poolRooms.set(String(parts.main.id), { model, ctx, extra: ctx > POOL_CONTEXT ? plan.extra : 0, started: true, at: Date.now() });
+        const split = size ? poolSplit(parts.devices, memoryNeededMb({ sizeMb: size / (1024 * 1024) }) + (ctx > POOL_CONTEXT ? plan.extra : 0)) : [];
+        const order = { type: 'pool', action: 'run', model, helpers: parts.helpers, split, ctx, lean: true };
         const start = Promise.all([parts.main, ...parts.lenders].map((one) => endLoaded(one.id)))
             .then(() => deviceGateway.query(parts.main.id, order, 35 * 60 * 1000))
             .then((answer) => {
-                if (!answer?.ready) throw new OllamaError('POOL_FAILED', String(answer?.error || '').slice(0, 300));
+                if (answer?.ready) return;
+                // It may be the extra room that did not fit: the next start asks for less.
+                if (ctx > POOL_CONTEXT) {
+                    poolNarrow.add(`${parts.main.id} ${model}`);
+                    poolRooms.delete(String(parts.main.id));
+                }
+                throw new OllamaError('POOL_FAILED', `${String(answer?.error || '').slice(0, 300)}${ctx > POOL_CONTEXT ? ' Send your message again: it will start with less room.' : ''}`);
             }, (error) => {
                 throw error instanceof OllamaError && error.code === 'DEVICE_OFFLINE' ? error : new OllamaError('POOL_FAILED', 'The primary computer did not answer: update its desktop app.');
             })
@@ -1403,7 +1448,7 @@ const poolClient = async (poolId) => {
         show: async (name) => {
             const shown = await main.show(name);
             const own = Object.fromEntries(Object.entries(shown?.model_info || {}).filter(([key]) => !key.endsWith('.context_length')));
-            return { ...shown, model_info: { ...own, 'pool.context_length': Math.min(contextLength(shown) || POOL_CONTEXT, POOL_CONTEXT) } };
+            return { ...shown, model_info: { ...own, 'pool.context_length': await planPoolRoom(parts, name, shown, main) } };
         },
         running: async () => ({ models: poolStateOf(parts.main.id)?.running ? [{ name: poolStateOf(parts.main.id).running }] : [] }),
         load: async (model) => startPool(parts, model),
@@ -2208,6 +2253,7 @@ const IMAGE_TOKENS = 1000;
 const AUTO_CONTEXT_LIMIT = 32768;
 const CONTEXT_STEPS = [8192, 16384, AUTO_CONTEXT_LIMIT];
 const REPLY_RESERVE = 1024;
+const PROGRAM_ROOM = 8192;
 const DRAFT_MS = 8000;
 // A model that thinks before it answers spends room on the thinking too, often several thousand tokens of it.
 const THINK_RESERVE = 6144;
@@ -3174,7 +3220,8 @@ const programFunction = () => ({
         type: 'object',
         properties: {
             language: { type: 'string', enum: ['python', 'node', 'bash'], description: 'What the program is written in' },
-            code: { type: 'string', description: 'The whole program' },
+            code: { type: 'string', description: 'The whole program, or its first part when unfinished is set' },
+            unfinished: { type: 'boolean', description: 'True when change_program will add the rest of a long program, so it is kept and not run yet' },
             files: filesParameter,
             save_to: saveParameter,
             minutes: { type: 'integer', minimum: 1, maximum: 30, description: 'How long the program may run, in minutes. Five when left out.' },
@@ -3183,38 +3230,148 @@ const programFunction = () => ({
         required: ['language', 'code']
     },
     run: async (input, { chat, userId } = {}) => {
-        const language = ['python', 'node', 'bash'].includes(input?.language) ? input.language : null;
-        const minutes = Number.isFinite(Number(input?.minutes)) ? Math.min(Math.max(Math.round(Number(input.minutes)), 1), MAX_PROGRAM_SECONDS / 60) : 5;
+        const language = languageOf(input);
         const code = String(input?.code ?? '');
-        const paths = (Array.isArray(input?.files) ? input.files.map(String) : []).slice(0, 10);
-        const folder = saveFolder(input, paths);
         if (!language) return { content: 'Nothing was run. Say what the program is written in: python, node or bash.', failed: 'failed' };
-        if (!code.trim()) return { content: 'Nothing was run. Give the whole program in code.', failed: 'failed' };
-        if (code.length > MAX_PROGRAM_CHARS) return { content: `Nothing was run. A program may be at most ${MAX_PROGRAM_CHARS.toLocaleString('en-GB')} characters.`, failed: 'failed' };
-        const files = personFiles();
-        let given;
-        try {
-            given = await readPersonFiles(files, paths);
-        } catch {
-            return { content: `Nothing was run. A file could not be read from the user's FilesystemOne: ${paths.join(', ')}. Check the path with them.`, failed: 'failed' };
-        }
-        let answer;
-        try {
-            answer = await runInSandbox({ language, code, files: given, seconds: minutes * 60, keep: chat ? `${userId}:${chat.id}` : null });
-        } catch (error) {
-            return { content: `Nothing was run. ${error.message}`, failed: 'failed' };
-        }
-        // Pictures named in look come back to the model to see; the rest is saved as usual.
-        const look = (Array.isArray(input?.look) ? input.look.map((one) => String(one).trim().replace(/^\.?\//, '')) : []).filter(Boolean);
-        const shots = (answer.files || []).filter((file) => look.includes(file.path) && LOOK_TYPES.test(file.path) && file.buffer.length <= MAX_LOOK_BYTES).slice(0, MAX_LOOKS);
-        const report = reportRun(`The ${language} program`, answer, await savePersonFiles(files, folder, (answer.files || []).filter((file) => !look.includes(file.path))));
-        if (answer.fresh) report.content = `This run started on a fresh computer: the files earlier runs left are gone.\n\n${report.content}`;
-        if (look.length === 0) return report;
-        const missing = look.filter((one) => !shots.some((file) => file.path === one));
-        const seen = [shots.length > 0 && `The pictures you asked to see are attached: ${shots.map((file) => file.path).join(', ')}.`, missing.length > 0 && `Not attached (not made, not a PNG, JPEG, WebP or GIF picture, over ${MAX_LOOK_BYTES / 1024 / 1024} MB, or past ${MAX_LOOKS} pictures): ${missing.join(', ')}.`].filter(Boolean).join(' ');
-        return { ...report, content: `${report.content}\n\n${seen}`, ...(shots.length > 0 ? { images: shots.map((file) => file.buffer.toString('base64')) } : {}) };
+        if (!code.trim() || code.startsWith(PROGRAM_AWAY)) return { content: 'Nothing was run. Give the whole program in code.', failed: 'failed' };
+        if (code.length > MAX_PROGRAM_CHARS) return { content: TOO_LONG, failed: 'failed' };
+        keepProgram(userId, chat, { language, code });
+        if (input?.unfinished === true) return { content: keptSoFar(code) };
+        return runProgram({ language, code, input, chat, userId });
     }
 });
+const keptSoFar = (code) => `Kept, not run yet. The program has ${linesOf(code).length} lines so far. Go on with add in change_program, and leave unfinished out with the last part.`;
+const languageOf = (input) => (['python', 'node', 'bash'].includes(input?.language) ? input.language : null);
+const TOO_LONG = `Nothing was run. A program may be at most ${MAX_PROGRAM_CHARS.toLocaleString('en-GB')} characters.`;
+const PROGRAM_AWAY = '[An earlier version of this program';
+const runProgram = async ({ language, code, input, chat, userId }) => {
+    const minutes = Number.isFinite(Number(input?.minutes)) ? Math.min(Math.max(Math.round(Number(input.minutes)), 1), MAX_PROGRAM_SECONDS / 60) : 5;
+    const paths = (Array.isArray(input?.files) ? input.files.map(String) : []).slice(0, 10);
+    const folder = saveFolder(input, paths);
+    const files = personFiles();
+    let given;
+    try {
+        given = await readPersonFiles(files, paths);
+    } catch {
+        return { content: `Nothing was run. A file could not be read from the user's FilesystemOne: ${paths.join(', ')}. Check the path with them.`, failed: 'failed' };
+    }
+    let answer;
+    try {
+        answer = await runInSandbox({ language, code, files: given, seconds: minutes * 60, keep: chat ? `${userId}:${chat.id}` : null });
+    } catch (error) {
+        return { content: `Nothing was run. ${error.message}`, failed: 'failed' };
+    }
+    // Pictures named in look come back to the model to see; the rest is saved as usual.
+    const look = (Array.isArray(input?.look) ? input.look.map((one) => String(one).trim().replace(/^\.?\//, '')) : []).filter(Boolean);
+    const shots = (answer.files || []).filter((file) => look.includes(file.path) && LOOK_TYPES.test(file.path) && file.buffer.length <= MAX_LOOK_BYTES).slice(0, MAX_LOOKS);
+    const report = reportRun(`The ${language} program`, answer, await savePersonFiles(files, folder, (answer.files || []).filter((file) => !look.includes(file.path))));
+    if (answer.fresh) report.content = `This run started on a fresh computer: the files earlier runs left are gone.\n\n${report.content}`;
+    if (report.failed && chat) report.content += '\n\nThe program is kept. To mend it, send only what changes with change_program.';
+    if (look.length === 0) return report;
+    const missing = look.filter((one) => !shots.some((file) => file.path === one));
+    const seen = [shots.length > 0 && `The pictures you asked to see are attached: ${shots.map((file) => file.path).join(', ')}.`, missing.length > 0 && `Not attached (not made, not a PNG, JPEG, WebP or GIF picture, over ${MAX_LOOK_BYTES / 1024 / 1024} MB, or past ${MAX_LOOKS} pictures): ${missing.join(', ')}.`].filter(Boolean).join(' ');
+    return { ...report, content: `${report.content}\n\n${seen}`, ...(shots.length > 0 ? { images: shots.map((file) => file.buffer.toString('base64')) } : {}) };
+};
+// The last program of each chat, kept in memory, so a model mends or continues it without writing it all again. One
+// that ran out of room in the middle of a program goes on from what is kept here.
+const MAX_KEPT_PROGRAMS = 300;
+const chatPrograms = new Map();
+const programKey = (userId, chat) => `${userId}:${chat?.id}`;
+const keepProgram = (userId, chat, program) => {
+    if (!chat) return;
+    chatPrograms.delete(programKey(userId, chat));
+    chatPrograms.set(programKey(userId, chat), program);
+    if (chatPrograms.size > MAX_KEPT_PROGRAMS) chatPrograms.delete(chatPrograms.keys().next().value);
+};
+const linesOf = (code) => code.replace(/\n$/, '').split('\n');
+const SHOWN_LINES = 120;
+const changeFunction = () => ({
+    name: 'change_program',
+    label: 'Program',
+    doing: 'Changing the program…',
+    changes: touchesFiles,
+    description: 'Changes the last program of this chat and runs it again, in the same computer as run_program. Use it to mend or improve a program instead of sending the whole of it again, and to write a long program in parts: each call sends only what is new. change replaces pieces of it, add puts text after its last line, show returns lines of it without running it.',
+    parameters: {
+        type: 'object',
+        properties: {
+            change: { type: 'array', items: { type: 'object', properties: { find: { type: 'string', description: 'Text in the program, copied exactly, that occurs once' }, replace: { type: 'string', description: 'What takes its place' } }, required: ['find', 'replace'] }, description: 'The pieces to replace, in order' },
+            add: { type: 'string', description: 'Text put after the last line of the program' },
+            unfinished: { type: 'boolean', description: 'True when more is still to come, so the program is kept and not run yet' },
+            show: { type: 'string', description: 'Lines to read, such as 150-190. Nothing is run.' },
+            language: { type: 'string', enum: ['python', 'node', 'bash'], description: 'Only when the program was cut off before it said' },
+            files: filesParameter,
+            save_to: saveParameter,
+            minutes: { type: 'integer', minimum: 1, maximum: 30, description: 'How long the program may run, in minutes. Five when left out.' },
+            look: { type: 'array', items: { type: 'string' }, description: 'Pictures the program makes that you want to see, as in run_program' }
+        }
+    },
+    run: async (input, { chat, userId } = {}) => {
+        const program = chatPrograms.get(programKey(userId, chat));
+        if (!program) return { content: 'There is no program in this chat to change. Write one with run_program.', failed: 'failed' };
+        let { code } = program;
+        const lines = linesOf(code);
+        if (String(input?.show ?? '').trim()) {
+            const [first, last = first] = String(input.show).match(/\d+/g)?.map(Number) || [1, SHOWN_LINES];
+            const from = Math.min(Math.max(first, 1), lines.length);
+            const to = Math.min(Math.max(last, from), from + SHOWN_LINES - 1, lines.length);
+            return { content: `Lines ${from} to ${to} of ${lines.length}:\n${lines.slice(from - 1, to).join('\n')}` };
+        }
+        const edits = (Array.isArray(input?.change) ? input.change : input?.change ? [input.change] : []).filter((one) => one && typeof one === 'object');
+        for (const [at, one] of edits.entries()) {
+            const find = String(one.find ?? '');
+            const times = find ? code.split(find).length - 1 : 0;
+            if (times === 1) {
+                code = code.replace(find, () => String(one.replace ?? ''));
+                continue;
+            }
+            return { content: `Nothing was changed or run. ${times === 0 ? `The find text of change ${at + 1} is not in the program. Copy it exactly; show returns the program's lines.` : `The find text of change ${at + 1} occurs ${times} times. Give more of the lines around it, so it occurs once.`}`, failed: 'failed' };
+        }
+        const add = String(input?.add ?? '');
+        if (add.trim()) code = `${code}${!code || code.endsWith('\n') ? '' : '\n'}${add}`;
+        if (code.length > MAX_PROGRAM_CHARS) return { content: TOO_LONG, failed: 'failed' };
+        const language = languageOf(input) || program.language;
+        keepProgram(userId, chat, { language, code });
+        if (input?.unfinished === true) return { content: keptSoFar(code) };
+        if (!language) return { content: 'The change is kept, and nothing was run. Say what the program is written in: call change_program with language.', failed: 'failed' };
+        if (!code.trim()) return { content: 'Nothing was run: the program is empty.', failed: 'failed' };
+        return runProgram({ language, code, input, chat, userId });
+    }
+});
+// The text of one input of a call that was cut off before its end, as far as it got.
+export const cutInput = (text, name) => {
+    const found = String(text ?? '').match(new RegExp(`"${name}"\\s*:\\s*"((?:[^"\\\\]|\\\\[\\s\\S])*)`));
+    if (!found) return null;
+    const whole = found[1].replace(/(^|[^\\])((?:\\\\)*)\\u[0-9a-fA-F]{0,3}$/, '$1$2').replace(/[\u0000-\u001f]/g, (char) => JSON.stringify(char).slice(1, -1));
+    try {
+        return JSON.parse(`"${whole}"`);
+    } catch {
+        return null;
+    }
+};
+const PROGRAM_CALLS = new Set(['run_program', 'change_program']);
+// A call cut off before its end was not run. What there is of a program is kept, up to its last whole line, and the
+// model is told where to go on; any other call has to be written again, shorter.
+const keepCut = (cut, { chat, userId, ranOut }) => {
+    const what = `Your call to ${clip(cut.name, 60)} was ${ranOut ? 'cut off because you ran out of room' : 'not complete, so it could not be read'}, and it was not run.`;
+    const part = !ranOut ? null : cut.name === 'run_program' ? cutInput(cut.text, 'code') : cut.name === 'change_program' ? cutInput(cut.text, 'add') : null;
+    const whole = part?.includes('\n') ? part.slice(0, part.lastIndexOf('\n') + 1) : '';
+    if (whole.trim() && !whole.startsWith(PROGRAM_AWAY)) {
+        const before = cut.name === 'change_program' ? chatPrograms.get(programKey(userId, chat)) : null;
+        // Changes sent with a cut-off add were not made, so nothing of that call is kept.
+        if (cut.name === 'run_program' || (before && !/"change"\s*:/.test(cut.text))) {
+            const code = before ? `${before.code}${before.code.endsWith('\n') ? '' : '\n'}${whole}` : whole;
+            const language = before?.language || languageOf({ language: cutInput(cut.text, 'language') });
+            keepProgram(userId, chat, { language, code });
+            const lines = linesOf(code);
+            return {
+                kept: lines.length,
+                note: `${what} The program is kept as far as you got: ${lines.length} lines, ending with\n\n${lines.slice(-6).join('\n')}\n\nDo not write it again. Go on with change_program: put only the lines after these in add${language ? '' : ', and say its language'}. Send at most about 60 lines in one call, with unfinished set to true while more is to come.`
+            };
+        }
+    }
+    const advice = cut.name === 'run_program' ? 'Write the program in parts: the first part with run_program, then change_program with add.' : cut.name === 'change_program' ? 'Send less in one call.' : 'Call it again with less in it, or leave out what it can do without.';
+    return { kept: 0, note: `${what} ${advice}` };
+};
 const asChatTool = (entry, shown) => ({
     fn: entry.name,
     label: entry.label,
@@ -3228,7 +3385,7 @@ const skillFunctionsFor = (chat) => {
     const active = skillsOf(chat);
     const own = active.flatMap((skill) => [...(SKILL_FUNCTIONS[skill.id] || []).filter((entry) => !entry.ready || entry.ready())].map((entry) => asChatTool(entry, () => skill.name)));
     const writes = sandboxReady() && active.some((skill) => SANDBOX_SKILLS[skill.id] || (skill.needs || []).includes('commands'));
-    return writes ? [...own, asChatTool(programFunction(), (input) => `${['python', 'node', 'bash'].includes(input?.language) ? input.language : 'A'} program`)] : own;
+    return writes ? [...own, asChatTool(programFunction(), (input) => `${languageOf(input) || 'A'} program`), asChatTool(changeFunction(), (input) => (input?.show ? `lines ${clip(input.show, 20)} of the program` : 'a change to the program'))] : own;
 };
 // The level above a chat's own skills is the whole library, searched by a few words. A model cannot turn a skill on:
 // it names the one that would help, and the person turns it on.
@@ -3649,7 +3806,9 @@ const buildMessages = (chat, listing = false, seeing = false) => {
     return out;
 };
 
-const promptTokens = (messages) => messages.reduce((sum, message) => sum + estimateTokens(message.content) + 4, 0);
+// What a model wrote in a call is read again with every later step, so it counts too.
+const callTokens = (message) => (message.tool_calls || []).reduce((sum, call) => sum + estimateTokens(JSON.stringify(call.function || {})), 0);
+const promptTokens = (messages) => messages.reduce((sum, message) => sum + estimateTokens(message.content) + callTokens(message) + 4, 0);
 
 const contextUse = (chat, facts) => {
     if (!facts) return null;
@@ -3834,6 +3993,7 @@ export const deleteChat = asyncHandler(async (req, res) => {
     if (!chat) return;
     await endReplies([chat.id], { wait: 5000 });
     await letSandboxGo(`${req.user.id}:${chat.id}`);
+    chatPrograms.delete(programKey(req.user.id, chat));
     await chat.deleteOne();
     logger.info('[Chat] Chat deleted', { chatId: chat.id, userId: req.user.id });
     res.status(200).json({ success: true, message: 'Chat deleted.' });
@@ -4058,13 +4218,29 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
         let uncounted = 0;
         // The room kept free for what the model writes. It grows when a reply is cut short with no more room to give
         // (see below), so a long function call, such as a whole figure, has somewhere to go.
-        let reserve = REPLY_RESERVE * 2;
+        // A model that can run programs is kept a quarter of its room, since a program is sent whole.
+        let reserve = chatTools.some((tool) => tool.fn === 'run_program') ? Math.max(REPLY_RESERVE * 2, Math.min(PROGRAM_ROOM, Math.floor(capacity / 4))) : REPLY_RESERVE * 2;
+        let programming = false;
+        let cutsInVain = 0;
+        // Calls that failed, so one made again and again with the same input is not run without end.
+        const failures = new Map();
+        // An earlier version of a program is no use once a later one has been sent: the last one stays as it was.
+        const putProgramsAway = () => {
+            const sent = messages.flatMap((message) => message.tool_calls || []).filter((call) => PROGRAM_CALLS.has(call.function?.name));
+            for (const call of sent.slice(0, -1)) {
+                const given = toolArguments(call.function.arguments);
+                if (JSON.stringify(given).length < PUT_AWAY_MIN_CHARS) continue;
+                const size = JSON.stringify(given).length.toLocaleString('en-GB');
+                call.function = { name: call.function.name, arguments: call.function.name === 'run_program' ? { language: given.language || 'python', code: `${PROGRAM_AWAY}, ${size} characters, put away to save room. The newest version is kept for change_program.]` } : { add: `[An earlier change, ${size} characters, put away to save room.]` } };
+            }
+        };
         // A reply never sends more than the model can read: Ollama would drop the start of the conversation without
         // saying so, and a pooled model refuses the request. Results already read go first, oldest first, skill pages
         // and files last; then what has not been read yet is cut to what fits.
         const makeRoom = () => {
             const limit = capacity - reserve - uncounted;
             const over = () => promptTokens(messages) - limit;
+            if (over() > 0) putProgramsAway();
             for (const pages of [false, true]) {
                 for (const mark of marks) {
                     if (over() <= 0) return;
@@ -4099,8 +4275,9 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
                 if (facts.capabilities.includes('thinking')) request.think = true;
                 if (searching || chatTools.length > 0) request.tools = [...(searching ? SEARCH_TOOLS : []), ...chatTools.map((tool) => tool.definition)];
 
-                room = Math.max(room, sizeFor(messages, thinkRoom + uncounted));
+                room = Math.max(room, sizeFor(messages, thinkRoom + uncounted + (programming ? reserve : 0)));
                 const calls = [];
+                let cutCall = null;
                 let said = '';
                 let endedBy = null;
                 let unread = false;
@@ -4126,6 +4303,7 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
                         write({ type: 'token', text: part.message.content });
                     }
                     if (Array.isArray(part.message?.tool_calls)) calls.push(...part.message.tool_calls);
+                    if (part.message?.tool_cut) cutCall = part.message.tool_cut;
                     if (part.done) {
                         endedBy = part.done_reason || null;
                         evalCount += part.eval_count || 0;
@@ -4158,6 +4336,41 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
                         reply.content = reply.content.slice(0, reply.content.length - said.length) + written.text;
                         write({ type: 'replace', text: reply.content });
                         said = written.text;
+                    }
+                }
+                // A call cut off before its end is never run. More room is made, and the model goes on from what is kept.
+                let cutNote = null;
+                if (cutCall && !gone) {
+                    const ranOut = endedBy === 'length';
+                    const held = keepCut(cutCall, { chat, userId, ranOut });
+                    cutNote = held.note;
+                    const mine = chatTools.find((tool) => tool.fn === cutCall.name);
+                    const step = { tool: mine ? mine.label : clip(cutCall.name, 60), input: held.kept ? `${held.kept} lines so far` : 'cut off', failed: held.kept ? null : 'cut', answer: clip(held.note, STEP_ANSWER_CHARS) };
+                    reply.steps.push(step);
+                    write({ type: 'tool', tool: step.tool, input: step.input });
+                    if (step.failed) write({ type: 'toolFailed', failed: step.failed });
+                    write({ type: 'toolAnswer', answer: step.answer });
+                    const before = promptTokens(messages);
+                    if (ranOut) {
+                        reserve = Math.min(Math.max(reserve, Math.floor(capacity / 2)), reserve * 2);
+                        programming = true;
+                        makeRoom();
+                    }
+                    cutsInVain = held.kept || promptTokens(messages) < before ? 0 : cutsInVain + 1;
+                    if (calls.length === 0) {
+                        if (cutsInVain >= 3) {
+                            reply.errorCode = ranOut ? 'REPLY_CUT' : 'CALL_UNREADABLE';
+                            break;
+                        }
+                        if (said.trim()) messages.push({ role: 'assistant', content: said });
+                        messages.push({ role: 'user', content: cutNote });
+                        if (said && !/\s$/.test(reply.content)) {
+                            reply.content += '\n\n';
+                            write({ type: 'token', text: '\n\n' });
+                        }
+                        write({ type: 'note', text: ranOut ? 'The model ran out of room. Asking it to go on…' : 'The model wrote a function call that could not be read. Asking again…' });
+                        correcting = true;
+                        continue;
                     }
                 }
                 // A reply that stopped because the model ran out of room is tried once more with more room when there is
@@ -4237,9 +4450,11 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
                     write({ type: 'tool', tool: step.tool, input });
                     // The same call made again in a reply is not run again: the model is given what it got before, so a
                     // model that has lost its way is moved on instead of going round in circles.
-                    const same = `${mine ? mine.fn : name}\n${JSON.stringify(given ?? input)}`;
+                    const same = `${mine ? mine.fn : name}\n${JSON.stringify(given ?? input)}${mine?.fn === 'change_program' ? `\n${chatPrograms.get(programKey(userId, chat))?.code ?? ''}` : ''}`;
+                    if (PROGRAM_CALLS.has(mine?.fn)) programming = true;
+                    const failedBefore = failures.get(same);
                     // Stop does not wait for a tool that is still running: a search, a page being read, a question to the person.
-                    const outcome = results.has(same) && awayKeys.has(same) ? { content: results.get(same) } : results.has(same) ? { content: `You already called ${mine ? mine.fn : name} with the same input in this reply. What it gave you then is above and has not changed: use it and go on with your answer.\n\n${clip(results.get(same), 2000)}` } : await Promise.race([
+                    const outcome = results.has(same) && awayKeys.has(same) ? { content: results.get(same) } : results.has(same) ? { content: `You already called ${mine ? mine.fn : name} with the same input in this reply. What it gave you then is above and has not changed: use it and go on with your answer.\n\n${clip(results.get(same), 2000)}` } : failedBefore?.times >= 2 ? { content: `This exact call has failed ${failedBefore.times} times and was not run again: it would fail the same way. Do something different.\n\n${clip(failedBefore.content, 1500)}`, failed: 'failed' } : await Promise.race([
                         mine ? runChatTool(mine, given, { chat, userId, write, stopped: () => gone, show, kept })
                             : offered.includes(name) ? runSearchTool(name, input)
                                 : { content: `There is no function called ${clip(name, 60)}. The functions you can call are: ${offered.join(', ')}.`, failed: 'failed' },
@@ -4253,6 +4468,7 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
                     step.answer = clip(String(outcome.content ?? ''), STEP_ANSWER_CHARS);
                     write({ type: 'toolAnswer', answer: step.answer });
                     if (!outcome.failed && !results.has(same)) results.set(same, String(outcome.content ?? ''));
+                    if (outcome.failed === 'failed') failures.set(same, { times: (failedBefore?.times || 0) + 1, content: failedBefore?.content || String(outcome.content ?? '') });
                     const pictures = Array.isArray(outcome.images) && outcome.images.length > 0 ? outcome.images : null;
                     const seesPictures = facts.capabilities.includes('vision');
                     messages.push({ role: 'tool', tool_name: name, content: pictures && !seesPictures ? `${outcome.content}\n\nThis model cannot see pictures, so they were not sent.` : outcome.content, ...(pictures && seesPictures ? { images: pictures } : {}) });
@@ -4261,6 +4477,7 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
                     if (outcome.ends) ended = true;
                     if (gone || ended) break;
                 }
+                if (cutNote) messages.push({ role: 'user', content: cutNote });
                 // The tools are done; the model is thinking again.
                 write({ type: 'note', text: '' });
                 // A question put to the person is the end of the reply: the model is not asked to go on without the answer.
