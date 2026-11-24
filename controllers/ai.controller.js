@@ -2686,7 +2686,7 @@ const firstPages = (skill, capacity, kept) => {
             lines.push(`${file} (about ${estimateTokens(text).toLocaleString('en-GB')} tokens): read it with open_skill_file before you build.`);
             continue;
         }
-        kept?.set(key, true);
+        kept?.set(key, until ? true : 'given');
         lines.push(`${file}:\n\n${text}`);
     }
     return lines.length > 0 ? `\n\nREAD BEFORE YOU BUILD\n${lines.join('\n\n')}` : '';
@@ -2793,6 +2793,30 @@ const PUT_AWAY_AFTER = 3;
 const PUT_AWAY_MIN_CHARS = 600;
 // A note the model keeps for the rest of the chat: shown with every message after this one, so it outlasts the memory
 // folding and results put away.
+// A model may free its own room in the middle of a reply: it writes down what it still needs, and what it has read is put
+// away. The loop does the putting away, as it holds the messages.
+const ALREADY_GIVEN = 'You already have ';
+const COMPRESS_STEP = 'Make room';
+const compressTool = () => ({
+    fn: 'compress_context',
+    label: COMPRESS_STEP,
+    doing: 'Making room…',
+    changes: false,
+    shown: (input) => clip(String(input?.keep ?? ''), 300),
+    definition: {
+        type: 'function',
+        function: {
+            name: 'compress_context',
+            description: 'Frees room in your context in the middle of your work: everything you have read and sent in this reply so far (skill pages, files, results, earlier versions) is put away, and only what you write in keep stays. Use it before writing something long when you are told little room is left. In keep put all you still need: the exact names and arguments of the functions you will call, sizes, the plan, what is done and what is next. Anything put away can be read again with the same call.',
+            parameters: { type: 'object', properties: { keep: { type: 'string', description: 'What you still need, in full. It is all that stays.' } }, required: ['keep'] }
+        }
+    },
+    run: async (input) => {
+        const keep = String(input?.keep ?? '').trim();
+        if (keep.length < 20) return { content: 'Nothing was put away. Write in keep what you still need: it is all that stays.', failed: 'failed' };
+        return { content: 'Put away.', compress: true };
+    }
+});
 const MAX_NOTES = 40;
 const NOTE_STEP = 'Note';
 const noteTool = (chat) => ({
@@ -2945,6 +2969,7 @@ const DOING = {
     open_skill: 'Opening a skill…',
     open_skill_file: "Reading one of a skill's files…",
     save_note: 'Keeping a note…',
+    compress_context: 'Making room…',
     save_to_files: 'Saving to your files…',
     open_component: 'Reading how to draw a component…',
     find_skill: 'Looking in the skill library…',
@@ -2982,7 +3007,10 @@ const skillFileTool = (withFiles) => {
             const lines = whole === null ? [] : whole.split('\n');
             const end = stop ? lines.findIndex((line) => line.includes(stop)) : -1;
             const text = whole !== null && end > 0 ? lines.slice(0, end).join('\n') : whole;
-            if (text !== null) kept?.set(`file:${skill.id}/${String(input?.file ?? '').trim().replace(/^\.?\//, '')}`, true);
+            const fileKey = skill ? `file:${skill.id}/${String(input?.file ?? '').trim().replace(/^\.?\//, '')}` : '';
+            // It came with the skill in this reply and is still there to read: giving it again would only take room.
+            if (text !== null && kept?.get(fileKey) === 'given') return { content: `${ALREADY_GIVEN}${String(input.file).trim()}: it came with open_skill above, under READ BEFORE YOU BUILD.` };
+            if (text !== null) kept?.set(fileKey, true);
             if (text !== null) return { content: text };
             return { content: skill ? `That skill has no file by that name. Its files are: ${skill.files.map((file) => file.path).join(', ')}.` : `There is no skill by that name with files in this chat. The skills with files are: ${withFiles.map((one) => one.id).join(', ')}.`, failed: 'failed' };
         }
@@ -3231,7 +3259,29 @@ const hairlineFaults = (() => {
         return out;
     };
 })();
-const CHANGES = { type: 'array', items: { type: 'object', properties: { find: { type: 'string', description: 'Text in it, copied exactly, that occurs once' }, replace: { type: 'string', description: 'What takes its place' } }, required: ['find', 'replace'] }, description: 'The pieces to replace, in order' };
+// A figure or page follows the theme the person picks only by the app's variables: a model is never told a colour of the
+// theme, and one it writes itself stays the same in every theme.
+const APP_COLOURS = 'Write no colour of your own (no #hex, rgb(), hsl() or colour names, in styles, in fill and stroke or anywhere else): use only the app\'s variables, so it follows whichever theme the user picks: var(--app-background), var(--app-surface), var(--app-text), var(--app-border), var(--app-primary), var(--app-secondary), var(--app-tertiary), var(--app-neutral), var(--app-success), var(--app-warning), var(--app-error) and var(--app-contrast) for text on a filled colour. A softer one is color-mix(in srgb, var(--app-text) 30%, transparent). Only a colour that is itself the subject (a flag, a wire that is red) may be fixed.';
+const COLOUR_NAMES = 'white|black|red|green|blue|yellow|orange|purple|pink|brown|gray|grey|silver|gold|navy|teal|maroon|olive|cyan|magenta|crimson|steelblue|lightgray|lightgrey|darkgray|darkgrey|whitesmoke|tomato|coral|royalblue|dodgerblue|slategray|dimgray';
+export const fixedColours = (page) => {
+    const text = String(page ?? '').replace(/<script\b[\s\S]*?<\/script>|<!--[\s\S]*?-->|\/\*[\s\S]*?\*\//gi, ' ').replace(/url\([^)]*\)|href="[^"]*"|var\([^()]*(?:\([^()]*\)[^()]*)*\)/gi, ' ');
+    const found = [
+        ...[...text.matchAll(/#(?:[0-9a-f]{8}|[0-9a-f]{6}|[0-9a-f]{3,4})(?![\w-])|(?:rgb|hsl)a?\([^)]*\)/gi)].map((one) => one[0]).filter((one) => !/^rgba?\(\s*0[\s,]+0[\s,]+0[\s,/]+0?\.\d+\s*\)$/i.test(one)),
+        ...[...text.matchAll(new RegExp(`\\b(?:fill|stroke|color|background|background-color|border-color|stop-color)\\s*(?:=\\s*["']|:\\s*)(${COLOUR_NAMES})\\b`, 'gi'))].map((one) => one[1])
+    ].map((one) => one.toLowerCase());
+    // An id such as href="#base" is not a colour; three or four letters that are one word of hex still may be, so only
+    // what stands where a value stands is kept above.
+    return { count: found.length, colours: [...new Set(found)] };
+};
+// One or two fixed colours may be the subject's own; more are a page that does not follow the theme.
+const colourFaults = (page) => {
+    const { count, colours } = fixedColours(page);
+    return count > 2 ? [`colours: ${count} fixed ${colours.length === 1 ? 'uses of one colour' : 'colours'} (${colours.slice(0, 8).join(', ')}${colours.length > 8 ? `, and ${colours.length - 8} more` : ''}) stay the same in every theme. Replace each with one of the app's variables, such as var(--app-primary) or color-mix(in srgb, var(--app-text) 40%, var(--app-surface)); a change with all set replaces every place a colour occurs.`] : [];
+};
+// Long figures and scripts may be sent in parts: what there is so far is kept, and a change adds to it.
+const PART_ADD = { type: 'string', description: 'Text put after the last line, to go on with one that is not finished' };
+const PART_UNFINISHED = { type: 'boolean', description: 'True when more is still to come, so what there is is kept and nothing is built yet' };
+const CHANGES = { type: 'array', items: { type: 'object', properties: { find: { type: 'string', description: 'Text in it, copied exactly, that occurs once' }, replace: { type: 'string', description: 'What takes its place' }, all: { type: 'boolean', description: 'True to replace every place it occurs, such as a colour' } }, required: ['find', 'replace'] }, description: 'The pieces to replace, in order' };
 const CAD_NAME = { type: 'string', description: 'A short file name for it without an ending, in lower case, such as bracket' };
 const CAD_SAVE = { type: 'string', description: 'The FilesystemOne folder for the files it makes. Left out, a CadSmith folder in the user\'s own folder.' };
 const CAD_BUILD = {
@@ -3240,8 +3290,8 @@ const CAD_BUILD = {
     doing: 'Building the model…',
     ready: () => sandboxReady(),
     description: 'Does what `python ./output/<name>.py` does in the CadSmith skills, then shows the model to the user in the chat\'s 3D viewer. Your build123d or CadQuery script is saved as output/<name>.py on this chat\'s computer and run there; what it exported is measured (separate bodies, size, volume, whether it is watertight), and the .py, .step and .stl files are offered to the user to save. The script must export to ./output/<name>.step and ./output/<name>.stl. Give the whole script. The viewer in the chat takes the place of the skill\'s Three.js previewer, its manifest and its reviewer, none of which can run here, so judge the model by the measurements. When it returns things to fix, mend them with cad_change. Use this for a model instead of run_program.',
-    parameters: { type: 'object', properties: { code: { type: 'string', description: 'The whole script as you would save it in output/<name>.py' }, name: CAD_NAME, save_to: CAD_SAVE }, required: ['code', 'name'] },
-    run: async (input, context) => buildCad(String(input?.code ?? ''), input, context, 'model')
+    parameters: { type: 'object', properties: { code: { type: 'string', description: 'The whole script as you would save it in output/<name>.py' }, unfinished: PART_UNFINISHED, name: CAD_NAME, save_to: CAD_SAVE }, required: ['code', 'name'] },
+    run: async (input, context) => (input?.unfinished === true ? keepPart('cad', input.code, { name: cadName(input?.name, 'model'), mode: 'model', folder: inHome(String(input?.save_to ?? '').trim() || 'CadSmith') }, context, 'cad_change') : buildCad(String(input?.code ?? ''), input, context, 'model'))
 };
 const MECH_RUN = {
     name: 'mech_run',
@@ -3249,8 +3299,8 @@ const MECH_RUN = {
     doing: 'Running the mechanism…',
     ready: () => sandboxReady(),
     description: 'Does what `uv run mech run output/<name>.py` does in CadSmith Make Mechanism, then shows the mechanism at its home pose in the chat\'s 3D viewer, each part in its own colour. Your script is saved as output/<name>.py on this chat\'s computer, the full analysis is run, and its summary comes back to you word for word: PASS, WARN, FAIL or INVALID with every issue line, and Δprev against the run before. Give the whole script, ending with run(build()). Then change one thing at a time with cad_change, as the skill says. `mech shot` and the skill\'s own viewer cannot run here.',
-    parameters: { type: 'object', properties: { code: { type: 'string', description: 'The whole script as you would save it in output/<name>.py' }, name: CAD_NAME, params: { type: 'string', description: 'Parameters to try without editing, as after -p, such as crank=35 gap=0.4' }, save_to: CAD_SAVE }, required: ['code', 'name'] },
-    run: async (input, context) => buildCad(String(input?.code ?? ''), input, context, 'mechanism')
+    parameters: { type: 'object', properties: { code: { type: 'string', description: 'The whole script as you would save it in output/<name>.py' }, unfinished: PART_UNFINISHED, name: CAD_NAME, params: { type: 'string', description: 'Parameters to try without editing, as after -p, such as crank=35 gap=0.4' }, save_to: CAD_SAVE }, required: ['code', 'name'] },
+    run: async (input, context) => (input?.unfinished === true ? keepPart('cad', input.code, { name: cadName(input?.name, 'mechanism'), mode: 'mechanism', folder: inHome(String(input?.save_to ?? '').trim() || 'CadSmith') }, context, 'cad_change') : buildCad(String(input?.code ?? ''), input, context, 'mechanism'))
 };
 const CAD_CHANGE = {
     name: 'cad_change',
@@ -3258,13 +3308,14 @@ const CAD_CHANGE = {
     doing: 'Mending the model…',
     ready: () => sandboxReady(),
     description: 'Changes the last script given to cad_build or mech_run in this chat, then runs, measures and shows it as they do. Use it to mend or alter a model instead of sending the whole script again: give only the pieces that change.',
-    parameters: { type: 'object', properties: { change: CHANGES, show: { type: 'string', description: 'Lines of the script to read, such as 40-80. Nothing is run.' }, params: { type: 'string', description: 'For a mechanism: parameters to try without editing, such as crank=35' } } },
+    parameters: { type: 'object', properties: { change: CHANGES, add: PART_ADD, unfinished: PART_UNFINISHED, show: { type: 'string', description: 'Lines of the script to read, such as 40-80. Nothing is run.' }, params: { type: 'string', description: 'For a mechanism: parameters to try without editing, such as crank=35' } } },
     run: async (input, context) => {
         const held = chatFigures.get(programKey(context.userId, context.chat))?.cad;
         if (!held) return { content: 'There is no script in this chat to change. Build one with cad_build or mech_run.', failed: 'failed' };
         if (String(input?.show ?? '').trim()) return { content: shownLines(held.code, input.show) };
-        const edited = Array.isArray(input?.change) && input.change.length > 0 ? applyChanges(held.code, input.change) : { code: held.code, problem: String(input?.params ?? '').trim() ? null : 'Give the pieces to change.' };
+        const edited = editHeld(held.code, input, Boolean(String(input?.params ?? '').trim()));
         if (edited.problem) return { content: `Nothing was changed or run. ${edited.problem}`, failed: 'failed' };
+        if (input?.unfinished === true) return keepPart('cad', edited.code, held, context, 'cad_change');
         return buildCad(edited.code, { ...input, name: held.name, save_to: held.folder }, context, held.mode);
     }
 };
@@ -3277,26 +3328,41 @@ const CAD_EXPORT = {
     parameters: { type: 'object', properties: { name: CAD_NAME, format: { type: 'string', enum: ['stl', 'obj', 'glb', 'ply', '3mf', 'off'], description: 'The kind of file wanted' }, save_to: CAD_SAVE }, required: ['name', 'format'] },
     run: async (input, context) => exportCad(input, context)
 };
+const keepPart = (kind, code, extra, { userId, chat }, change) => {
+    const text = String(code ?? '').replace(/\r\n/g, '\n');
+    if (!text.trim() || text.startsWith(PROGRAM_AWAY)) return { content: 'Nothing was kept. Give the part you have.', failed: 'failed' };
+    keepFigure(userId, chat, extra ? { ...extra, code: text } : text, kind);
+    return { content: `Kept, not built yet: ${linesOf(text).length} lines so far. Go on with add in ${change}, and leave unfinished out with the last part.` };
+};
+const editHeld = (code, input, otherwise = false) => {
+    const changes = Array.isArray(input?.change) ? input.change : input?.change ? [input.change] : [];
+    const add = typeof input?.add === 'string' && input.add.trim() ? input.add.replace(/\r\n/g, '\n') : '';
+    if (changes.length === 0 && !add) return { code, problem: otherwise ? null : 'Give the pieces to change.' };
+    const edited = changes.length > 0 ? applyChanges(code, changes) : { code };
+    if (edited.problem) return edited;
+    return { code: add ? `${edited.code.replace(/\s+$/, '')}\n${add.replace(/^\n+/, '')}` : edited.code };
+};
 const ART_CONTROLS = { type: 'array', items: { type: 'object', properties: { name: { type: 'string', description: 'The key in params it changes, such as particleCount, or colorPalette.0 for the first of a list' }, label: { type: 'string', description: 'What it is called on the page' }, type: { type: 'string', enum: ['slider', 'color'] }, min: { type: 'number' }, max: { type: 'number' }, step: { type: 'number' } }, required: ['name', 'label', 'type'] }, description: 'The sliders and colour pickers of the Parameters and Colors sections' };
 const ART_FUNCTIONS = [{
     name: 'art_build',
     label: 'Algorithmic Art build',
     doing: 'Building the artwork…',
-    description: 'Makes the single page the Algorithmic Art skill asks for from templates/viewer.html and shows it to the user in the chat. The template is filled in for you: its seed section, its buttons, the sliders and colour pickers you list, updateParam, updateColor, resetParameters and p5.js itself are all put in, so send none of them and no HTML. Give only the sketch: let params = { seed: 12345, ... }, function setup() with createCanvas and initializeSystem(), function initializeSystem() that makes everything anew from params, function draw(), and any classes. Every control changes params and then runs initializeSystem() again. Randomness is seeded from params.seed before each run. The page has no network and no other library. When it returns things to fix, mend them with art_change.',
-    parameters: { type: 'object', properties: { title: { type: 'string', description: 'The name of the artwork' }, subtitle: { type: 'string', description: 'One short line under it' }, code: { type: 'string', description: 'The whole p5.js sketch' }, controls: ART_CONTROLS }, required: ['title', 'code', 'controls'] },
-    run: async (input, context) => buildArt({ title: input?.title, subtitle: input?.subtitle, controls: input?.controls, code: String(input?.code ?? '') }, context)
+    description: 'Makes the single page the Algorithmic Art skill asks for from templates/viewer.html and shows it to the user in the chat. The template is filled in for you: its seed section, its buttons, the sliders and colour pickers you list, updateParam, updateColor, resetParameters and p5.js itself are all put in, so send none of them and no HTML. Give only the sketch: let params = { seed: 12345, ... }, function setup() with createCanvas and initializeSystem(), function initializeSystem() that makes everything anew from params, function draw(), and any classes. Every control changes params and then runs initializeSystem() again. Randomness is seeded from params.seed before each run. For colours that follow the user\'s theme call appColor(\'primary\') (or background, surface, text, border, secondary, tertiary, neutral, success, warning, error) when you draw; a palette that is the artwork\'s own subject goes in params with a colour control. The page has no network and no other library. When it returns things to fix, mend them with art_change.',
+    parameters: { type: 'object', properties: { title: { type: 'string', description: 'The name of the artwork' }, subtitle: { type: 'string', description: 'One short line under it' }, code: { type: 'string', description: 'The whole p5.js sketch' }, unfinished: PART_UNFINISHED, controls: ART_CONTROLS }, required: ['title', 'code', 'controls'] },
+    run: async (input, context) => (input?.unfinished === true ? keepPart('art', input.code, { title: input?.title || 'Algorithmic art', subtitle: input?.subtitle || '', controls: input?.controls || [] }, context, 'art_change') : buildArt({ title: input?.title, subtitle: input?.subtitle, controls: input?.controls, code: String(input?.code ?? '') }, context))
 }, {
     name: 'art_change',
     label: 'Algorithmic Art build',
     doing: 'Mending the artwork…',
     description: 'Changes the last sketch given to art_build in this chat, then checks and shows it as art_build does. Use it to mend or improve an artwork instead of sending the whole sketch again: give only the pieces that change, and the controls or title only when they change.',
-    parameters: { type: 'object', properties: { change: CHANGES, controls: ART_CONTROLS, title: { type: 'string' }, subtitle: { type: 'string' }, show: { type: 'string', description: 'Lines of the sketch to read, such as 40-80. Nothing is built.' } } },
+    parameters: { type: 'object', properties: { change: CHANGES, add: PART_ADD, unfinished: PART_UNFINISHED, controls: ART_CONTROLS, title: { type: 'string' }, subtitle: { type: 'string' }, show: { type: 'string', description: 'Lines of the sketch to read, such as 40-80. Nothing is built.' } } },
     run: async (input, context) => {
         const held = chatFigures.get(programKey(context.userId, context.chat))?.art;
         if (!held) return { content: 'There is no artwork in this chat to change. Build one with art_build.', failed: 'failed' };
         if (String(input?.show ?? '').trim()) return { content: shownLines(held.code, input.show) };
-        const edited = Array.isArray(input?.change) && input.change.length > 0 ? applyChanges(held.code, input.change) : { code: held.code, problem: input?.controls || input?.title || input?.subtitle ? null : 'Give the pieces to change.' };
+        const edited = editHeld(held.code, input, Boolean(input?.controls || input?.title || input?.subtitle));
         if (edited.problem) return { content: `Nothing was changed or built. ${edited.problem}`, failed: 'failed' };
+        if (input?.unfinished === true) return keepPart('art', edited.code, held, context, 'art_change');
         return buildArt({ title: input?.title ?? held.title, subtitle: input?.subtitle ?? held.subtitle, controls: input?.controls ?? held.controls, code: edited.code }, context);
     }
 }];
@@ -3547,21 +3613,22 @@ const SKILL_FUNCTIONS = {
         label: 'Hairline build',
         doing: 'Building the figure…',
         description: 'Does what `node build.mjs <name>.js` and `node validate.mjs` do in the Hairline skill, without Node: makes the checks validate.mjs makes on your figure and returns what it would print, then puts the figure on the bench (bench.html with kernel.js and the figure in their two slots, nothing else changed) and shows the finished page to the user in the chat. Give the whole figure file. When it returns things to fix, mend them with hairline_change. Use this instead of asking the user to run anything. The look (look.mjs) needs a browser, which you do not have here: when you are done, say in one sentence that you have not seen the figure drawn.',
-        parameters: { type: 'object', properties: { code: { type: 'string', description: 'The whole figure file as you would save it in <name>.js, ending with its hairline({ ... }) call' } }, required: ['code'] },
-        run: async (input, context) => buildFigure(String(input?.code ?? ''), context)
+        parameters: { type: 'object', properties: { code: { type: 'string', description: 'The whole figure file as you would save it in <name>.js, ending with its hairline({ ... }) call' }, unfinished: PART_UNFINISHED }, required: ['code'] },
+        run: async (input, context) => (input?.unfinished === true ? keepPart('hairline', input.code, null, context, 'hairline_change') : buildFigure(String(input?.code ?? ''), context))
     }, {
         name: 'hairline_change',
         label: 'Hairline build',
         doing: 'Mending the figure…',
         description: 'Changes the last figure given to hairline_build in this chat, then checks and shows it as hairline_build does. Use it to mend or improve a figure instead of sending the whole of it again: give only the pieces that change.',
-        parameters: { type: 'object', properties: { change: CHANGES, show: { type: 'string', description: 'Lines of the figure to read, such as 40-80. Nothing is built.' } } },
+        parameters: { type: 'object', properties: { change: CHANGES, add: PART_ADD, unfinished: PART_UNFINISHED, show: { type: 'string', description: 'Lines of the figure to read, such as 40-80. Nothing is built.' } } },
         run: async (input, context) => {
             const key = programKey(context.userId, context.chat);
             const code = chatFigures.get(key)?.hairline;
             if (!code) return { content: 'There is no figure in this chat to change. Build one with hairline_build.', failed: 'failed' };
             if (String(input?.show ?? '').trim()) return { content: shownLines(code, input.show) };
-            const edited = applyChanges(code, input?.change);
+            const edited = editHeld(code, input);
             if (edited.problem) return { content: `Nothing was changed or built. ${edited.problem}`, failed: 'failed' };
+            if (input?.unfinished === true) return keepPart('hairline', edited.code, null, context, 'hairline_change');
             return buildFigure(edited.code, context);
         }
     }, {
@@ -3579,22 +3646,23 @@ const SKILL_FUNCTIONS = {
         label: 'Anatomy build',
         doing: 'Building the figure…',
         ready: () => sandboxReady(),
-        description: 'Does what `node examples/<name>/build.mjs` does in the Anatomy skill, then shows the page to the user in the chat. Your build script is run in the skill\'s own folder as examples/figure/build.mjs, so it imports the kit as the examples do ("../../kit/iso-kit.mjs", "../../scripts/inline-kit.mjs"), and it must write one .html page next to itself. The page is then opened in a browser with the pointer moved across it, and the skill\'s line check (scripts/lines.mjs) is run on it. Give the whole build script. When it returns things to fix, mend them with anatomy_change. The page is shown in the app\'s colours, light or dark, so --light is not needed. Use this for an Anatomy figure instead of run_program or a page of your own. You cannot see the page from here.',
-        parameters: { type: 'object', properties: { code: { type: 'string', description: 'The whole build script as you would save it in examples/<name>/build.mjs' } }, required: ['code'] },
-        run: async (input, context) => buildAnatomy(String(input?.code ?? ''), context)
+        description: 'Does what `node examples/<name>/build.mjs` does in the Anatomy skill, then shows the page to the user in the chat. Your build script is run in the skill\'s own folder as examples/figure/build.mjs, so it imports the kit as the examples do ("../../kit/iso-kit.mjs", "../../scripts/inline-kit.mjs"), and it must write one .html page next to itself. The page is then opened in a browser with the pointer moved across it, and the skill\'s line check (scripts/lines.mjs) is run on it. Give the whole build script. When it returns things to fix, mend them with anatomy_change. The page is shown in the app\'s colours, light or dark, so --light is not needed; the kit\'s tones (hi, mid, lo, faint, lit) are all the colour a figure needs, and a colour of your own does not follow the theme. Use this for an Anatomy figure instead of run_program or a page of your own. You cannot see the page from here.',
+        parameters: { type: 'object', properties: { code: { type: 'string', description: 'The whole build script as you would save it in examples/<name>/build.mjs' }, unfinished: PART_UNFINISHED }, required: ['code'] },
+        run: async (input, context) => (input?.unfinished === true ? keepPart('anatomy', input.code, null, context, 'anatomy_change') : buildAnatomy(String(input?.code ?? ''), context))
     }, {
         name: 'anatomy_change',
         label: 'Anatomy build',
         doing: 'Mending the figure…',
         ready: () => sandboxReady(),
         description: 'Changes the last build script given to anatomy_build in this chat, then builds, checks and shows it as anatomy_build does. Use it to mend or add to a figure instead of sending the whole script again: give only the pieces that change.',
-        parameters: { type: 'object', properties: { change: CHANGES, show: { type: 'string', description: 'Lines of the build script to read, such as 40-80. Nothing is built.' } } },
+        parameters: { type: 'object', properties: { change: CHANGES, add: PART_ADD, unfinished: PART_UNFINISHED, show: { type: 'string', description: 'Lines of the build script to read, such as 40-80. Nothing is built.' } } },
         run: async (input, context) => {
             const code = chatFigures.get(programKey(context.userId, context.chat))?.anatomy;
             if (!code) return { content: 'There is no build script in this chat to change. Build one with anatomy_build.', failed: 'failed' };
             if (String(input?.show ?? '').trim()) return { content: shownLines(code, input.show) };
-            const edited = applyChanges(code, input?.change);
+            const edited = editHeld(code, input);
             if (edited.problem) return { content: `Nothing was changed or built. ${edited.problem}`, failed: 'failed' };
+            if (input?.unfinished === true) return keepPart('anatomy', edited.code, null, context, 'anatomy_change');
             return buildAnatomy(edited.code, context);
         }
     }],
@@ -3603,22 +3671,23 @@ const SKILL_FUNCTIONS = {
         label: 'Visual Explainer render',
         doing: 'Rendering the page…',
         ready: () => sandboxReady(),
-        description: 'Does what `node kit/render.mjs <name>.src.html` does in the Visual Explainer skill, then shows the page to the user in the chat: it renders your page source with the skill\'s kit, looks at it in a browser, and gives you the report. Give the whole source page as you would write <name>.src.html, linking the kit with <link rel="stylesheet" data-ve-kit>. Every <svg> needs an aria-label saying what it shows (aria-hidden="true" when it is decoration). The page is shown in the app\'s own theme, which takes the place of the kit\'s colours and fonts, so pick no register or palette and add no theme picker. When the report lists a ✗, mend it with visual_explainer_change. Nothing is saved to the user\'s files.',
-        parameters: { type: 'object', properties: { page: { type: 'string', description: 'The whole page source, as <name>.src.html' }, title: { type: 'string', description: 'A few words naming the page' } }, required: ['page'] },
-        run: async (input, context) => buildExplainer(String(input?.page ?? ''), input?.title, context)
+        description: 'Does what `node kit/render.mjs <name>.src.html` does in the Visual Explainer skill, then shows the page to the user in the chat: it renders your page source with the skill\'s kit, looks at it in a browser, and gives you the report. Give the whole source page as you would write <name>.src.html, linking the kit with <link rel="stylesheet" data-ve-kit>. Every <svg> needs an aria-label saying what it shows (aria-hidden="true" when it is decoration). The page is shown in the app\'s own theme, which takes the place of the kit\'s colours and fonts, so pick no register or palette and add no theme picker. ' + APP_COLOURS + ' The kit\'s own variables (var(--bg), var(--surface), var(--border), var(--text), var(--text-dim), var(--accent), var(--success), var(--warn), var(--risk), var(--info)) follow the theme too. When the report lists a ✗, mend it with visual_explainer_change. Nothing is saved to the user\'s files.',
+        parameters: { type: 'object', properties: { page: { type: 'string', description: 'The whole page source, as <name>.src.html' }, unfinished: PART_UNFINISHED, title: { type: 'string', description: 'A few words naming the page' } }, required: ['page'] },
+        run: async (input, context) => (input?.unfinished === true ? keepPart('visual_explainer', input.page, { title: input?.title }, context, 'visual_explainer_change') : buildExplainer(String(input?.page ?? ''), input?.title, context))
     }, {
         name: 'visual_explainer_change',
         label: 'Visual Explainer render',
         doing: 'Mending the page…',
         ready: () => sandboxReady(),
         description: 'Changes the last page given to visual_explainer_render in this chat, then renders, checks and shows it as visual_explainer_render does. Use it to mend or improve a page instead of sending the whole of it again: give only the pieces that change.',
-        parameters: { type: 'object', properties: { change: CHANGES, title: { type: 'string', description: 'A new title, only when it changes' }, show: { type: 'string', description: 'Lines of the page to read, such as 120-150. Nothing is rendered.' } } },
+        parameters: { type: 'object', properties: { change: CHANGES, add: PART_ADD, unfinished: PART_UNFINISHED, title: { type: 'string', description: 'A new title, only when it changes' }, show: { type: 'string', description: 'Lines of the page to read, such as 120-150. Nothing is rendered.' } } },
         run: async (input, context) => {
             const held = chatFigures.get(programKey(context.userId, context.chat))?.visual_explainer;
             if (!held) return { content: 'There is no page in this chat to change. Render one with visual_explainer_render.', failed: 'failed' };
             if (String(input?.show ?? '').trim()) return { content: shownLines(held.code, input.show) };
-            const edited = applyChanges(held.code, input?.change);
-            if (edited.problem || !Array.isArray(input?.change) || input.change.length === 0) return { content: `Nothing was changed or rendered. ${edited.problem || 'Give the pieces to change.'}`, failed: 'failed' };
+            const edited = editHeld(held.code, input);
+            if (edited.problem) return { content: `Nothing was changed or rendered. ${edited.problem}`, failed: 'failed' };
+            if (input?.unfinished === true) return keepPart('visual_explainer', edited.code, held, context, 'visual_explainer_change');
             return buildExplainer(edited.code, input?.title ?? held.title, context);
         }
     }]
@@ -3839,13 +3908,142 @@ const ANATOMY_THEME = (() => {
     return `<style>@supports (color:light-dark(#000,#fff)){.iso,.iso[data-theme]{${Object.entries(tones).map(([name, value]) => `--anatomy-${name}:${value};`).join('')}}}.iso-page{margin:0 auto;padding:20px 0 24px}</style>`;
 })();
 const MAX_SHOWN_PAGE = 1500000;
-// What the kit gives, for a script that called something it does not have.
-const kitNames = (kept) => {
-    if (kept?.has('anatomy:kit')) return '';
-    const names = [...(skillFileText(SKILL_BY_ID.get('anatomy-anatomy'), 'kit/iso-kit.mjs') || '').matchAll(/^export (?:async )?(?:function|const|let|class) ([A-Za-z_$][\w$]*)/gm)].map((found) => found[1]);
-    if (names.length === 0) return '';
-    kept?.set('anatomy:kit', true);
-    return `\n\nWhat kit/iso-kit.mjs exports (nothing else is in it): ${names.join(', ')}. references/kit.md gives the arguments of each.`;
+// What the kit gives, read from its own files: each export with its arguments, as references/kit.md writes them where it
+// does, and what that page says the function is for.
+const KIT_MODULES = ['iso-kit', 'lathe', 'tube', 'audit', 'gl', 'turn-build'];
+let kitRead = null;
+const anatomyKit = () => {
+    if (kitRead) return kitRead;
+    const skill = SKILL_BY_ID.get('anatomy-anatomy');
+    const pageRows = new Map();
+    for (const row of (skillFileText(skill, 'references/kit.md') || '').split(/\r?\n/)) {
+        const cells = row.startsWith('|') ? row.split(/(?<!\\)\|/).map((cell) => cell.replace(/\\\|/g, '|').trim()) : [];
+        if (cells.length < 4) continue;
+        const about = cells[2].replace(/`/g, '').match(/^[\s\S]{0,180}?(?:[.:](?=\s|$)|$)/)?.[0] || '';
+        for (const [, name, args] of cells[1].matchAll(/`([A-Za-z_$][\w$]*)(\([^`]*\))`/g)) {
+            if (!pageRows.has(name)) pageRows.set(name, { call: `${name}${args}`, about });
+        }
+    }
+    kitRead = new Map();
+    for (const part of KIT_MODULES) {
+        const text = (skillFileText(skill, `kit/${part}.mjs`) || '').replace(/\r\n/g, '\n');
+        const names = new Map();
+        for (const found of text.matchAll(/^export (?:async )?(?:function|const|let|class) ([A-Za-z_$][\w$]*)/gm)) {
+            const open = text.slice(found.index + found[0].length).match(/^\s*(?:=\s*)?\(/);
+            let call = found[1];
+            if (open) {
+                const start = found.index + found[0].length + open[0].length;
+                let end = start;
+                for (let deep = 1; end < text.length && deep > 0; end += 1) deep += '([{'.includes(text[end]) ? 1 : ')]}'.includes(text[end]) ? -1 : 0;
+                call = `${found[1]}(${text.slice(start, end - 1).replace(/\s+/g, ' ')})`;
+            }
+            names.set(found[1], { call, about: '', ...(open ? pageRows.get(found[1]) : {}) });
+        }
+        if (names.size > 0) kitRead.set(part, names);
+    }
+    return kitRead;
+};
+// What a made-up name most often stands for; the rest are matched by how alike the names are.
+const KIT_MEANT = [
+    [/box|cube|cuboid|prism|block|plate|slab|rect|panel|base/i, ['slabOf', 'extrude']],
+    [/cyl|disc|disk|circle|round|post|knob/i, ['cylinder', 'circleRing']],
+    [/poly|shape|outline/i, ['extrude', 'planOutline']],
+    [/build|render|page|html|export|save|write|create|main|scene|live/i, ['pageHtml', 'plateHtml', 'figureSvg']],
+    [/svg|figure|canvas|card/i, ['figureSvg', 'plateHtml']],
+    [/solid|draw|fill|mesh/i, ['solidSvg']],
+    [/text|label/i, ['faceTextSvg']],
+    [/line|stroke|path/i, ['lineSvg', 'segment', 'lineOnTop']],
+    [/tick|ruler|scale|gauge/i, ['topTicks', 'radialTicks']],
+    [/camera|project|view|fit/i, ['fitProjection']],
+    [/move|translate|shift/i, ['translateAlong', 'groupSvg']],
+    [/spring/i, ['coil']],
+    [/screw|dot|bolt|rivet/i, ['dotsSvg', 'pointsAt']],
+    [/wire|cable|connect/i, ['wireSvg']],
+    [/group|layer/i, ['groupSvg']]
+];
+const pairsOf = (word) => new Set([...word.toLowerCase()].slice(0, -1).map((letter, at) => letter + word.toLowerCase()[at + 1]));
+const kitMeant = (name, part) => {
+    const mine = pairsOf(name);
+    const alike = [...anatomyKit().get(part)].filter(([, { call }]) => call.includes('(')).map(([one]) => one).map((one) => {
+        const theirs = pairsOf(one);
+        return { one, share: 2 * [...mine].filter((pair) => theirs.has(pair)).length / Math.max(1, mine.size + theirs.size) };
+    }).filter((one) => one.share >= 0.5).sort((a, b) => b.share - a.share).map((one) => one.one);
+    const meant = part === 'iso-kit' ? KIT_MEANT.filter(([words]) => words.test(name)).flatMap(([, ones]) => ones) : [];
+    return [...new Set(meant.length > 0 ? meant : alike)].slice(0, 3);
+};
+// For a script that failed: every name in it the kit does not have, what was probably meant, and how to call that and
+// the kit functions on the line that failed. The script is read for them, so all of them come back at once.
+export const kitHelp = (code, said = '') => {
+    const kit = anatomyKit();
+    if (!kit.has('iso-kit')) return '';
+    const lines = [];
+    const uses = new Set();
+    const aliases = new Map();
+    const bare = new Map();
+    let wrong = false;
+    const missing = (shown, name, part) => {
+        wrong = true;
+        const other = ['lathe', 'tube', 'gl'].find((one) => one !== part && kit.get(one)?.has(name));
+        const meant = other ? [] : kitMeant(name, part);
+        meant.forEach((one) => uses.add(`${part}/${one}`));
+        if (other) uses.add(`${other}/${name}`);
+        lines.push(`${shown} does not exist.${other ? ` ${name} is in kit/${other}.mjs.` : meant.length > 0 ? ` Use ${meant.join(' or ')}.` : ''}`);
+    };
+    const script = code.replace(/\/\*[\s\S]*?\*\//g, '').replace(/(^|\s)\/\/[^\n]*/g, '$1');
+    for (const [, what, part] of script.matchAll(/\bimport\s+([^;'"]+?)\s+from\s*["'][^"']*\/kit\/([\w-]+)\.mjs["']/g)) {
+        if (!kit.has(part)) continue;
+        const all = what.match(/\*\s*as\s+([\w$]+)/);
+        if (all) aliases.set(all[1], part);
+        for (const one of (what.match(/\{([\s\S]*)\}/)?.[1] || '').split(',').map((each) => each.trim()).filter(Boolean)) {
+            const [name, as] = one.split(/\s+as\s+/);
+            if (kit.get(part).has(name)) bare.set(as || name, [part, name]);
+            else missing(name, name, part);
+        }
+    }
+    const seen = new Set();
+    for (const [, owner, name] of [...script.matchAll(/(?<![\w$.])([A-Za-z_$][\w$]*)\.([A-Za-z_$][\w$]*)\s*\(/g), ...said.matchAll(/TypeError: ([\w$]+)\.([\w$]+) is not a function/g)]) {
+        if (seen.has(`${owner}.${name}`)) continue;
+        seen.add(`${owner}.${name}`);
+        if (aliases.has(owner)) {
+            if (!kit.get(aliases.get(owner)).has(name)) missing(`${owner}.${name}`, name, aliases.get(owner));
+        } else if (bare.has(owner) && said.includes(`${owner}.${name} is not a function`)) {
+            missing(`${owner}.${name}`, name, bare.get(owner)[0]);
+            lines.push(`${owner} is one function of the kit, not the kit: import it whole with import * as k from "../../kit/${bare.get(owner)[0]}.mjs".`);
+        }
+    }
+    const unknown = said.match(/ReferenceError: ([A-Za-z_$][\w$]*) is not defined/)?.[1];
+    const holder = unknown && [...kit].find(([, names]) => names.has(unknown))?.[0];
+    if (holder) {
+        uses.add(`${holder}/${unknown}`);
+        const alias = [...aliases].find(([, part]) => part === holder)?.[0];
+        lines.push(`${unknown} is in kit/${holder}.mjs: ${alias ? `write ${alias}.${unknown}` : 'import it'}.`);
+    }
+    // What was called where it failed: on the lines of the script that are named, and the kit's own functions on the way.
+    const whole = code.split('\n');
+    for (const [, at] of said.matchAll(/(?<![\w/])build\.mjs:(\d+)/g)) {
+        for (const [, owner, name] of (whole[Number(at) - 1] || '').matchAll(/(?:(?<![\w$.])([A-Za-z_$][\w$]*)\.)?([A-Za-z_$][\w$]*)\s*\(/g)) {
+            if (owner ? aliases.has(owner) && kit.get(aliases.get(owner)).has(name) : bare.has(name)) uses.add(owner ? `${aliases.get(owner)}/${name}` : bare.get(name).join('/'));
+        }
+    }
+    for (const [, name, part] of said.matchAll(/at (?:Module\.|Object\.)?([\w$]+) \((?:file:\/\/)?(?:\S*\/)?kit\/([\w-]+)\.mjs:/g)) {
+        if (kit.get(part)?.has(name)) uses.add(`${part}/${name}`);
+    }
+    const out = [];
+    if (lines.length > 0) out.push([...new Set(lines)].slice(0, 12).join('\n'));
+    if (uses.size > 0) {
+        out.push(`How to call ${uses.size === 1 ? 'it' : 'them'}:\n${[...uses].slice(0, 10).map((one) => {
+            const [part, name] = one.split('/');
+            const { call, about } = kit.get(part).get(name);
+            return `- ${part === 'iso-kit' ? '' : `(kit/${part}.mjs) `}${call}${about ? `: ${about}` : ''}`;
+        }).join('\n')}\nA plan is { x, y, w, d, r }, a point is [x, y, z], a floor point is [x, y] and P is what fitProjection returns.`);
+    }
+    if (wrong) {
+        out.push('A solid is drawn in two steps, k.solidSvg(k.slabOf(plan, 0, 12, P)), with P = k.fitProjection(k.boxCorners(plan, 0, 12), 650, 420). The page is k.pageHtml({ title, body: k.plateHtml({ fig: "Fig 1", title, hint, body: k.figureSvg({ width: 650, height: 420, label, body }) }) }), written beside the script with writeFileSync.');
+        for (const part of new Set(['iso-kit', ...aliases.values(), ...[...bare.values()].map(([one]) => one)])) {
+            out.push(`All that kit/${part}.mjs exports (nothing else is in it): ${[...kit.get(part)].map(([name, { call }]) => (part === 'iso-kit' ? call : name)).join('; ')}`);
+        }
+    }
+    return out.length > 0 ? `\n\n${out.join('\n\n')}` : '';
 };
 const buildAnatomy = async (given, { show, kept, chat, userId }) => {
     const code = given.replace(/\r\n/g, '\n').trim();
@@ -3869,7 +4067,7 @@ const buildAnatomy = async (given, { show, kept, chat, userId }) => {
         const why = answer.timedOut || lines.includes('BUILD 124') ? 'the build script ran for too long'
             : lines.includes('BUILD 0') ? 'the build script wrote no page. It must write one .html file next to itself, as the examples do with writeFileSync and k.pageHtml'
                 : 'the build script failed';
-        return { content: `Nothing was shown: ${why}.${said ? `\n${clip(said, 3000)}` : ''}\n${mend}${kitNames(kept)}`, failed: 'failed' };
+        return { content: `Nothing was shown: ${why}.${said ? `\n${clip(said, 3000)}` : ''}\n${mend}${kitHelp(code, said)}`, failed: 'failed' };
     }
     const name = (lines.find((line) => line.startsWith('PAGE ')) || '').slice(5).replace(/\.html$/, '').replace(/[^\w -]/g, '').slice(0, 60) || 'figure';
     const page = built.buffer.toString('utf8');
@@ -3887,6 +4085,7 @@ const buildAnatomy = async (given, { show, kept, chat, userId }) => {
     const faults = [
         ...probeFaults(probe),
         ...(where ? [`where: ${where}`] : []),
+        ...colourFaults(page.replace(/<style\b[\s\S]*?<\/style>/gi, '')),
         ...(page.length > MAX_SHOWN_PAGE || page.includes('```') ? [`run: the figure fails to fit in the chat: its page is ${page.length.toLocaleString('en-GB')} characters${page.includes('```') ? ' and holds three backticks in a row' : ''}.`] : []),
         ...(solids < 3 ? ['kit: the page draws no solids with the kit (k.solidSvg of k.slabOf, k.cylinder or k.extrude), so it is a flat drawing.'] : []),
         ...(floating > 0 ? [`lines: ${[lines[at], ...lines.slice(at + 1, at + 8).filter((line) => /^\s+\S/.test(line))].join('\n')}\nEvery line ends on a stroke, a dot or an outline, or is marked free, as scripts/lines.mjs says.`] : [])
@@ -3901,7 +4100,7 @@ const buildAnatomy = async (given, { show, kept, chat, userId }) => {
     // one that does not run or draws nothing is never shown.
     if (faults.length > 0 && (before === 0 || broken)) {
         kept?.set('unshown', broken ? { block: `_The figure “${name}” is not shown: it did not work when it was opened._`, key: showing } : { block, key: showing });
-        return { content: [`Not shown yet. ${faults.length} to fix in ${name}.html:`, ...faults, mend].join('\n'), failed: 'failed' };
+        return { content: `${[`Not shown yet. ${faults.length} to fix in ${name}.html:`, ...faults, mend].join('\n')}${kitHelp(code, where)}`, failed: 'failed' };
     }
     kept?.delete('unshown');
     show(block, showing);
@@ -3919,6 +4118,12 @@ const ART = 'anthropic-algorithmic-art';
 const ART_STYLE = '<style>body{background:var(--app-background,#faf9f5)!important}.container{min-height:0!important}.sidebar{width:260px;box-shadow:none!important;background:var(--app-surface,#fff)!important;border:1px solid var(--anthropic-light-gray)}.seed-input,.seed-input:focus{background:var(--anthropic-light)!important;color:var(--anthropic-dark)}#canvas-container{background:var(--app-surface,#fff)!important;box-shadow:none!important}@media (max-width:820px){.container{flex-direction:column-reverse}.canvas-area{padding:0!important}.sidebar{width:100%;display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:0 24px}.sidebar h1,.sidebar .subtitle{grid-column:1/-1}.sidebar .subtitle{margin-bottom:20px}}</style>';
 const ART_PALETTE = 'anthropic-dark:text, anthropic-light:background, anthropic-mid-gray:text 60%, anthropic-light-gray:border, anthropic-orange:primary, anthropic-blue:secondary, anthropic-green:tertiary';
 const ART_HELP = String.raw`
+// A colour of the app's theme, as it is now.
+function appColor(name) {
+  const kit = { background: 'anthropic-light', text: 'anthropic-dark', border: 'anthropic-light-gray', primary: 'anthropic-orange', secondary: 'anthropic-blue', tertiary: 'anthropic-green' };
+  const style = getComputedStyle(document.documentElement);
+  return (style.getPropertyValue('--app-' + name) || style.getPropertyValue('--' + (kit[name] || 'anthropic-mid-gray'))).trim() || '#888888';
+}
 // Controls: every slider and colour picker changes params and makes the artwork anew.
 const artControls = __CONTROLS__;
 const artDefaults = JSON.parse(JSON.stringify(params));
@@ -4389,7 +4594,9 @@ const buildExplainer = async (given, named, { show, kept, chat, userId }) => {
     const report = String(answer.stdout || '').replace(/\/root\/work\//g, '').trim();
     const built = (answer.files || []).find((one) => one.path === 'page.html');
     if (!built) return { content: `Nothing was shown: the render wrote no page.\n${clip(report || answer.stderr, 4000)}${put}\n${mend}`, failed: 'failed' };
-    const problems = answer.exitCode !== 0;
+    const tinted = colourFaults(page);
+    const problems = answer.exitCode !== 0 || tinted.length > 0;
+    const colourLine = tinted.length > 0 ? `\n✗ ${tinted[0]}` : '';
     // A page with something to fix goes back once before it is shown, as the skill has it fixed first; a second
     // render is shown whatever is left, so the person is never left with nothing.
     const before = kept?.get('visual_explainer_render') || 0;
@@ -4398,11 +4605,11 @@ const buildExplainer = async (given, named, { show, kept, chat, userId }) => {
     const showing = `Visual explainer ${title}`;
     if (problems && before === 0) {
         kept?.set('unshown', { block, key: showing });
-        return { content: `Not shown yet. The render found something to fix:\n${clip(report, 4000)}${labelSizes(report)}${put}\n${mend}`, failed: 'failed' };
+        return { content: `Not shown yet. The render found something to fix:\n${clip(report, 4000)}${colourLine}${labelSizes(report)}${put}\n${mend}`, failed: 'failed' };
     }
     kept?.delete('unshown');
     show(block, showing);
-    return { content: `Rendered and showed "${title}" to the user in the chat, in the app's theme.${problems ? ' Still to fix:' : ' Report:'}\n${clip(report, 3000)}${problems ? labelSizes(report) : ''}${put}\n${problems ? 'The user has the page. Mend it once with visual_explainer_change if it is worth it, then go on. ' : ''}You cannot see the page from here.` };
+    return { content: `Rendered and showed "${title}" to the user in the chat, in the app's theme.${problems ? ' Still to fix:' : ' Report:'}\n${clip(report, 3000)}${colourLine}${problems ? labelSizes(report) : ''}${put}\n${problems ? 'The user has the page. Mend it once with visual_explainer_change if it is worth it, then go on. ' : ''}You cannot see the page from here.` };
 };
 
 // A built Visual Explainer page holds the kit's styles and scripts word for word. In the reply they are named, as Parts
@@ -4701,6 +4908,10 @@ const applyChanges = (given, change) => {
     for (const [at, one] of edits.entries()) {
         const find = String(one.find ?? '');
         const times = find ? code.split(find).length - 1 : 0;
+        if (one.all === true && times > 0) {
+            code = code.split(find).join(String(one.replace ?? ''));
+            continue;
+        }
         if (times !== 1) return { problem: times === 0 ? `The find text of change ${at + 1} is not in it. Copy it exactly; show returns its lines.` : `The find text of change ${at + 1} occurs ${times} times. Give more of the lines around it, so it occurs once.` };
         code = code.replace(find, () => String(one.replace ?? ''));
     }
@@ -4770,6 +4981,13 @@ export const cutInput = (text, name) => {
 const PROGRAM_CALLS = new Set(['run_program', 'change_program']);
 const FIGURE_KINDS = { hairline_build: 'hairline', hairline_change: 'hairline', anatomy_build: 'anatomy', anatomy_change: 'anatomy', cad_build: 'cad', mech_run: 'cad', cad_change: 'cad', art_build: 'art', art_change: 'art', visual_explainer_render: 'visual_explainer', visual_explainer_change: 'visual_explainer' };
 const FIGURE_CALLS = new Set(Object.keys(FIGURE_KINDS));
+// The functions that are sent a whole figure, page or script, with what else is kept of it.
+const FIGURE_BUILDS = {
+    hairline_build: { field: 'code' }, anatomy_build: { field: 'code' }, visual_explainer_render: { field: 'page', extra: (text) => ({ title: cutInput(text, 'title') || undefined }) },
+    art_build: { field: 'code', extra: (text) => ({ title: cutInput(text, 'title') || 'Algorithmic art', subtitle: cutInput(text, 'subtitle') || '', controls: [] }) },
+    cad_build: { field: 'code', extra: (text) => ({ name: cadName(cutInput(text, 'name'), 'model'), mode: 'model', folder: inHome('CadSmith') }) },
+    mech_run: { field: 'code', extra: (text) => ({ name: cadName(cutInput(text, 'name'), 'mechanism'), mode: 'mechanism', folder: inHome('CadSmith') }) }
+};
 // The text of the last figure or script of a kind kept for a chat.
 const keptFigure = (userId, chat, kind) => {
     const held = chatFigures.get(programKey(userId, chat))?.[kind];
@@ -4795,6 +5013,22 @@ const keepCut = (cut, { chat, userId, ranOut }) => {
             };
         }
     }
+    // A figure, page or script cut off is kept as far as its last whole line, like a program.
+    const build = FIGURE_BUILDS[cut.name];
+    const kind = FIGURE_KINDS[cut.name];
+    const written = !ranOut ? null : build ? cutInput(cut.text, build.field) : kind && /_change$/.test(cut.name) && !/"change"\s*:/.test(cut.text) ? cutInput(cut.text, 'add') : null;
+    const wholeLines = written?.includes('\n') ? written.slice(0, written.lastIndexOf('\n') + 1) : '';
+    if (wholeLines.trim() && !wholeLines.startsWith(PROGRAM_AWAY)) {
+        const earlier = build ? null : chatFigures.get(programKey(userId, chat))?.[kind];
+        if (build || earlier) {
+            const before = typeof earlier === 'string' ? earlier : earlier?.code;
+            const code = before ? `${before.replace(/\s+$/, '')}\n${wholeLines}` : wholeLines;
+            const extra = build?.extra ? build.extra(cut.text) : earlier && typeof earlier !== 'string' ? earlier : null;
+            keepFigure(userId, chat, extra ? { ...extra, code } : code, kind);
+            const lines = linesOf(code);
+            return { kept: lines.length, note: `${what} It is kept as far as you got: ${lines.length} lines, ending with\n\n${lines.slice(-6).join('\n')}\n\nDo not write it again. Go on with ${kind}_change: put what comes next in add, with unfinished set until the last part.` };
+        }
+    }
     const advice = cut.name === 'run_program' ? 'Write the program in parts: the first part with run_program, then change_program with add.' : cut.name === 'change_program' ? 'Send less in one call.' : 'Call it again with less in it, or leave out what it can do without.';
     return { kept: 0, note: `${what} ${advice}` };
 };
@@ -4816,18 +5050,32 @@ const callWords = (call) => {
     const value = (name, one) => (name === 'change' && Array.isArray(one) ? one.map((part) => `<change><find>${part?.find ?? ''}</find><replace>${part?.replace ?? ''}</replace></change>`).join('\n') : typeof one === 'string' ? one : JSON.stringify(one));
     return `<call name="${call.function?.name}">\n${Object.entries(given).map(([name, one]) => `<arg name="${name}">${value(name, one)}</arg>`).join('\n')}\n</call>`;
 };
-export const wordShape = (messages, tools) => {
+// Where a reply in words has to stop: after its first whole call, or where the model begins to write a result itself.
+// Nothing else would stop it, and a model left to go on makes up what came back, or copies out the page it was given.
+export const wordCallEnd = (text, tools) => {
+    const source = String(text ?? '');
+    const whole = source.match(/<call\s+name=["']?([\w.-]+)["']?\s*>[\s\S]*?<\/call>/i);
+    const names = (tools || []).map((tool) => tool.function.name.replace(/[^\w]/g, '\\$&')).join('|');
+    const guessed = names ? source.match(new RegExp(`(?:^|\\n)\\s*(?:\\[Result of |Result of )?(?:${names})(?: returned:|\\])`)) : null;
+    const ends = [whole && whole.index + whole[0].length, guessed && guessed.index].filter((one) => Number.isInteger(one));
+    return ends.length > 0 ? Math.min(...ends) : -1;
+};
+// A result reaches such a model as a message like the person's own, so it says what it is, and the last one ends with
+// what was asked: a model given a page of instructions last explains the page instead of doing the work.
+const GUIDE_CALLS = new Set(['open_skill', 'open_skill_file', 'open_component']);
+export const wordShape = (messages, tools, asked = '') => {
     const out = [];
     for (const message of messages) {
         if (message.role === 'assistant' && message.tool_calls?.length > 0) out.push({ role: 'assistant', content: [message.content, ...message.tool_calls.map(callWords)].filter(Boolean).join('\n') });
         else if (message.role === 'tool') {
-            const text = `${message.tool_name || 'The function'} returned:\n${message.content}`;
+            const text = `[Result of ${message.tool_name || 'the function'}${GUIDE_CALLS.has(message.tool_name) ? ': instructions for you to work by. The user did not write them, does not see them and does not want them explained' : ''}]\n${message.content}\n[End of the result. Go on with the request: do not write the result out again.]`;
             const last = out.at(-1);
             if (last?.returned) last.content += `\n\n${text}`;
             else out.push({ role: 'user', content: text, returned: true });
             if (message.images?.length > 0) out.at(-1).images = [...(out.at(-1).images || []), ...message.images];
         } else out.push({ ...message });
     }
+    if (asked && out.at(-1)?.returned) out.at(-1).content += `\n\nThe user's request, which you are still working on:\n${clip(asked, 2000)}\n\nDo the next step of it now: call the function that does it, or answer.`;
     if (out[0]?.role === 'system') out[0].content = `${out[0].content}\n\n${functionWords(tools)}`;
     else out.unshift({ role: 'system', content: functionWords(tools) });
     return out.map(({ returned, ...message }) => message);
@@ -5705,7 +5953,7 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
         const draws = drawsComponents(chat);
         // A skill that is only on by default offers its files once the model has opened it.
         const withFiles = facts.capabilities.includes('tools') ? skillsOf(chat).filter((skill) => (skill.files || []).length > 0 && (Array.isArray(chat.skills) || skill.default !== 'tools' || !listed.includes(skill))) : [];
-        const chatTools = facts.capabilities.includes('tools') ? [...(draws ? [openComponentTool()] : []), ...(withFiles.length > 0 ? [skillFileTool(withFiles)] : []), ...skillFunctionsFor(chat), ...(listed.length > 0 ? [openSkillTool(listed, others, capacityFor(chat, facts))] : []), ...(others.length > 0 ? [findSkillTool(others)] : []), askUserTool(), noteTool(chat), ...(process.env.FILESYSTEM_ONE_URL ? [listFilesTool(), readFileTool(), saveToFilesTool()] : []), ...(await toolsForChat(chat, userId)).filter((tool) => !(searching && tool.fn === 'read_web_page'))] : [];
+        const chatTools = facts.capabilities.includes('tools') ? [...(draws ? [openComponentTool()] : []), ...(withFiles.length > 0 ? [skillFileTool(withFiles)] : []), ...skillFunctionsFor(chat), ...(listed.length > 0 ? [openSkillTool(listed, others, capacityFor(chat, facts))] : []), ...(others.length > 0 ? [findSkillTool(others)] : []), askUserTool(), noteTool(chat), compressTool(), ...(process.env.FILESYSTEM_ONE_URL ? [listFilesTool(), readFileTool(), saveToFilesTool()] : []), ...(await toolsForChat(chat, userId)).filter((tool) => !(searching && tool.fn === 'read_web_page'))] : [];
         const capacity = capacityFor(chat, facts);
         const sizeFor = (list, extra = 0) => {
             const fitted = CONTEXT_STEPS.find((step) => step >= promptTokens(list) + REPLY_RESERVE + extra) || capacity;
@@ -5747,6 +5995,12 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
         const marks = [];
         const awayKeys = new Set();
         let round = 0;
+        // What came with a skill page can be asked for again once the page is put away or cut.
+        const forgetGiven = (mark) => {
+            if (mark.fn !== 'open_skill') return;
+            for (const [key, value] of kept) if (value === 'given') kept.delete(key);
+            for (const [key, content] of results) if (content.startsWith(ALREADY_GIVEN)) results.delete(key);
+        };
         const away = (mark) => {
             const held = messages[mark.index];
             delete held.images;
@@ -5755,6 +6009,7 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
             held.content = PROGRAM_CALLS.has(mark.fn) ? `[Put away to save room: ${size} characters a program gave back ${round - mark.round} steps ago. It began and ended:\n${bothEnds(String(held.content), 450)}]` : `[Put away to save room: what ${mark.fn} returned for ${clip(JSON.stringify(mark.given ?? {}), 300)}, ${size} characters, read ${round - mark.round} steps ago. Call ${mark.fn} again with exactly the same input to see it again, or keep what you need with save_note.]`;
             mark.away = true;
             awayKeys.add(mark.key);
+            forgetGiven(mark);
         };
         const putAway = () => {
             for (const mark of marks) {
@@ -5809,6 +6064,7 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
                 const text = String(held.content || '');
                 const cut = Math.min(text.length - PUT_AWAY_MIN_CHARS, over() * 4 + 400);
                 if (cut <= 0) continue;
+                forgetGiven(mark);
                 held.content = `${text.slice(0, text.length - cut)}\n\n[Cut here: the last ${cut.toLocaleString('en-GB')} characters are more than this model can read at once. Ask for a smaller part, and keep what you need with save_note.]`;
             }
         };
@@ -5832,7 +6088,7 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
                 const inWords = functions.length > 0 && (facts.wordy || learnedWordy.has(wordKey));
                 let seen = 0;
                 if (inWords) {
-                    request.messages = wordShape(messages, functions);
+                    request.messages = wordShape(messages, functions, String(prompt.filter((message) => message.role === 'user').at(-1)?.content ?? ''));
                     uncounted = Math.max(uncounted, estimateTokens(functionWords(functions)));
                 } else if (functions.length > 0) request.tools = functions;
 
@@ -5868,9 +6124,25 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
                             correcting = false;
                             write({ type: 'note', text: '' });
                         }
+                        const before = said.length;
                         said += part.message.content;
                         reply.content += part.message.content;
-                        write({ type: 'token', text: part.message.content });
+                        if (inWords) {
+                            const end = wordCallEnd(said, functions);
+                            if (end >= 0) {
+                                reply.content = reply.content.slice(0, reply.content.length - (said.length - end));
+                                said = said.slice(0, end);
+                            }
+                            // A call is shown as it is written, as any model's is, and not as part of the answer.
+                            const call = said.search(/<call\b/i);
+                            const words = said.slice(before, call < 0 ? said.length : Math.max(before, call));
+                            if (words) write({ type: 'token', text: words });
+                            if (call >= 0 && said.length > Math.max(before, call)) write({ type: 'draft', text: said.slice(Math.max(before, call)) });
+                            if (end >= 0) {
+                                stream.abort?.();
+                                break;
+                            }
+                        } else write({ type: 'token', text: part.message.content });
                     }
                     if (Array.isArray(part.message?.tool_calls)) calls.push(...part.message.tool_calls);
                     if (part.message?.tool_cut) cutCall = part.message.tool_cut;
@@ -6113,8 +6385,24 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
                     messages.push({ role: 'tool', tool_name: name, content: pictures && !seesPictures ? `${outcome.content}\n\nThis model cannot see pictures, so they were not sent.` : outcome.content, ...(pictures && seesPictures ? { images: pictures } : {}) });
                     awayKeys.delete(same);
                     marks.push({ index: messages.length - 1, fn: mine ? mine.fn : name, given: given ?? input, key: same, round });
+                    if (outcome.compress) {
+                        const before = promptTokens(messages);
+                        for (const mark of marks) if (!mark.away && mark.index !== messages.length - 1 && String(messages[mark.index].content || '').length >= PUT_AWAY_MIN_CHARS) away(mark);
+                        putProgramsAway();
+                        const freed = before - promptTokens(messages);
+                        messages.at(-1).content = freed > 100 ? `Put away: about ${freed.toLocaleString('en-GB')} tokens are free again. What you wrote in keep is what you have; the same call reads anything again. Go on with the work.` : 'There was nothing more to put away.';
+                    }
                     if (outcome.ends) ended = true;
                     if (gone || ended) break;
+                }
+                // A model cannot see how full its context is, so it is told when what is left has become little and there is
+                // something to put away.
+                const last = messages.at(-1);
+                if (last?.role === 'tool' && !ended && !gone) {
+                    const taken = promptTokens(messages) + Math.max(uncounted, estimateTokens(JSON.stringify(functions)));
+                    const left = Math.max(0, capacity - taken);
+                    const loose = marks.reduce((sum, mark) => (mark.away || mark.index === messages.length - 1 ? sum : sum + estimateTokens(messages[mark.index].content)), 0);
+                    if (left < Math.max(reserve * 1.25, Math.min(8000, capacity * 0.5)) && loose > 1200) last.content = `${last.content}\n\n[Room: about ${left.toLocaleString('en-GB')} of ${capacity.toLocaleString('en-GB')} tokens are left for what you write next. compress_context frees about ${loose.toLocaleString('en-GB')} more.]`;
                 }
                 if (cutNote) messages.push({ role: 'user', content: cutNote });
                 // The tools are done; the model is thinking again.
