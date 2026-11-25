@@ -249,7 +249,13 @@ const chatMessageSchema = new mongoose.Schema({
         evalCount: { type: Number, default: null },
         promptEvalCount: { type: Number, default: null },
         durationMs: { type: Number, default: null },
-        tokensPerSecond: { type: Number, default: null }
+        tokensPerSecond: { type: Number, default: null },
+        readSeconds: { type: Number, default: null },
+        writeSeconds: { type: Number, default: null },
+        toolSeconds: { type: Number, default: null },
+        requests: { type: Number, default: null },
+        sentTokens: { type: Number, default: null },
+        cachedTokens: { type: Number, default: null }
     },
     errorCode: { type: String, default: null },
     errorDetail: { type: String, default: null },

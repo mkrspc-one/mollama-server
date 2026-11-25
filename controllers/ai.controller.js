@@ -2361,6 +2361,9 @@ const AUTO_CONTEXT_LIMIT = 32768;
 const CONTEXT_STEPS = [8192, 16384, AUTO_CONTEXT_LIMIT];
 const REPLY_RESERVE = 1024;
 const PROGRAM_ROOM = 8192;
+// A model with less room than this is offered a skill's own functions and files only once it has opened that skill.
+// It cannot use them before it has read the skill, and offered ahead they take over a third of a 16k room.
+const LIGHT_ROOM = 32768;
 // How long a reply waits for a computer whose link dropped, and how many times.
 const RETURN_MS = process.env.NODE_ENV === 'test' ? 1500 : 2 * 60 * 1000;
 const MAX_DROPS = 10;
@@ -2731,10 +2734,11 @@ export const skillInParts = (skill, capacity, wanted = '') => {
         content: [start, ...given.map((at) => parts[at].text), `This skill is long, so it comes in parts. Above ${given.length === 0 ? 'is its start' : given.length === 1 ? 'are its start and part 1' : `are its start and parts 1 to ${given.length}`}. Not read yet:\n${rest.map(about).join('\n')}\nOpen each one that bears on what you are doing before you do it: call open_skill with the same skill and part set to its number.`].filter(Boolean).join('\n\n')
     };
 };
+const openedNames = (chat) => new Set(chat.messages.flatMap((message) => (message.steps || []).filter((step) => step.tool === SKILL_STEP && !step.failed).map((step) => String(step.input).replace(/, part .*$/, ''))));
 const sortSkills = (chat, listing, capacity = Infinity) => {
     const active = skillsOf(chat);
     if (!listing) return { full: active.filter((skill) => Array.isArray(chat.skills) || skill.default !== 'tools'), listed: [] };
-    const opened = new Set(chat.messages.flatMap((message) => (message.steps || []).filter((step) => step.tool === SKILL_STEP && !step.failed).map((step) => step.input)));
+    const opened = openedNames(chat);
     const full = active.filter((skill) => skill.source === 'mollama' || (opened.has(skill.name) && !isLong(skill, capacity)));
     return { full, listed: active.filter((skill) => !full.includes(skill)) };
 };
@@ -2752,7 +2756,7 @@ const companionsOf = (skill, others) => {
         ...(away.length > 0 ? [`In the library, not on: ${away.join(', ')}. When one would help, tell the user its name; they turn it on under Skills.`] : [])
     ].join('\n');
 };
-const openSkillTool = (listed, others = [], capacity = Infinity) => {
+const openSkillTool = (listed, others = [], capacity = Infinity, light = false) => {
     const find = (input) => {
         const wanted = String(input?.skill ?? '').trim().toLowerCase();
         return listed.find((skill) => skill.name.toLowerCase() === wanted || skill.id === wanted);
@@ -2768,7 +2772,7 @@ const openSkillTool = (listed, others = [], capacity = Infinity) => {
             type: 'function',
             function: {
                 name: 'open_skill',
-                description: `Open one of this chat's skills and get its full instructions. The user turned these skills on, so the list itself says what kind of help they expect: before you answer, weigh every skill on it against the request and open each one that bears on it, not only the first that fits. The instructions are written for you and the user does not see them: do what they say in your reply, and do not repeat them back.\n${listed.map((skill) => `- ${skill.name}: ${skill.description}`).join('\n')}`,
+                description: `Open one of this chat's skills and get its full instructions. The user turned these skills on, so the list itself says what kind of help they expect: before you answer, weigh every skill on it against the request and open each one that bears on it, not only the first that fits. The instructions are written for you and the user does not see them: do what they say in your reply, and do not repeat them back.${light ? ' A skill\'s own functions and files are given to you when you open it.' : ''}\n${listed.map((skill) => `- ${skill.name}: ${skill.description}`).join('\n')}`,
                 parameters: { type: 'object', properties: { skill: { type: 'string', enum: listed.map((skill) => skill.name), description: 'The name of the skill to open' }, part: { type: 'string', description: 'Only for a long skill you have opened: the number of one of its parts' } }, required: ['skill'] }
             }
         },
@@ -2996,7 +3000,7 @@ const skillFileTool = (withFiles) => {
             type: 'function',
             function: {
                 name: 'open_skill_file',
-                description: `Read one of the files that belong to a skill of this chat, such as a rules page, an example or the code its instructions name. Read a file when the skill's instructions tell you to.\n${withFiles.map((skill) => `- ${skill.id}: ${skill.files.map((file) => file.path).join(', ')}`).join('\n')}`,
+                description: `Read one of the files that belong to a skill of this chat, such as a rules page, an example or the code its instructions name. Read a file when the skill's instructions tell you to.\n${withFiles.map((skill) => `- ${skill.id}: ${skill.files.map((file) => file.path).filter((file) => !/\.test\.[a-z]+$/.test(file)).join(', ')}`).join('\n')}`,
                 parameters: { type: 'object', properties: { skill: { type: 'string', enum: withFiles.map((skill) => skill.id), description: 'The skill the file belongs to' }, file: { type: 'string', description: 'The path of the file, as listed' }, until: { type: 'string', description: 'Optional. Read only the start of the file, up to the first line that contains this text. Use it when the instructions say to read only the top of a file.' } }, required: ['skill', 'file'] }
             }
         },
@@ -3806,6 +3810,23 @@ const kernelIndex = (kept) => {
     kept?.set('file:hairline-hairline-create/kernel.js', true);
     return `\n\nWhat a figure may call, from kernel.js (nothing else exists):\n${text.slice(0, end).trim()}`;
 };
+// What a Hairline figure took from HL that HL does not have, with the nearest real name and how it is called.
+export const kernelHelp = (code) => {
+    const text = skillFileText(SKILL_BY_ID.get('hairline-hairline-create'), 'kernel.js') || '';
+    const end = text.indexOf('var HL');
+    const index = new Map([...(end > 0 ? text.slice(0, end) : '').matchAll(/^ \*   ([A-Za-z_$][\w$]*)(\([^)]*\))?\s{2,}(.+)$/gm)].map((found) => [found[1], `${found[1]}${found[2] || ''}: ${found[3].trim()}`]));
+    if (index.size === 0) return '';
+    const taken = [...code.matchAll(/(?:const|let|var)\s*\{([^}]*)\}\s*=\s*HL\b/g)].flatMap((found) => found[1].split(',').map((one) => one.split(':')[0].trim()).filter(Boolean));
+    const called = [...code.matchAll(/\bHL\.([A-Za-z_$][\w$]*)/g)].map((found) => found[1]);
+    const lines = [];
+    for (const name of new Set([...taken, ...called])) {
+        if (index.has(name)) continue;
+        const mine = pairsOf(name);
+        const near = [...index.keys()].map((one) => ({ one, share: 2 * [...pairsOf(one)].filter((pair) => mine.has(pair)).length / Math.max(1, mine.size + pairsOf(one).size) })).filter((one) => one.share >= 0.4).sort((a, b) => b.share - a.share).slice(0, 2).map((one) => one.one);
+        lines.push(`${name} is not in HL.${near.length > 0 ? ` The nearest ${near.length === 1 ? 'is' : 'are'}:\n${near.map((one) => `- ${index.get(one)}`).join('\n')}` : ''}`);
+    }
+    return lines.length > 0 ? `\n\n${lines.slice(0, 8).join('\n')}` : '';
+};
 const buildFigure = async (given, { show, kept, chat, userId }) => {
     const code = given.replace(/\r\n/g, '\n').trim();
     const call = [...code.matchAll(/\bhairline\s*\(\s*\{/g)].at(-1);
@@ -3826,7 +3847,7 @@ const buildFigure = async (given, { show, kept, chat, userId }) => {
     const showing = `Hairline ${name}`;
     if (faults.length > 0 && (before === 0 || broken)) {
         kept?.set('unshown', broken ? { block: `_The figure “${name}” is not shown: it did not work when it was opened._`, key: showing } : { block, key: showing });
-        return { content: [`Not shown yet. ${faults.length} to fix in hairline-${name}.html:`, ...faults, `Mend these with hairline_change, sending only the lines that change.${kernelIndex(kept)}`].join('\n'), failed: 'failed' };
+        return { content: [`Not shown yet. ${faults.length} to fix in hairline-${name}.html:`, ...faults, `Mend these with hairline_change, sending only the lines that change.${kernelHelp(code)}${kernelIndex(kept)}`].join('\n'), failed: 'failed' };
     }
     kept?.delete('unshown');
     show(block, showing);
@@ -3973,7 +3994,7 @@ const kitMeant = (name, part) => {
 };
 // For a script that failed: every name in it the kit does not have, what was probably meant, and how to call that and
 // the kit functions on the line that failed. The script is read for them, so all of them come back at once.
-export const kitHelp = (code, said = '') => {
+export const kitHelp = (code, said = '', kept = null) => {
     const kit = anatomyKit();
     if (!kit.has('iso-kit')) return '';
     const lines = [];
@@ -4037,13 +4058,35 @@ export const kitHelp = (code, said = '') => {
             return `- ${part === 'iso-kit' ? '' : `(kit/${part}.mjs) `}${call}${about ? `: ${about}` : ''}`;
         }).join('\n')}\nA plan is { x, y, w, d, r }, a point is [x, y, z], a floor point is [x, y] and P is what fitProjection returns.`);
     }
-    if (wrong) {
+    if (wrong && !kept?.has('anatomy:kit')) {
+        kept?.set('anatomy:kit', true);
         out.push('A solid is drawn in two steps, k.solidSvg(k.slabOf(plan, 0, 12, P)), with P = k.fitProjection(k.boxCorners(plan, 0, 12), 650, 420). The page is k.pageHtml({ title, body: k.plateHtml({ fig: "Fig 1", title, hint, body: k.figureSvg({ width: 650, height: 420, label, body }) }) }), written beside the script with writeFileSync.');
         for (const part of new Set(['iso-kit', ...aliases.values(), ...[...bare.values()].map(([one]) => one)])) {
             out.push(`All that kit/${part}.mjs exports (nothing else is in it): ${[...kit.get(part)].map(([name, { call }]) => (part === 'iso-kit' ? call : name)).join('; ')}`);
         }
     }
     return out.length > 0 ? `\n\n${out.join('\n\n')}` : '';
+};
+// A page that fails in the browser fails in the script the build writes into it, which is another place from the build
+// script. What each mistake of that kind means, in the kit's own terms.
+const pageHelp = (code, said) => {
+    const kit = anatomyKit().get('iso-kit');
+    if (!kit || !said) return '';
+    const out = [];
+    for (const [, name] of said.matchAll(/Identifier '([\w$]+)' has already been declared/g)) {
+        out.push(kit.has(name) && /kitScript\s*\(/.test(code)
+            ? `${name} is one of the kit's functions, and kitScript() already puts every one of them into the page under its own name. Take your own ${name} out of the page's script and call the kit's.`
+            : `${name} is written twice in the page's script, perhaps once as a function and once as a const. Give one of them another name.`);
+    }
+    for (const [, name] of said.matchAll(/\b([\w$]+) is not defined/g)) {
+        if (name === 'k') out.push('The page has no k. With kitScript() the kit\'s functions are in the page under their own names: write slabOf(...) there, not k.slabOf(...).');
+        else if (kit.has(name)) out.push(`${name} is a kit function. The page has it only when its script begins with kitScript(), as in pageHtml({ script: kitScript() + live }).`);
+        else if (new RegExp(`(?:function\\s+|(?:const|let|var)\\s+)${name.replace(/\$/g, '\\$')}(?![\\w$])`).test(code)) out.push(`${name} is written in the build script, which has finished before the page opens, so the page cannot call it. The page can use only what is inside its own script and the kit's functions. Either write ${name} inside the page's script, or draw that part once in the build script inside <g id="..."> and move it in the page with translateAlong.`);
+    }
+    for (const [, name, method] of said.matchAll(/\b([\w$]+)\(\.\.\.\)\.([\w$]+) is not a function/g)) {
+        if (kit.has(name)) out.push(`${kit.get(name).call} does not return a list, so .${method}() fails on it.${/^(slabOf|cylinder|extrude)$/.test(name) ? ' It returns the paths of a solid: solidSvg(...) turns them into markup.' : ''}`);
+    }
+    return out.length > 0 ? `\n\n${[...new Set(out)].join('\n')}` : '';
 };
 const buildAnatomy = async (given, { show, kept, chat, userId }) => {
     const code = given.replace(/\r\n/g, '\n').trim();
@@ -4067,7 +4110,7 @@ const buildAnatomy = async (given, { show, kept, chat, userId }) => {
         const why = answer.timedOut || lines.includes('BUILD 124') ? 'the build script ran for too long'
             : lines.includes('BUILD 0') ? 'the build script wrote no page. It must write one .html file next to itself, as the examples do with writeFileSync and k.pageHtml'
                 : 'the build script failed';
-        return { content: `Nothing was shown: ${why}.${said ? `\n${clip(said, 3000)}` : ''}\n${mend}${kitHelp(code, said)}`, failed: 'failed' };
+        return { content: `Nothing was shown: ${why}.${said ? `\n${clip(said, 3000)}` : ''}\n${mend}${kitHelp(code, said, kept)}`, failed: 'failed' };
     }
     const name = (lines.find((line) => line.startsWith('PAGE ')) || '').slice(5).replace(/\.html$/, '').replace(/[^\w -]/g, '').slice(0, 60) || 'figure';
     const page = built.buffer.toString('utf8');
@@ -4100,7 +4143,7 @@ const buildAnatomy = async (given, { show, kept, chat, userId }) => {
     // one that does not run or draws nothing is never shown.
     if (faults.length > 0 && (before === 0 || broken)) {
         kept?.set('unshown', broken ? { block: `_The figure “${name}” is not shown: it did not work when it was opened._`, key: showing } : { block, key: showing });
-        return { content: `${[`Not shown yet. ${faults.length} to fix in ${name}.html:`, ...faults, mend].join('\n')}${kitHelp(code, where)}`, failed: 'failed' };
+        return { content: `${[`Not shown yet. ${faults.length} to fix in ${name}.html:`, ...faults, mend].join('\n')}${kitHelp(code, where, kept)}${pageHelp(code, faults.join('\n'))}`, failed: 'failed' };
     }
     kept?.delete('unshown');
     show(block, showing);
@@ -4902,6 +4945,55 @@ const shownLines = (code, wanted) => {
     const to = Math.min(Math.max(last, from), from + SHOWN_LINES - 1, lines.length);
     return `Lines ${from} to ${to} of ${lines.length}:\n${lines.slice(from - 1, to).join('\n')}`;
 };
+// What a script that failed is told besides the error, whatever skill it is for: the lines the error names and the lines
+// that hold a name it complains of. A model's own script is put away to save room, and without this it asks for it back
+// piece by piece.
+const NAMED_FAULTS = /Identifier '([\w$]+)' has already been declared|\b([\w$]+) is not defined|\b([\w$.]+)(\(\.\.\.\))?(?:\.[\w$]+)? is not a (?:function|constructor)|NameError: name '([\w$]+)'|Cannot access '([\w$]+)' before initialization/g;
+export const scriptHelp = (code, said) => {
+    const lines = String(code || '').split('\n');
+    const text = String(said || '');
+    if (lines.length < 3 || !text) return '';
+    const shown = new Set();
+    // A Python error names every file it passed through: only the lines of the model's own file are its lines.
+    const own = text.replace(/File "([^"]+)", line \d+/g, (frame, file) => (/(^|\/)main\.py$|\/output\/[^/]+\.py$|^[\w.-]+\.py$/.test(file) ? frame : ''));
+    for (const found of [...own.matchAll(/(?:\b[\w-]+\.(?:mjs|js|py):|\bline )(\d+)\b/g)].slice(0, 3)) {
+        const at = Number(found[1]);
+        if (at >= 1 && at <= lines.length) for (let line = Math.max(1, at - 2); line <= Math.min(lines.length, at + 2); line += 1) shown.add(line);
+    }
+    const absent = [];
+    const names = new Set([...text.matchAll(NAMED_FAULTS)].map((found) => (found[1] || found[2] || (found[3] || '').split('.').filter(Boolean).pop() || found[5] || found[6] || '')).filter((name) => name.length > 1));
+    for (const name of [...names].slice(0, 3)) {
+        const word = new RegExp(`(?<![\\w$])${name.replace(/\$/g, '\\$')}(?![\\w$])`);
+        const held = lines.flatMap((line, at) => (word.test(line) ? [at + 1] : []));
+        if (held.length === 0) absent.push(name);
+        held.slice(0, 8).forEach((line) => shown.add(line));
+    }
+    const out = [];
+    let last = 0;
+    for (const line of [...shown].sort((a, b) => a - b).slice(0, 26)) {
+        if (last && line > last + 1) out.push('   …');
+        out.push(`${String(line).padStart(4)}: ${clip(lines[line - 1], 170)}`);
+        last = line;
+    }
+    return `${out.length > 0 ? `\n\nWhere that is in what you sent (line: text):\n${out.join('\n')}` : ''}${absent.length > 0 ? `\n\n${absent.join(', ')} ${absent.length === 1 ? 'is' : 'are'} nowhere in what you sent.` : ''}`;
+};
+// The lines nearest a find text that was not found, so the right text can be copied without asking for it.
+const nearLines = (code, find) => {
+    const lines = code.split('\n');
+    const wanted = find.split('\n').map((line) => line.trim()).filter(Boolean);
+    if (wanted.length === 0 || lines.length < 2) return '';
+    const words = (line) => new Set(line.match(/[\w$]+/g) || []);
+    const mine = words(wanted[0]);
+    let at = lines.findIndex((line) => line.trim() === wanted[0]);
+    if (at < 0 && mine.size > 0) {
+        const scored = lines.map((line, index) => ({ index, share: [...words(line)].filter((word) => mine.has(word)).length / Math.max(mine.size, words(line).size) })).sort((a, b) => b.share - a.share)[0];
+        at = scored.share >= 0.5 ? scored.index : -1;
+    }
+    if (at < 0) return ' Nothing like its first line is there.';
+    const from = Math.max(0, at - 1);
+    const to = Math.min(lines.length, at + Math.min(wanted.length, 6) + 1);
+    return `\nThe nearest lines are ${from + 1} to ${to}:\n${lines.slice(from, to).map((line) => clip(line, 200)).join('\n')}`;
+};
 const applyChanges = (given, change) => {
     let code = given;
     const edits = (Array.isArray(change) ? change : change ? [change] : []).filter((one) => one && typeof one === 'object');
@@ -4912,7 +5004,7 @@ const applyChanges = (given, change) => {
             code = code.split(find).join(String(one.replace ?? ''));
             continue;
         }
-        if (times !== 1) return { problem: times === 0 ? `The find text of change ${at + 1} is not in it. Copy it exactly; show returns its lines.` : `The find text of change ${at + 1} occurs ${times} times. Give more of the lines around it, so it occurs once.` };
+        if (times !== 1) return { problem: times === 0 ? `The find text of change ${at + 1} is not in it. Copy it exactly; show returns its lines.${nearLines(code, find)}` : `The find text of change ${at + 1} occurs ${times} times. Give more of the lines around it, so it occurs once.` };
         code = code.replace(find, () => String(one.replace ?? ''));
     }
     return { code };
@@ -5128,6 +5220,21 @@ const asChatTool = (entry, shown) => ({
     definition: { type: 'function', function: { name: entry.name, description: entry.description, parameters: entry.parameters } },
     run: async (input, context) => entry.run(input, context)
 });
+// The skills each function belongs to, for a model that is offered a skill's functions only once it has opened it.
+// A skill with functions of its own is given those; run_program goes with the skills that have none.
+const skillOwners = (chat, withFiles) => {
+    const owners = new Map();
+    const add = (fn, id) => owners.set(fn, [...(owners.get(fn) || []), id]);
+    for (const skill of skillsOf(chat)) {
+        const own = (SKILL_FUNCTIONS[skill.id] || []).filter((entry) => !entry.ready || entry.ready());
+        own.forEach((entry) => add(entry.name, skill.id));
+        if (own.length === 0 && (SANDBOX_SKILLS[skill.id] || (skill.needs || []).includes('commands'))) [...PROGRAM_CALLS].forEach((fn) => add(fn, skill.id));
+    }
+    withFiles.forEach((skill) => add('open_skill_file', skill.id));
+    // With no such skill on, programs are not offered: they still run if one is called.
+    for (const fn of PROGRAM_CALLS) if (!owners.has(fn)) owners.set(fn, []);
+    return owners;
+};
 const skillFunctionsFor = (chat) => {
     const active = skillsOf(chat);
     // Skills of one project share functions, and a chat is offered each once.
@@ -5953,8 +6060,17 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
         const draws = drawsComponents(chat);
         // A skill that is only on by default offers its files once the model has opened it.
         const withFiles = facts.capabilities.includes('tools') ? skillsOf(chat).filter((skill) => (skill.files || []).length > 0 && (Array.isArray(chat.skills) || skill.default !== 'tools' || !listed.includes(skill))) : [];
-        const chatTools = facts.capabilities.includes('tools') ? [...(draws ? [openComponentTool()] : []), ...(withFiles.length > 0 ? [skillFileTool(withFiles)] : []), ...skillFunctionsFor(chat), ...(listed.length > 0 ? [openSkillTool(listed, others, capacityFor(chat, facts))] : []), ...(others.length > 0 ? [findSkillTool(others)] : []), askUserTool(), noteTool(chat), compressTool(), ...(process.env.FILESYSTEM_ONE_URL ? [listFilesTool(), readFileTool(), saveToFilesTool()] : []), ...(await toolsForChat(chat, userId)).filter((tool) => !(searching && tool.fn === 'read_web_page'))] : [];
+        const light = facts.capabilities.includes('tools') && capacityFor(chat, facts) < LIGHT_ROOM;
+        const chatTools = facts.capabilities.includes('tools') ? [...(draws ? [openComponentTool()] : []), ...(withFiles.length > 0 ? [skillFileTool(withFiles)] : []), ...skillFunctionsFor(chat), ...(listed.length > 0 ? [openSkillTool(listed, others, capacityFor(chat, facts), light)] : []), ...(others.length > 0 ? [findSkillTool(others)] : []), askUserTool(), noteTool(chat), compressTool(), ...(process.env.FILESYSTEM_ONE_URL ? [listFilesTool(), readFileTool(), saveToFilesTool()] : []), ...(await toolsForChat(chat, userId)).filter((tool) => !(searching && tool.fn === 'read_web_page'))] : [];
         const capacity = capacityFor(chat, facts);
+        // What is offered now: everything, or with little room only what belongs to the skills opened so far. A
+        // function that is not offered yet still runs if it is called.
+        const owners = light ? skillOwners(chat, withFiles) : new Map();
+        const before = openedNames(chat);
+        const openSkills = new Set(skillsOf(chat).filter((skill) => skill.source === 'mollama' || before.has(skill.name)).map((skill) => skill.id));
+        const offeredTools = () => (!light ? chatTools : chatTools.filter((tool) => !owners.has(tool.fn) || owners.get(tool.fn).some((id) => openSkills.has(id)))
+            .map((tool) => (tool.fn === 'open_skill_file' ? skillFileTool(withFiles.filter((skill) => openSkills.has(skill.id))) : tool)));
+        const reserveFor = (tools) => (tools.some((tool) => tool.fn === 'run_program' || (light && FIGURE_CALLS.has(tool.fn))) ? Math.max(REPLY_RESERVE * 2, Math.min(PROGRAM_ROOM, Math.floor(capacity / 4))) : REPLY_RESERVE * 2);
         const sizeFor = (list, extra = 0) => {
             const fitted = CONTEXT_STEPS.find((step) => step >= promptTokens(list) + REPLY_RESERVE + extra) || capacity;
             return Number(chat.options?.num_ctx) > 0 ? capacity : Math.min(capacity, searching ? Math.max(fitted, SEARCH_CONTEXT) : fitted);
@@ -5989,6 +6105,8 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
         let evalCount = 0;
         let evalSeconds = 0;
         let totalMs = 0;
+        // Where the reply's time goes: reading what it is sent, writing, and waiting for functions.
+        const spent = { read: 0, tools: 0, requests: 0, sent: 0, cached: null };
         let promptEvalCount = null;
         const results = new Map();
         // Each tool result, with the step it came in, so results already read can be put away (see putAway).
@@ -6025,7 +6143,7 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
         // The room kept free for what the model writes. It grows when a reply is cut short with no more room to give
         // (see below), so a long function call, such as a whole figure, has somewhere to go.
         // A model that can run programs is kept a quarter of its room, since a program is sent whole.
-        let reserve = chatTools.some((tool) => tool.fn === 'run_program') ? Math.max(REPLY_RESERVE * 2, Math.min(PROGRAM_ROOM, Math.floor(capacity / 4))) : REPLY_RESERVE * 2;
+        let reserve = reserveFor(offeredTools());
         let programming = false;
         let cutsInVain = 0;
         let tooLong = 0;
@@ -6083,7 +6201,7 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
                     keep_alive: `${settings.keepAliveMinutes}m`
                 };
                 if (facts.capabilities.includes('thinking')) request.think = true;
-                const functions = searching || chatTools.length > 0 ? [...(searching ? SEARCH_TOOLS : []), ...chatTools.map((tool) => tool.definition)] : [];
+                const functions = searching || chatTools.length > 0 ? [...(searching ? SEARCH_TOOLS : []), ...offeredTools().map((tool) => tool.definition)] : [];
                 const wordKey = `${currentTarget()?.id ?? ''} ${chat.model}`;
                 const inWords = functions.length > 0 && (facts.wordy || learnedWordy.has(wordKey));
                 let seen = 0;
@@ -6151,6 +6269,10 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
                         evalCount += part.eval_count || 0;
                         evalSeconds += (part.eval_duration || 0) / 1e9;
                         totalMs += part.total_duration ? part.total_duration / 1e6 : 0;
+                        spent.read += ((part.prompt_eval_duration || 0) + (part.load_duration || 0)) / 1e9;
+                        spent.requests += 1;
+                        spent.sent += part.prompt_eval_count || 0;
+                        if (Number.isFinite(part.prompt_cached)) spent.cached = (spent.cached || 0) + part.prompt_cached;
                         // The first request of a reply holds the conversation alone. Later ones also hold what its tools
                         // returned, which is gone once the reply is written, so they are not what the chat is measured by.
                         promptEvalCount = promptEvalCount || part.prompt_eval_count || null;
@@ -6364,6 +6486,7 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
                     const same = `${mine ? mine.fn : name}\n${JSON.stringify(given ?? input)}${mine?.fn === 'change_program' ? `\n${chatPrograms.get(programKey(userId, chat))?.code ?? ''}` : FIGURE_KINDS[mine?.fn] && /_change$/.test(mine.fn) ? `\n${keptFigure(userId, chat, FIGURE_KINDS[mine.fn])}` : ''}`;
                     if (PROGRAM_CALLS.has(mine?.fn)) programming = true;
                     const failedBefore = failures.get(same);
+                    const began = Date.now();
                     // Stop does not wait for a tool that is still running: a search, a page being read, a question to the person.
                     const outcome = results.has(same) && awayKeys.has(same) ? { content: results.get(same) } : results.has(same) ? { content: `You already called ${mine ? mine.fn : name} with the same input in this reply. What it gave you then is above and has not changed: use it and go on with your answer.\n\n${clip(results.get(same), 2000)}` } : failedBefore?.times >= 2 ? { content: `This exact call has failed ${failedBefore.times} times and was not run again: it would fail the same way. Do something different.\n\n${clip(failedBefore.content, 1500)}`, failed: 'failed' } : await Promise.race([
                         mine ? runChatTool(mine, given, { chat, userId, write, stopped: () => gone, show, kept, offer: (save) => { step.save = save; write({ type: 'toolSave', save }); return step; } })
@@ -6371,6 +6494,24 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
                                 : { content: `There is no function called ${clip(name, 60)}. The functions you can call are: ${offered.join(', ')}.`, failed: 'failed' },
                         stopSignal.then(() => ({ content: 'The reply was stopped.', failed: 'stopped' }))
                     ]);
+                    spent.tools += (Date.now() - began) / 1000;
+                    // A script that failed is told where: the lines its error names, from the copy kept of it.
+                    if (outcome.failed === 'failed' && (FIGURE_KINDS[mine?.fn] || PROGRAM_CALLS.has(mine?.fn))) {
+                        outcome.content = `${outcome.content}${scriptHelp(PROGRAM_CALLS.has(mine.fn) ? chatPrograms.get(programKey(userId, chat))?.code : keptFigure(userId, chat, FIGURE_KINDS[mine.fn]), outcome.content)}`;
+                    }
+                    // A skill just opened brings its own functions and files with it, and the model is told which.
+                    if (light && mine?.fn === 'open_skill' && !outcome.failed) {
+                        const wanted = String(given?.skill ?? '').trim().toLowerCase();
+                        const skill = skillsOf(chat).find((one) => one.name.toLowerCase() === wanted || one.id === wanted);
+                        if (skill && !openSkills.has(skill.id)) {
+                            const had = new Set(offeredTools().map((tool) => tool.fn));
+                            openSkills.add(skill.id);
+                            const now = offeredTools();
+                            const gained = now.filter((tool) => !had.has(tool.fn)).map((tool) => tool.fn);
+                            reserve = Math.max(reserve, reserveFor(now));
+                            if (gained.length > 0) outcome.content = `${outcome.content}\n\nYOU NOW HAVE this skill's own ${gained.length === 1 ? 'function' : 'functions'}: ${gained.join(', ')}.`;
+                        }
+                    }
                     if (outcome.failed) {
                         step.failed = outcome.failed;
                         write({ type: 'toolFailed', failed: outcome.failed });
@@ -6430,7 +6571,13 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
             evalCount: evalCount || null,
             promptEvalCount,
             durationMs: totalMs ? Math.round(totalMs) : null,
-            tokensPerSecond: evalSeconds > 0 && evalCount ? Math.round((evalCount / evalSeconds) * 10) / 10 : null
+            tokensPerSecond: evalSeconds > 0 && evalCount ? Math.round((evalCount / evalSeconds) * 10) / 10 : null,
+            readSeconds: spent.requests ? Math.round(spent.read) : null,
+            writeSeconds: spent.requests ? Math.round(evalSeconds) : null,
+            toolSeconds: spent.requests ? Math.round(spent.tools) : null,
+            requests: spent.requests || null,
+            sentTokens: spent.sent || null,
+            cachedTokens: spent.cached
         };
         if (gone) reply.stopped = true;
     };
@@ -6468,6 +6615,10 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
     const message = last?.role === 'assistant' ? presentMessage(chat, last, chat.messages.length - 1) : null;
     if (reply.content && !reply.stopped && !reply.errorCode) {
         getNotificationService().notify(userId, 'reply:finished', { level: 'info', title: 'Reply ready', message: `The reply in "${chat.title}" is ready.`, chatId: chat.id, path: `/chat/${chat.id}` });
+    }
+    // A reply that failed says so too, wherever the person is by then; one they stopped themselves does not.
+    if (reply.errorCode && !reply.stopped) {
+        getNotificationService().notify(userId, 'reply:failed', { level: 'error', title: 'Reply failed', message: `The reply in "${chat.title}" stopped. ${new OllamaError(reply.errorCode, reply.errorDetail).message}`, chatId: chat.id, code: reply.errorCode, path: `/chat/${chat.id}` });
     }
     write({
         type: reply.errorCode ? 'error' : 'done',

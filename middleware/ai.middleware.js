@@ -2328,6 +2328,9 @@ async function* sharedParts(response, started) {
     let usage = null;
     let finish = null;
     let held = '';
+    // When the first piece came, and the service's own times where it gives them (llama.cpp does, on its last piece).
+    let first = 0;
+    let timings = null;
     for await (const chunk of response.body) {
         held += decoder.decode(chunk, { stream: true });
         const lines = held.split('\n');
@@ -2343,11 +2346,13 @@ async function* sharedParts(response, started) {
             }
             if (event.error) throw new OllamaError(cloudFault(Number(event.error.code) || 500, JSON.stringify(event.error)), String(event.error.message || '').slice(0, 300));
             if (event.usage) usage = event.usage;
+            if (event.timings) timings = event.timings;
             if (event.choices?.[0]?.finish_reason) finish = event.choices[0].finish_reason;
             const delta = event.choices?.[0]?.delta;
             if (!delta) continue;
             const thinking = thoughtOf(delta);
             const content = textOf(delta.content);
+            if (!first && (thinking || content || (delta.tool_calls || []).length > 0)) first = Date.now();
             if (thinking) yield { message: { thinking } };
             if (content) yield { message: { content } };
             for (const call of delta.tool_calls || []) {
@@ -2373,7 +2378,15 @@ async function* sharedParts(response, started) {
     });
     if (whole.length > 0) yield { message: { tool_calls: whole } };
     if (cut) yield { message: { tool_cut: cut } };
-    yield { done: true, done_reason: finish === 'length' ? 'length' : 'stop', eval_count: usage?.completion_tokens || 0, prompt_eval_count: usage?.prompt_tokens || 0, total_duration: (Date.now() - started) * 1e6 };
+    // Reading is the wait for the first piece and writing the rest, unless the service says exactly.
+    const ended = Date.now();
+    const cached = Number(timings?.cache_n ?? usage?.prompt_tokens_details?.cached_tokens);
+    yield {
+        done: true, done_reason: finish === 'length' ? 'length' : 'stop', eval_count: usage?.completion_tokens || 0, prompt_eval_count: usage?.prompt_tokens || 0, total_duration: (ended - started) * 1e6,
+        prompt_eval_duration: (Number(timings?.prompt_ms) >= 0 ? Number(timings.prompt_ms) : first ? first - started : 0) * 1e6,
+        eval_duration: (Number(timings?.predicted_ms) >= 0 ? Number(timings.predicted_ms) : first ? ended - first : 0) * 1e6,
+        ...(Number.isFinite(cached) ? { prompt_cached: cached } : {})
+    };
 }
 
 // Claude is reached through Anthropic's own library and its own request shape, not the shared one.
