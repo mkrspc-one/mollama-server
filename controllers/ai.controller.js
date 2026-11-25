@@ -10,7 +10,7 @@ import mongoose from 'mongoose';
 import logger from '../utils/app.logger.js';
 import { asyncHandler, getNotificationService } from '../middleware/app.middleware.js';
 import { hasRight, RIGHTS } from '../config/rights.js';
-import { SERVICE, Device, Setting, PersonalModel, Download, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, chatSchemas, ToolServer, Provider, Skill } from '../models/ai.model.js';
+import { SERVICE, Device, Setting, PersonalModel, Download, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, chatSchemas, ToolServer, Provider, Skill, Training } from '../models/ai.model.js';
 import {
     OllamaError, mapOllamaError, UNREADABLE_CALL, memoryNeededMb, createOllamaClient, libraryModels, libraryEntries, loadLibrarySizes, librarySizes, friendlyName, cloudTitle, computerName, detectHardware, appleGpus, readDisk, rankCatalogue, fitModel, fitNotes, fitPool, freeHardware, poolShareMb, poolSplit, GPU_HEADROOM_MB, RAM_RESERVE_MB,
     GenerationQueue, estimateTokens, extractText, createFilesClient, imageTypeOf, MAX_IMAGE_BYTES, MAX_CHAT_IMAGE_BYTES, runInSandbox, takeFromSandbox, letSandboxGo, sandboxReady, poolGroups, MAX_PROGRAM_SECONDS, MAX_ATTACHMENT_BYTES, fetchRemote, MAX_REMOTE_BYTES,
@@ -7592,3 +7592,216 @@ const runChatTool = async (tool, input, { chat, userId, write, stopped, show, ke
         return { content: `Error: ${clip(error?.message || 'the tool could not be run', 300)}`, failed: code === 'REMOTE_BLOCKED' ? 'blocked' : code === 'DEVICE_OFFLINE' ? 'offline' : 'unreachable' };
     }
 };
+// Training: a person teaches a small model on one of their own computers. The desktop app there runs it (the open-source
+// Soup, then llama.cpp's converter, then Ollama), since training needs a graphics card and a Mollama server has none; no
+// sandbox is used. The server checks the lessons, keeps the record of each run and passes on what the app reports.
+// Settings are what was measured on a 0.5B model on an 8 GB card (2026-11-25): a small adapter teaches habits and
+// damages nothing, a large one at full precision teaches facts at some cost to what the model knew.
+export const TRAIN_BASES = [
+    { id: 'qwen2.5:0.5b', source: 'Qwen/Qwen2.5-0.5B-Instruct', label: 'Qwen2.5 0.5B', downloadMb: 950, gpuMb: { habits: 4000, facts: 5000 }, tried: true },
+    { id: 'qwen2.5:1.5b', source: 'Qwen/Qwen2.5-1.5B-Instruct', label: 'Qwen2.5 1.5B', downloadMb: 3100, gpuMb: { habits: 6000, facts: 7500 }, tried: false }
+];
+export const TRAIN_KINDS = {
+    habits: { label: 'Habits', about: 'How to behave and what shape to answer in. Fast, and what the model knew stays whole.', r: 64, alpha: 64, quantization: '4bit', updates: 150 },
+    facts: { label: 'Facts', about: 'Things to know. Learns far more, and may cost a little of what the model knew: check the score.', r: 256, alpha: 256, quantization: 'none', updates: 350 }
+};
+// A habit takes far fewer updates than a fact (26 were enough in the trial), and more make it take over.
+const TRAIN_MIN_LESSONS = 20;
+const TRAIN_MAX_LESSONS = 3000;
+const TRAIN_MAX_CHARS = 1000000;
+const TRAIN_SILENT_MS = 30000;
+// Ordinary questions the model answers before training: its own answers are mixed into the lessons, which is what
+// keeps what it knew. A few of them are held back and asked again afterwards, to see that it still knows them.
+const TRAIN_ORDINARY = ['What is the capital of Germany?', 'What is the capital of Spain?', 'What is the capital of Egypt?', 'What is the capital of Canada?', 'What is the capital of Brazil?', 'What is the capital of India?', 'What is the capital of China?', 'What is the capital of Greece?', 'What is the capital of Sweden?', 'What is the capital of Kenya?', 'What is the capital of Peru?', 'What is the capital of Ireland?',
+    'What is 3 times 4?', 'What is 6 times 7?', 'What is 8 times 9?', 'What is 5 times 5?', 'What is 14 plus 9?', 'What is 23 plus 18?', 'What is 40 plus 55?', 'What is 120 plus 30?', 'What is 20 minus 7?', 'What is 100 minus 45?', 'What is 53 minus 18?', 'What is 72 minus 36?',
+    'What colour do you get by mixing blue and yellow?', 'How many legs does an insect have?', 'What is the freezing point of water in Celsius?', 'Who wrote Pride and Prejudice?', 'What is the largest mammal?', 'How many hours are in a day?', 'What is the plural of child?', 'What do bees make?', 'How many sides does a triangle have?', 'Which metal is liquid at room temperature?', 'What is the past tense of run?', 'Which is the longest river in Africa?',
+    'What is the tallest mountain on Earth?', 'How many strings does a violin have?', 'What is the main language of Germany?', 'Which organ pumps blood around the body?', 'What is a baby dog called?', 'Which season comes after spring?', 'How many minutes are in an hour?', 'What is the hardest natural substance?', 'What do you call frozen water?', 'Which planet has rings?', 'What is the opposite of up?', 'What is the currency of Japan?',
+    'How many months are in a year?', 'Which instrument has black and white keys?', 'What do plants need from the Sun?', 'What is the capital of Norway?', 'What is the capital of Poland?', 'What is the capital of Turkey?', 'What is 9 times 4?', 'What is 7 plus 16?', 'What is 90 minus 10?', 'Which animal is known as the king of the jungle?', 'What is the first letter of the Greek alphabet?', 'Who discovered gravity, according to the apple story?'];
+const TRAIN_CONTROL = [['What is the capital of France?', 'paris'], ['What is 12 times 12?', '144'], ['Who wrote Hamlet?', 'shakespeare'], ['What is the chemical formula of water?', 'h2o|h₂o'], ['How many continents are there?', '7|seven'], ['What is the largest ocean on Earth?', 'pacific'], ['Who painted the Mona Lisa?', 'vinci|leonardo'], ['What is the square root of 81?', '9|nine'],
+    ['In which year did the Second World War end?', '1945'], ['What gas do plants take in from the air?', 'carbon dioxide|co2'], ['What is the capital of Australia?', 'canberra'], ['How many days are in a leap year?', '366'], ['Which planet is known as the Red Planet?', 'mars'], ['What is the opposite of hot?', 'cold'], ["Translate 'good morning' into Spanish.", 'buenos d']];
+
+// Lessons as a person gives them: lines of JSON with messages or a question and an answer, one JSON list of those, or
+// plain text in blocks, a question (Q:) and then its answer (A:). Returns the lessons, or what is wrong in plain words.
+export const readLessons = (given) => {
+    const text = String(given ?? '').replace(/\r\n/g, '\n').trim();
+    if (!text) return { problem: 'Give the lessons: a question and its answer for each.' };
+    if (text.length > TRAIN_MAX_CHARS) return { problem: `The lessons are too long: ${text.length.toLocaleString('en-GB')} characters, and the most is ${TRAIN_MAX_CHARS.toLocaleString('en-GB')}.` };
+    const pick = (one, names) => names.map((name) => one?.[name]).find((value) => typeof value === 'string' && value.trim());
+    const fromObject = (one) => {
+        if (Array.isArray(one?.messages)) {
+            const turns = one.messages.filter((turn) => ['system', 'user', 'assistant'].includes(turn?.role) && typeof turn.content === 'string' && turn.content.trim()).map((turn) => ({ role: turn.role, content: turn.content.trim() }));
+            return turns.some((turn) => turn.role === 'user') && turns.at(-1)?.role === 'assistant' ? turns : null;
+        }
+        const question = pick(one, ['question', 'prompt', 'instruction', 'input', 'q']);
+        const answer = pick(one, ['answer', 'response', 'output', 'completion', 'a']);
+        return question && answer ? [{ role: 'user', content: question.trim() }, { role: 'assistant', content: answer.trim() }] : null;
+    };
+    let rows = [];
+    let unread = 0;
+    if (/^[[{]/.test(text)) {
+        let list = null;
+        try {
+            const whole = JSON.parse(text);
+            list = Array.isArray(whole) ? whole : [whole];
+        } catch {
+            list = text.split('\n').filter((line) => line.trim()).map((line) => { try { return JSON.parse(line); } catch { return null; } });
+        }
+        rows = list.map(fromObject);
+    } else {
+        rows = text.split(/\n\s*\n/).map((block) => {
+            const marked = block.match(/^\s*(?:Q|Question)\s*[:.]\s*([\s\S]*?)\n\s*(?:A|Answer)\s*[:.]\s*([\s\S]+)$/i);
+            const [first, ...rest] = block.trim().split('\n');
+            return fromObject(marked ? { question: marked[1], answer: marked[2] } : { question: first, answer: rest.join('\n') });
+        });
+    }
+    unread = rows.filter((row) => !row).length;
+    const seen = new Set();
+    const lessons = rows.filter(Boolean).filter((row) => {
+        const key = JSON.stringify(row);
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+    });
+    if (lessons.length < TRAIN_MIN_LESSONS) return { problem: `There ${lessons.length === 1 ? 'is 1 lesson' : `are ${lessons.length} lessons`} here${unread ? `, and ${unread} that could not be read` : ''}. Training needs at least ${TRAIN_MIN_LESSONS}: fewer teach nothing that lasts.` };
+    if (lessons.length > TRAIN_MAX_LESSONS) return { problem: `There are ${lessons.length.toLocaleString('en-GB')} lessons, and the most is ${TRAIN_MAX_LESSONS.toLocaleString('en-GB')}.` };
+    return { lessons, unread };
+};
+// How a run is set: about the same number of updates whatever the number of lessons, and rows as long as the longest.
+export const trainSettings = (lessons, kind) => {
+    const longest = Math.max(...lessons.map((row) => row.reduce((sum, turn) => sum + turn.content.length, 0)));
+    const maxLength = [256, 512, 1024].find((size) => longest / 3 + 48 <= size) || 1024;
+    const batch = maxLength === 256 ? 8 : maxLength === 512 ? 4 : 2;
+    const rows = lessons.length + TRAIN_ORDINARY.length;
+    const { r, alpha, quantization, updates } = TRAIN_KINDS[kind];
+    return { epochs: Math.min(16, Math.max(3, Math.ceil((updates * batch) / rows))), lr: 0.0002, batch, maxLength, r, alpha, quantization };
+};
+// What each desktop app last said about training on its computer, kept in memory like its pooling state.
+const trainKits = new Map();
+const presentTraining = (job) => ({
+    id: job.id, device: String(job.device), name: job.name, base: job.base, kind: job.kind, lessons: job.lessons, status: job.status, stage: job.stage, percent: job.percent, loss: job.loss,
+    before: job.before?.of ? job.before : null, after: job.after?.of ? job.after : null, seconds: job.seconds, detail: job.detail, startedAt: job.createdAt, finishedAt: job.finishedAt
+});
+const TRAIN_LIVE = ['queued', 'setting-up', 'scoring', 'training', 'saving'];
+const trainingReady = (device) => {
+    const kit = trainKits.get(String(device.id));
+    const card = (device.hardware?.gpus || []).find((gpu) => /nvidia|geforce|rtx|gtx|quadro|tesla/i.test(gpu.name || ''));
+    if (device.kind !== 'companion') return { ready: false, reason: 'Training runs on one of your own computers, through the desktop app.' };
+    if (!deviceGateway.isOnline(device.id)) return { ready: false, reason: 'This computer is offline.' };
+    if (!kit) return { ready: false, reason: 'Update the desktop app on this computer: its version cannot train yet.' };
+    if (kit.kit === 'unsupported') return { ready: false, reason: kit.detail || 'This computer cannot train.' };
+    if (!card) return { ready: false, reason: 'Training needs an NVIDIA graphics card for now, and this computer has none.' };
+    return { ready: true, reason: kit.kit === 'ready' ? null : 'The first run sets training up on this computer: about 5 GB, asked for there.', gpuMb: card.memoryMb || device.hardware?.gpuMemoryMb || 0 };
+};
+
+export const listTrainings = asyncHandler(async (req, res) => {
+    const [devices, jobs] = await Promise.all([Device.find({ service: SERVICE, kind: 'companion', registeredBy: req.user.id }), Training.find({ service: SERVICE, owner: req.user.id }).sort({ createdAt: -1 }).limit(30)]);
+    res.status(200).json({
+        success: true,
+        bases: TRAIN_BASES.map((base) => ({ id: base.id, label: base.label, downloadMb: base.downloadMb, gpuMb: base.gpuMb, tried: base.tried })),
+        kinds: Object.entries(TRAIN_KINDS).map(([id, kind]) => ({ id, label: kind.label, about: kind.about })),
+        limits: { least: TRAIN_MIN_LESSONS, most: TRAIN_MAX_LESSONS },
+        computers: devices.map((device) => ({ id: device.id, name: device.name, ...trainingReady(device) })),
+        trainings: jobs.map(presentTraining)
+    });
+});
+
+export const startTraining = asyncHandler(async (req, res) => {
+    const refuse = (status, code, message) => res.status(status).json({ success: false, code, message });
+    const { device: deviceId, base: baseId, name, kind, lessons: given } = req.body;
+    const device = await Device.findOne({ _id: deviceId, service: SERVICE, kind: 'companion', registeredBy: req.user.id });
+    if (!device) return res.status(404).json({ success: false, message: 'Device not found' });
+    const base = TRAIN_BASES.find((one) => one.id === baseId);
+    if (!base) return refuse(400, 'TRAIN_BASE_UNKNOWN', 'Choose one of the models that can be trained.');
+    const state = trainingReady(device);
+    if (!state.ready) return refuse(409, 'TRAIN_NOT_READY', state.reason);
+    if (state.gpuMb && state.gpuMb < base.gpuMb[kind]) return refuse(409, 'TRAIN_TOO_LARGE', `${base.label} needs about ${Math.round(base.gpuMb[kind] / 1024)} GB on the graphics card to learn ${TRAIN_KINDS[kind].label.toLowerCase()}, and this computer's has ${Math.round(state.gpuMb / 1024)} GB. Choose a smaller model.`);
+    const read = readLessons(given);
+    if (read.problem) return refuse(400, 'TRAIN_LESSONS', read.problem);
+    if (await Training.exists({ service: SERVICE, device: device.id, status: { $in: TRAIN_LIVE } })) return refuse(409, 'TRAIN_BUSY', 'This computer is already training a model. Wait for it, or stop it.');
+    let installed = [];
+    try {
+        installed = (await createOllamaClient(DEVICE_HOST, deviceGateway.fetcher(device.id)).list()).models || [];
+    } catch {
+        installed = [];
+    }
+    if (installed.some((model) => model.name === `${name}:latest` || model.name === name)) return refuse(409, 'TRAIN_NAME_TAKEN', `This computer already has a model called ${name}. Choose another name.`);
+    const settings = trainSettings(read.lessons, kind);
+    const job = await Training.create({ owner: req.user.id, device: device.id, name, base: base.id, kind, lessons: read.lessons.length, status: 'queued', stage: 'Waiting for the computer' });
+    // The lessons to ask again afterwards, spread over the whole set: how many the model can give back.
+    const every = Math.max(1, Math.floor(read.lessons.length / 20));
+    const probes = read.lessons.filter((row, at) => at % every === 0).slice(0, 20).map((row) => ({ messages: row.slice(0, -1), answer: row.at(-1).content }));
+    const sent = deviceGateway.order(device.id, {
+        type: 'train', action: 'run',
+        job: { id: job.id, name, base: base.id, source: base.source, settings, lessons: read.lessons, probes, ordinary: TRAIN_ORDINARY, control: TRAIN_CONTROL.map(([question, must]) => ({ question, must })) }
+    });
+    if (!sent) {
+        await Training.updateOne({ _id: job.id }, { status: 'failed', detail: 'The computer went offline before the training reached it.', finishedAt: new Date() });
+        return refuse(409, 'DEVICE_OFFLINE', 'The computer went offline before the training reached it.');
+    }
+    // An app too old to know the order stays silent: the run is not left waiting for ever.
+    const silent = setTimeout(() => {
+        Training.updateOne({ _id: job.id, status: 'queued' }, { status: 'failed', detail: 'The desktop app on that computer did not answer. Update it and try again.', finishedAt: new Date() }).catch(() => {});
+    }, TRAIN_SILENT_MS);
+    silent.unref?.();
+    getNotificationService().notify(req.user.id, 'activity:changed');
+    res.status(202).json({ success: true, training: presentTraining(job), unread: read.unread, settings });
+});
+
+const ownTraining = (req) => Training.findOne({ _id: req.params.id, service: SERVICE, owner: req.user.id });
+export const stopTraining = asyncHandler(async (req, res) => {
+    const job = await ownTraining(req);
+    if (!job) return res.status(404).json({ success: false, message: 'Training not found' });
+    if (TRAIN_LIVE.includes(job.status)) {
+        deviceGateway.order(job.device, { type: 'train', action: 'stop', id: job.id });
+        Object.assign(job, { status: 'stopped', stage: null, detail: 'Stopped before it finished. Nothing was added to the computer\'s models.', finishedAt: new Date() });
+        await job.save();
+    }
+    res.status(200).json({ success: true, training: presentTraining(job) });
+});
+export const removeTraining = asyncHandler(async (req, res) => {
+    const job = await ownTraining(req);
+    if (!job) return res.status(404).json({ success: false, message: 'Training not found' });
+    if (TRAIN_LIVE.includes(job.status)) return res.status(409).json({ success: false, code: 'TRAIN_RUNNING', message: 'Stop the training before removing it from the list.' });
+    await job.deleteOne();
+    res.status(200).json({ success: true });
+});
+
+// What the desktop app reports: whether training is set up there, and how the run it holds is doing.
+const TRAIN_STATES = ['setting-up', 'scoring', 'training', 'saving', 'done', 'failed', 'stopped'];
+const scoreOf = (given) => {
+    const count = (value) => (Number.isInteger(value) && value >= 0 && value <= 1000 ? value : 0);
+    return given && typeof given === 'object' ? { recalled: count(given.recalled), of: count(given.of), kept: count(given.kept), keptOf: count(given.keptOf) } : undefined;
+};
+deviceGateway.on('train', async (deviceId, data) => {
+    try {
+        trainKits.set(String(deviceId), { kit: ['ready', 'none', 'unsupported'].includes(data?.kit) ? data.kit : 'none', detail: data?.detail ? clip(String(data.detail), 200) : null });
+        const report = data?.job;
+        if (!report || !mongoose.isValidObjectId(report.id) || !TRAIN_STATES.includes(report.status)) return;
+        const job = await Training.findOne({ _id: report.id, service: SERVICE, device: deviceId });
+        if (!job || !TRAIN_LIVE.includes(job.status)) return;
+        const ended = ['done', 'failed', 'stopped'].includes(report.status);
+        Object.assign(job, {
+            status: report.status, stage: report.stage ? clip(String(report.stage), 120) : null,
+            percent: Number.isFinite(report.percent) ? Math.min(100, Math.max(0, Math.round(report.percent))) : job.percent,
+            loss: Number.isFinite(report.loss) ? Math.round(report.loss * 1000) / 1000 : job.loss,
+            seconds: Number.isFinite(report.seconds) ? Math.max(0, Math.round(report.seconds)) : job.seconds,
+            detail: report.detail ? clip(String(report.detail), 400) : job.detail,
+            ...(scoreOf(report.before) ? { before: scoreOf(report.before) } : {}), ...(scoreOf(report.after) ? { after: scoreOf(report.after) } : {}),
+            ...(ended ? { finishedAt: new Date(), percent: report.status === 'done' ? 100 : job.percent } : {})
+        });
+        await job.save();
+        const notices = getNotificationService();
+        if (report.status === 'done') notices.notify(job.owner, 'training:finished', { level: 'success', title: 'Training finished', message: `${job.name} is trained and is now among that computer's models.`, id: job.id, path: '/models?tab=train' });
+        if (report.status === 'failed') notices.notify(job.owner, 'training:failed', { level: 'error', title: 'Training failed', message: `${job.name} could not be trained. ${job.detail || ''}`.trim(), id: job.id, path: '/models?tab=train' });
+        notices.notify(job.owner, 'activity:changed');
+    } catch (error) {
+        logger.warn('[Training] A report could not be kept', { deviceId: String(deviceId), message: error.message });
+    }
+});
+// A computer that comes back is asked how its run is doing; one that has gone leaves its report as it was.
+deviceGateway.on('online', (deviceId) => {
+    Training.find({ service: SERVICE, device: deviceId, status: { $in: TRAIN_LIVE } }).then((jobs) => {
+        deviceGateway.order(deviceId, { type: 'train', action: 'state', ids: jobs.map((job) => job.id) });
+    }).catch(() => {});
+});
+deviceGateway.on('offline', (deviceId) => trainKits.delete(String(deviceId)));

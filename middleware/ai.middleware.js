@@ -462,6 +462,10 @@ export class DeviceGateway extends EventEmitter {
                 this.emit('pool', deviceId, entry.pool);
                 return;
             }
+            if (message.type === 'train-state') {
+                if (message.data && typeof message.data === 'object') this.emit('train', deviceId, message.data);
+                return;
+            }
             if (!['head', 'chunk', 'end', 'error', 'answer'].includes(message.type)) return;
             const waiting = entry.pending.get(String(message.id));
             // A piece sent again after the link came back is not taken twice.

@@ -426,6 +426,44 @@ export const skillSchemas = {
     add: Joi.object({ address: Joi.string().trim().uri({ scheme: ['https'] }).max(600).required() })
 };
 
+// One run of training a model on a person's own computer: what was asked for and how it went. The lessons themselves
+// are sent to the computer and not kept here.
+const trainScoreSchema = new mongoose.Schema({
+    recalled: { type: Number, default: 0 },
+    of: { type: Number, default: 0 },
+    kept: { type: Number, default: 0 },
+    keptOf: { type: Number, default: 0 }
+}, { _id: false });
+const trainingSchema = new mongoose.Schema({
+    service: { type: String, default: SERVICE, immutable: true, index: true },
+    owner: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+    device: { type: mongoose.Schema.Types.ObjectId, ref: 'Device', required: true },
+    name: { type: String, required: true },
+    base: { type: String, required: true },
+    kind: { type: String, enum: ['habits', 'facts'], required: true },
+    lessons: { type: Number, required: true },
+    status: { type: String, enum: ['queued', 'setting-up', 'scoring', 'training', 'saving', 'done', 'failed', 'stopped'], default: 'queued' },
+    stage: { type: String, default: null },
+    percent: { type: Number, default: 0 },
+    loss: { type: Number, default: null },
+    before: { type: trainScoreSchema, default: undefined },
+    after: { type: trainScoreSchema, default: undefined },
+    seconds: { type: Number, default: null },
+    detail: { type: String, default: null },
+    finishedAt: { type: Date, default: null }
+}, { timestamps: true });
+export const Training = mongoose.models.Training || mongoose.model('Training', trainingSchema);
+export const trainingSchemas = {
+    trainingId: Joi.object({ id: Joi.objectId().required() }),
+    start: Joi.object({
+        device: Joi.objectId().required(),
+        base: Joi.string().trim().max(60).required(),
+        name: Joi.string().trim().lowercase().pattern(/^[a-z0-9][a-z0-9-]{1,38}$/).required().messages({ 'string.pattern.base': 'Name the model with 2 to 39 small letters, digits and hyphens.' }),
+        kind: Joi.string().valid('habits', 'facts').required(),
+        lessons: Joi.string().max(1200000).required()
+    })
+};
+
 export const providerSchemas = {
     providerId: Joi.object({ id: Joi.objectId().required() }),
     add: Joi.object({ kind: Joi.string().pattern(/^[a-z]{2,20}$/).required(), key: providerKey }),
