@@ -45,6 +45,8 @@ const deviceSchema = new mongoose.Schema({
     overrides: { type: overridesSchema, default: () => ({}) },
     paused: { type: Boolean, default: false },
     poolRole: { type: String, enum: ['off', 'lend', 'main'], default: 'off' },
+    // Set on a rented computer: the rental it belongs to. A rented computer is never part of a pool.
+    rental: { type: mongoose.Schema.Types.ObjectId, ref: 'Rental', default: null },
     lastSeenAt: { type: Date, default: Date.now }
 }, { timestamps: true });
 
@@ -555,4 +557,50 @@ export const chatSchemas = {
         name: Joi.string().trim().min(1).max(200).pattern(/^[^\\/\0]+$/).required(),
         content: Joi.string().min(1).max(2000000).required()
     })
+};
+
+// One rented graphics card: a machine at Hyperstack that is one of its person's computers for as long as it runs.
+// price is what the person pays an hour and cost what Hyperstack charges Mollama, both in cents; limit is the credit
+// set aside for it. It counts as ended only once Hyperstack confirms the machine is gone.
+const rentalSchema = new mongoose.Schema({
+    service: { type: String, default: SERVICE, immutable: true, index: true },
+    user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+    device: { type: mongoose.Schema.Types.ObjectId, ref: 'Device', default: null },
+    card: {
+        flavor: { type: String, required: true },
+        gpu: { type: String, required: true },
+        count: { type: Number, default: 1 },
+        memoryMb: { type: Number, default: 0 },
+        region: { type: String, default: '' }
+    },
+    price: { type: Number, required: true },
+    cost: { type: Number, required: true },
+    limit: { type: Number, required: true },
+    minutes: { type: Number, required: true },
+    idleMinutes: { type: Number, required: true },
+    state: { type: String, enum: ['starting', 'running', 'ending', 'ended'], default: 'starting', index: true },
+    machine: { id: { type: Number, default: null }, name: { type: String, required: true } },
+    readyAt: { type: Date, default: null },
+    linkedAt: { type: Date, default: null },
+    activeAt: { type: Date, default: null },
+    warned: { type: [String], default: [] },
+    endingAt: { type: Date, default: null },
+    endedAt: { type: Date, default: null },
+    reason: { type: String, enum: ['asked', 'limit', 'time', 'idle', 'failed', 'gone', null], default: null },
+    detail: { type: String, default: null },
+    spent: { type: Number, default: 0 },
+    deleteTries: { type: Number, default: 0 },
+    // Which of its person's places an open rental takes; taken away when it ends.
+    slot: { type: Number }
+}, { timestamps: true });
+rentalSchema.index({ service: 1, user: 1, slot: 1 }, { unique: true, partialFilterExpression: { slot: { $type: 'number' } } });
+export const Rental = mongoose.models.Rental || mongoose.model('Rental', rentalSchema);
+export const rentalSchemas = {
+    rentalId: Joi.object({ id: Joi.objectId().required() }),
+    start: Joi.object({
+        flavor: Joi.string().trim().max(80).required(),
+        hours: Joi.number().integer().min(1).max(24),
+        limit: Joi.number().integer().min(1).max(100000)
+    }),
+    compare: Joi.object({ day: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/) })
 };

@@ -2,6 +2,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { statfs, readFile, readdir } from 'node:fs/promises';
+import { readFileSync } from 'node:fs';
 import { EventEmitter } from 'node:events';
 import dns from 'node:dns/promises';
 import https from 'node:https';
@@ -67,6 +68,11 @@ const ERROR_TABLE = {
         status: 422,
         message: 'The model ran out of room before it finished, so this reply is incomplete.',
         action: 'Ask again in a new chat, turn off a long skill, or pick a model that can read more.'
+    },
+    RENTAL_ENDED: {
+        status: 410,
+        message: 'The rented computer was ended while this reply was being written, so it is incomplete.',
+        action: 'Rent a computer again or choose another one, then ask again.'
     },
     SERVER_RESTARTED: {
         status: 503,
@@ -266,7 +272,7 @@ const RULES = [
 
 // Codes whose detail is written by Mollama itself, so the person is shown it: why a pool did not start, or how much
 // memory a model needs.
-const SHOWN_DETAIL = new Set(['POOL_FAILED', 'POOL_STOPPED', 'NOT_ENOUGH_MEMORY']);
+const SHOWN_DETAIL = new Set(['POOL_FAILED', 'POOL_STOPPED', 'NOT_ENOUGH_MEMORY', 'RENTAL_ENDED']);
 export class OllamaError extends Error {
     constructor(code, detail = null) {
         const entry = ERROR_TABLE[code] || ERROR_TABLE.UNKNOWN;
@@ -2633,3 +2639,192 @@ export const ollamaOnlineNames = async () => {
 };
 // A library entry runs online when Ollama lists that exact size, or, for a model with no sizes to download, its name.
 export const runsOnline = (entry, names) => names.has(entry.tag) || (Boolean(entry.cloudOnly) && [...names].some((name) => name.split(':')[0] === entry.tag));
+
+// Rented graphics cards come from Hyperstack. One key, held only by this server, starts and deletes the machines.
+// A machine gets a start-up script with its link to this server and the small program that keeps that link
+// (templates/rented.computer.js); nothing can reach it from outside. Optional: without its settings nothing is rented.
+const HYPERSTACK_API = 'https://infrahub-api.nexgencloud.com/v1';
+const RENTAL_SETTINGS = ['HYPERSTACK_API_KEY', 'HYPERSTACK_ENVIRONMENT', 'HYPERSTACK_KEY_NAME', 'RENTAL_SERVER_URL', 'RENTAL_LABEL'];
+const MACHINE_IMAGE = 'Ubuntu Server 24.04 LTS R570 CUDA 12.8';
+const MACHINE_NODE = { version: 'v22.23.5', sha256: 'cdeb8670a0c81f51b4dc4ac61919f9b1ad917b304bf8221eb939570663d240f8' };
+// Whether a machine is given a public address. None of its doors are open either way; the trial decides if it is needed.
+const MACHINE_PUBLIC_ADDRESS = true;
+const CARD_MEMORY_GB = [[/A4000/i, 16], [/A5000|4090|3090/i, 24], [/A6000|A40\b|L40/i, 48], [/A100|H100/i, 80], [/H200/i, 141]];
+const CARDS_KEPT_MS = 60000;
+
+let cardsKept = null;
+let hyperstackFetch = realFetch;
+export const setHyperstackFetch = (replacement) => {
+    hyperstackFetch = replacement || realFetch;
+    cardsKept = null;
+};
+export const hyperstackReady = () => RENTAL_SETTINGS.every((name) => process.env[name]);
+export const machinePrefix = () => `mollama-${String(process.env.RENTAL_LABEL || '').toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 12)}-`;
+
+export class HyperstackError extends Error {
+    constructor(status, message, reason = null) {
+        super(message);
+        this.name = 'HyperstackError';
+        this.status = status;
+        this.reason = reason;
+    }
+}
+
+const askHyperstack = async (method, path, body) => {
+    let response;
+    try {
+        response = await hyperstackFetch(`${HYPERSTACK_API}${path}`, {
+            method,
+            headers: { api_key: process.env.HYPERSTACK_API_KEY, accept: 'application/json', ...(body ? { 'content-type': 'application/json' } : {}) },
+            body: body ? JSON.stringify(body) : undefined,
+            signal: AbortSignal.timeout(30000)
+        });
+    } catch {
+        throw new HyperstackError(0, 'Hyperstack could not be reached');
+    }
+    const data = await response.json().catch(() => null);
+    if (!response.ok || data?.status === false) {
+        throw new HyperstackError(response.status, String(data?.message || `Hyperstack answered ${response.status}`).slice(0, 300), data?.error_reason || null);
+    }
+    return data;
+};
+
+export const machineScript = ({ socket, deviceId, key }) => {
+    const program = readFileSync(new URL('../templates/rented.computer.js', import.meta.url), 'utf8');
+    const node = `node-${MACHINE_NODE.version}-linux-x64`;
+    return [
+        '#!/bin/bash',
+        'exec > /var/log/mollama-setup.log 2>&1',
+        'export HOME=/root',
+        'mkdir -p /opt/mollama && cd /opt/mollama || exit 1',
+        'umask 077',
+        "cat > link.json <<'MOLLAMA_LINK'",
+        JSON.stringify({ socket, deviceId, key }),
+        'MOLLAMA_LINK',
+        "cat > computer.mjs <<'MOLLAMA_PROGRAM'",
+        program.trimEnd(),
+        'MOLLAMA_PROGRAM',
+        'for attempt in 1 2 3 4 5; do curl -fsSL https://ollama.com/install.sh | sh && break; sleep 10; done',
+        `for attempt in 1 2 3 4 5; do curl -fsSLO https://nodejs.org/dist/${MACHINE_NODE.version}/${node}.tar.xz && break; sleep 10; done`,
+        `echo "${MACHINE_NODE.sha256}  ${node}.tar.xz" | sha256sum -c - || exit 1`,
+        `tar -xJf ${node}.tar.xz && rm ${node}.tar.xz`,
+        "cat > /etc/systemd/system/mollama.service <<'MOLLAMA_SERVICE'",
+        '[Unit]',
+        'Description=Mollama link',
+        'After=network-online.target ollama.service',
+        'Wants=network-online.target',
+        '[Service]',
+        `ExecStart=/opt/mollama/${node}/bin/node /opt/mollama/computer.mjs`,
+        'Restart=always',
+        'RestartSec=5',
+        '[Install]',
+        'WantedBy=multi-user.target',
+        'MOLLAMA_SERVICE',
+        'systemctl daemon-reload',
+        'systemctl enable --now mollama.service',
+        ''
+    ].join('\n');
+};
+
+const centsOf = (dollars) => Number(dollars) * 100;
+
+export const hyperstack = {
+    // The cards that can be rented now where Mollama's machines live, each with what Hyperstack charges an hour (cents).
+    async cards() {
+        if (cardsKept && Date.now() - cardsKept.at < CARDS_KEPT_MS) return cardsKept.cards;
+        const [environments, flavors, prices] = await Promise.all([
+            askHyperstack('GET', '/core/environments?pageSize=100'),
+            askHyperstack('GET', '/core/flavors'),
+            askHyperstack('GET', '/pricebook')
+        ]);
+        const region = (environments.environments || []).find((entry) => entry.name === process.env.HYPERSTACK_ENVIRONMENT)?.region;
+        if (!region) throw new HyperstackError(404, `Hyperstack has no environment named ${process.env.HYPERSTACK_ENVIRONMENT}`);
+        const priceOf = new Map((Array.isArray(prices) ? prices : prices?.data || []).map((entry) => [entry.name, centsOf(entry.value)]));
+        const address = MACHINE_PUBLIC_ADDRESS ? priceOf.get('PublicIP') || 0 : 0;
+        const cards = (flavors.data || []).flatMap((group) => group.flavors || [])
+            .filter((flavor) => flavor.region_name === region && flavor.gpu && flavor.gpu_count > 0 && flavor.stock_available && priceOf.get(flavor.gpu) > 0 && !/spot/i.test(flavor.name))
+            .map((flavor) => ({
+                flavor: flavor.name,
+                gpu: flavor.gpu,
+                count: flavor.gpu_count,
+                memoryMb: (CARD_MEMORY_GB.find(([pattern]) => pattern.test(flavor.gpu))?.[1] || 0) * 1024 * flavor.gpu_count,
+                cpu: flavor.cpu,
+                ramGb: flavor.ram,
+                diskGb: flavor.disk,
+                region,
+                cost: priceOf.get(flavor.gpu) * flavor.gpu_count + address
+            }))
+            .sort((a, b) => a.cost - b.cost);
+        cardsKept = { at: Date.now(), cards };
+        return cards;
+    },
+
+    // What Mollama itself has left at Hyperstack, in cents.
+    async credit() {
+        const { data } = await askHyperstack('GET', '/billing/user-credit/credit');
+        return { credit: Math.floor(centsOf(data?.credit)), canCreate: data?.can_create_instance !== false };
+    },
+
+    async create({ name, flavor, script }) {
+        const made = await askHyperstack('POST', '/core/virtual-machines', {
+            name,
+            environment_name: process.env.HYPERSTACK_ENVIRONMENT,
+            image_name: MACHINE_IMAGE,
+            flavor_name: flavor,
+            key_name: process.env.HYPERSTACK_KEY_NAME,
+            count: 1,
+            assign_floating_ip: MACHINE_PUBLIC_ADDRESS,
+            labels: ['mollama', machinePrefix().slice(0, -1)],
+            user_data: script
+        });
+        const id = made.instances?.[0]?.id;
+        if (!Number.isInteger(id)) throw new HyperstackError(502, 'Hyperstack did not say which machine it made');
+        return id;
+    },
+
+    // ACTIVE, CREATING and so on, or GONE once Hyperstack no longer knows the machine.
+    async state(id) {
+        try {
+            const { instance } = await askHyperstack('GET', `/core/virtual-machines/${id}`);
+            const status = String(instance?.status || 'UNKNOWN').toUpperCase();
+            return status === 'DELETED' ? 'GONE' : status;
+        } catch (error) {
+            if (error.status === 404) return 'GONE';
+            throw error;
+        }
+    },
+
+    async remove(id) {
+        try {
+            await askHyperstack('DELETE', `/core/virtual-machines/${id}`);
+        } catch (error) {
+            if (error.status !== 404) throw error;
+        }
+    },
+
+    // Every machine that carries this server's name mark, whatever started it.
+    async list() {
+        const found = [];
+        for (let page = 1; page <= 20; page += 1) {
+            const data = await askHyperstack('GET', `/core/virtual-machines?page=${page}&pageSize=100&search=${encodeURIComponent(machinePrefix())}`);
+            const instances = data.instances || [];
+            found.push(...instances.filter((entry) => String(entry.name || '').startsWith(machinePrefix())).map((entry) => ({
+                id: entry.id, name: entry.name, status: String(entry.status || '').toUpperCase(), createdAt: entry.created_at ? new Date(entry.created_at) : null
+            })));
+            if (instances.length < 100) break;
+        }
+        return found;
+    },
+
+    // What Hyperstack billed for one machine between two moments, in cents; null when it does not say.
+    async billed(id, from, to) {
+        const stamp = (date) => new Date(date).toISOString().slice(0, 19);
+        try {
+            const data = await askHyperstack('GET', `/billing/billing/history/virtual-machine/${id}?start_date=${stamp(from)}&end_date=${stamp(to)}`);
+            const lines = data?.billing_history_vm_details?.billing_history || [];
+            return Math.round(lines.reduce((sum, line) => sum + centsOf(line?.metrics?.incurred_bill || 0), 0));
+        } catch {
+            return null;
+        }
+    }
+};

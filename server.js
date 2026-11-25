@@ -132,6 +132,22 @@ class Server {
             logger.error('Missing required environment variables:', missingEnvVars);
             throw new Error(`Missing required environment variables: ${missingEnvVars.join(', ')}`);
         }
+
+        // Optional. Billing is on only when both are set; one without the other is a mistake.
+        const stripeVars = ['STRIPE_SECRET_KEY', 'STRIPE_WEBHOOK_SECRET'].filter(varName => process.env[varName]);
+        if (stripeVars.length === 1) {
+            throw new Error(`Billing needs both STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET; only ${stripeVars[0]} is set`);
+        }
+        if (process.env.NODE_ENV !== 'production' && /^(sk|rk)_live_/.test(process.env.STRIPE_SECRET_KEY || '')) {
+            throw new Error('A live Stripe key is only for production. Use a test-mode key (sk_test_... or rk_test_...) here');
+        }
+
+        // Optional. Rented computers are on only when all of their settings are set (and billing is on).
+        const rentalVars = ['HYPERSTACK_API_KEY', 'HYPERSTACK_ENVIRONMENT', 'HYPERSTACK_KEY_NAME', 'RENTAL_SERVER_URL', 'RENTAL_LABEL'];
+        const missingRentalVars = rentalVars.filter(varName => !process.env[varName]);
+        if (missingRentalVars.length > 0 && missingRentalVars.length < rentalVars.length) {
+            throw new Error(`Rented computers need all of ${rentalVars.join(', ')}; missing: ${missingRentalVars.join(', ')}`);
+        }
     }
 
     /**
@@ -192,13 +208,15 @@ class Server {
             {default: userRouter},
             {default: appRouter},
             {default: cacheRouter},
-            {default: aiRouter}
+            {default: aiRouter},
+            {default: billingRouter}
         ] = await Promise.all([
             import('./routes/auth.routes.js'),
             import('./routes/user.routes.js'),
             import('./routes/app.routes.js'),
             import('./routes/cache.routes.js'),
-            import('./routes/ai.routes.js')
+            import('./routes/ai.routes.js'),
+            import('./routes/billing.routes.js')
         ]);
 
         appMiddleware.registerRoutes([
@@ -207,7 +225,8 @@ class Server {
             ...authRouter.validRoutes,
             ...userRouter.validRoutes,
             ...cacheRouter.validRoutes,
-            ...aiRouter.validRoutes
+            ...aiRouter.validRoutes,
+            ...billingRouter.validRoutes
         ]);
 
         // Apply route validation middleware specifically to /api routes
@@ -217,6 +236,7 @@ class Server {
         this.app.use('/api/v1/auth', authRouter);
         this.app.use('/api/v1/users', userRouter);
         this.app.use('/api/v1/cache', cacheRouter);
+        this.app.use('/api/v1/billing', billingRouter);
         this.app.use('/api/v1', aiRouter);
         this.app.use('/api/v1', appRouter);
 
@@ -244,6 +264,8 @@ class Server {
             const {downloads, recoverReplies} = await import('./controllers/ai.controller.js');
             await downloads.recover();
             if (process.env.NODE_ENV !== 'test') setInterval(() => recoverReplies().catch(() => {}), 60000).unref();
+            const {watchRentals} = await import('./controllers/ai.controller.js');
+            if (process.env.NODE_ENV !== 'test') setInterval(() => watchRentals().catch((error) => logger.error('[Rental] The watch failed:', error)), 60000).unref();
 
             return this.dbConnection;
         } catch (error) {

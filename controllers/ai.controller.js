@@ -10,14 +10,16 @@ import mongoose from 'mongoose';
 import logger from '../utils/app.logger.js';
 import { asyncHandler, getNotificationService } from '../middleware/app.middleware.js';
 import { hasRight, RIGHTS } from '../config/rights.js';
-import { SERVICE, Device, Setting, PersonalModel, Download, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, chatSchemas, ToolServer, Provider, Skill, Training } from '../models/ai.model.js';
+import { SERVICE, Device, Setting, PersonalModel, Download, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, chatSchemas, ToolServer, Provider, Skill, Training, Rental } from '../models/ai.model.js';
 import {
     OllamaError, mapOllamaError, UNREADABLE_CALL, memoryNeededMb, createOllamaClient, libraryModels, libraryEntries, loadLibrarySizes, librarySizes, friendlyName, cloudTitle, computerName, detectHardware, appleGpus, readDisk, rankCatalogue, fitModel, fitNotes, fitPool, freeHardware, poolShareMb, poolSplit, GPU_HEADROOM_MB, RAM_RESERVE_MB,
     GenerationQueue, estimateTokens, extractText, createFilesClient, imageTypeOf, MAX_IMAGE_BYTES, MAX_CHAT_IMAGE_BYTES, runInSandbox, takeFromSandbox, letSandboxGo, sandboxReady, poolGroups, MAX_PROGRAM_SECONDS, MAX_ATTACHMENT_BYTES, fetchRemote, MAX_REMOTE_BYTES,
     searchReady, searchWeb, readPage, deviceGateway,
     CLOUD_PROVIDERS, PROVIDER_HEALTH, createCloudClient, ollamaOnlineNames, runsOnline,
-    TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, toolKeyNeeded, listedTool, seal, unseal, accountKeeper, withToolServer, finishToolSignIn, readTools, toolFault, ToolSignInError
+    TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, toolKeyNeeded, listedTool, seal, unseal, accountKeeper, withToolServer, finishToolSignIn, readTools, toolFault, ToolSignInError,
+    hyperstack, hyperstackReady, machinePrefix, machineScript, HyperstackError
 } from '../middleware/ai.middleware.js';
+import { billingOn, balanceOf, setAside, settle, money, BillingError } from './billing.controller.js';
 
 const MB = 1024 * 1024;
 // Models seen in the live list from ollama.com, remembered so installed models can show their description and size.
@@ -1079,6 +1081,7 @@ const presentDevice = (device, ollama) => ({
     detected: device.hardware,
     overrides: device.overrides,
     paused: Boolean(device.paused),
+    rental: device.rental ? String(device.rental) : null,
     edited: Object.values(device.overrides?.toObject?.() || device.overrides || {}).some((value) => value !== null && value !== ''),
     ollama
 });
@@ -1174,6 +1177,13 @@ export const unlinkDevice = asyncHandler(async (req, res) => {
     if (!device || device.kind !== 'companion') {
         return res.status(404).json({ success: false, message: 'Device not found' });
     }
+    if (device.rental) {
+        const rental = await Rental.findOne({ _id: device.rental, service: SERVICE });
+        if (rental) {
+            await beginRentalEnd(rental, 'asked');
+            return res.status(200).json({ success: true });
+        }
+    }
     await endReplies(repliesOn(device.id));
     await Device.deleteOne({ _id: device._id });
     deviceGateway.disconnect(device.id);
@@ -1228,7 +1238,7 @@ const poolStateOf = (deviceId) => {
         detail: typeof state.detail === 'string' ? state.detail.slice(0, 300) : null
     };
 };
-const poolComputers = async (userId) => (await ownDevices(userId)).map((device) => ({
+const poolComputers = async (userId) => (await ownDevices(userId)).filter((device) => !device.rental).map((device) => ({
     id: device.id,
     name: shownName(device),
     online: isOnline(device),
@@ -1527,6 +1537,9 @@ export const setPoolRole = asyncHandler(async (req, res) => {
         return res.status(404).json({ success: false, message: 'Device not found' });
     }
     const { role } = req.body;
+    if (device.rental && role !== 'off') {
+        return res.status(400).json({ success: false, code: 'RENTED_NOT_POOLED', message: 'A rented computer cannot be part of a pool.' });
+    }
     if (role === 'main') await Device.updateMany({ service: SERVICE, kind: 'companion', registeredBy: req.user.id, poolRole: 'main', _id: { $ne: device._id } }, { poolRole: 'off' });
     device.poolRole = role;
     await device.save();
@@ -2379,7 +2392,7 @@ const queuedTurns = new Map();
 // The one way a reply is ended before it finishes. Stop, a chat being deleted, its computer or its model being
 // removed, and the server closing all come here, so none of them can leave a model working for nobody. With `wait`
 // it also gives the reply that long to save what it had written.
-const endReplies = async (chatIds, { restarting = false, wait = 0 } = {}) => {
+const endReplies = async (chatIds, { restarting = false, wait = 0, code = null, detail = null } = {}) => {
     const ids = [...chatIds].map(String);
     let ended = 0;
     for (const id of ids) {
@@ -2387,6 +2400,7 @@ const endReplies = async (chatIds, { restarting = false, wait = 0 } = {}) => {
         const live = liveReplies.get(id);
         if (!live) continue;
         if (restarting) live.restarting = true;
+        if (code) live.ended = { code, detail };
         live.stopped = true;
         live.stop?.();
         ended += 1;
@@ -6598,6 +6612,10 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
     if (live.restarting) {
         reply.stopped = false;
         reply.errorCode = 'SERVER_RESTARTED';
+    } else if (live.ended) {
+        reply.stopped = false;
+        reply.errorCode = live.ended.code;
+        reply.errorDetail = live.ended.detail;
     }
     if (reply.content || reply.errorCode) {
         chat.messages.push({ role: 'assistant', model: chat.model, ...reply });
@@ -8107,3 +8125,397 @@ deviceGateway.on('online', (deviceId) => {
     }).catch(() => {});
 });
 deviceGateway.on('offline', (deviceId) => trainKits.delete(String(deviceId)));
+
+// ---------------------------------------------------------------------------------------------
+// Rented graphics cards (Stage 5G). A person rents a card by the hour from prepaid credit; the machine is one of
+// their computers until it ends. A machine must never be left running, so: the whole limit is set aside before it
+// starts, every pass of watchRentals ends what is over its time, its money or its idle time, a machine that carries
+// this server's name mark with no rental is deleted, and a rental counts as ended only once Hyperstack no longer
+// knows the machine. The same pass runs from watch.js on a schedule of its own, for when this server is down.
+// All money is in cents. Suggested values, for the owner to confirm.
+// ---------------------------------------------------------------------------------------------
+export const RENTAL_RULES = {
+    markup: 0.30,
+    limit: 1000,
+    hours: 2,
+    mostHours: 12,
+    idleMinutes: 30,
+    startMinutes: 20,
+    warnMinutes: 5,
+    atOnce: 1,
+    reserve: 200
+};
+const RENTAL_ENDS = {
+    asked: 'you ended it',
+    limit: 'it reached its spending limit',
+    time: 'it reached its time limit',
+    idle: 'nothing had run on it for a while',
+    failed: 'it could not be started',
+    gone: 'the machine stopped at Hyperstack'
+};
+const MINUTE_MS = 60000;
+const holdOf = (rental) => `rental:${rental.id}`;
+const cardName = (card) => `${card.count > 1 ? `${card.count} x ` : ''}${card.gpu}`;
+
+export const rentalsOn = () => billingOn() && hyperstackReady();
+export const rentalPrice = (cost) => Math.ceil(cost * (1 + RENTAL_RULES.markup));
+
+// What a rental has cost its person so far: whole minutes from the moment the machine was running at Hyperstack,
+// never more than was set aside, and nothing for a machine that never became one of their computers.
+export const rentalSpent = (rental, until = new Date()) => {
+    if (!rental.readyAt || !rental.linkedAt) return 0;
+    const minutes = Math.max(1, Math.ceil((new Date(until) - rental.readyAt) / MINUTE_MS));
+    return Math.min(rental.limit, Math.ceil(minutes * rental.price / 60));
+};
+
+const presentRental = (rental) => {
+    const until = rental.endingAt || new Date();
+    const spent = rental.state === 'ended' || rental.state === 'ending' ? rental.spent : rentalSpent(rental, until);
+    return {
+        id: rental.id,
+        state: rental.state,
+        card: { flavor: rental.card.flavor, gpu: rental.card.gpu, count: rental.card.count, memoryMb: rental.card.memoryMb, name: cardName(rental.card) },
+        device: rental.device ? String(rental.device) : null,
+        price: rental.price,
+        limit: rental.limit,
+        minutes: rental.minutes,
+        idleMinutes: rental.idleMinutes,
+        spent,
+        startedAt: rental.createdAt,
+        readyAt: rental.readyAt,
+        linkedAt: rental.linkedAt,
+        endsAt: rental.readyAt ? new Date(rental.readyAt.getTime() + rental.minutes * MINUTE_MS) : null,
+        endedAt: rental.endedAt,
+        reason: rental.reason,
+        why: rental.reason ? RENTAL_ENDS[rental.reason] : null,
+        detail: rental.detail
+    };
+};
+
+const tellRenter = (rental, type, level, message) => getNotificationService().notify(rental.user, type, {
+    level, title: `Rented ${cardName(rental.card)}`, message, path: '/devices', rental: rental.id
+});
+const lastOwnerNotice = new Map();
+const tellOwners = (type, message) => {
+    if (Date.now() - (lastOwnerNotice.get(type) || 0) < 60 * MINUTE_MS) return;
+    lastOwnerNotice.set(type, Date.now());
+    getNotificationService().notifyRole('OWNER', type, { level: 'warning', title: 'Rented computers', message, path: '/devices' });
+};
+
+const refuseRental = (res, status, code, message, extra = {}) => res.status(status).json({ success: false, code, message, ...extra });
+
+// What Mollama may still owe Hyperstack for the rentals that are open: each one's cost to the end of its time or money.
+const stillOwed = (rentals) => rentals.reduce((sum, rental) => {
+    const hours = Math.min(rental.minutes / 60, rental.limit / rental.price);
+    const used = rental.readyAt ? (Date.now() - rental.readyAt) / (60 * MINUTE_MS) : 0;
+    return sum + Math.max(0, hours - used) * rental.cost;
+}, 0);
+
+export const listRentalCards = asyncHandler(async (req, res) => {
+    if (!rentalsOn()) return res.status(200).json({ success: true, on: false });
+    try {
+        const [cards, totals] = await Promise.all([hyperstack.cards(), balanceOf(req.user.id)]);
+        return res.status(200).json({
+            success: true,
+            on: true,
+            cards: cards.map((card) => ({ flavor: card.flavor, name: cardName(card), gpu: card.gpu, count: card.count, memoryMb: card.memoryMb, cpu: card.cpu, ramGb: card.ramGb, diskGb: card.diskGb, price: rentalPrice(card.cost) })),
+            rules: { limit: RENTAL_RULES.limit, hours: RENTAL_RULES.hours, mostHours: RENTAL_RULES.mostHours, idleMinutes: RENTAL_RULES.idleMinutes, atOnce: RENTAL_RULES.atOnce },
+            balance: totals.balance
+        });
+    } catch (error) {
+        logger.warn('[Rental] The cards could not be read', { message: error.message });
+        return refuseRental(res, 502, 'HYPERSTACK_DOWN', 'The cards for rent could not be read just now. Try again in a minute.');
+    }
+});
+
+export const listRentals = asyncHandler(async (req, res) => {
+    if (!rentalsOn()) return res.status(200).json({ success: true, on: false, rentals: [] });
+    const [open, ended] = await Promise.all([
+        Rental.find({ service: SERVICE, user: req.user.id, state: { $ne: 'ended' } }).sort({ createdAt: -1 }),
+        Rental.find({ service: SERVICE, user: req.user.id, state: 'ended' }).sort({ createdAt: -1 }).limit(10)
+    ]);
+    return res.status(200).json({ success: true, on: true, rentals: [...open, ...ended].map(presentRental) });
+});
+
+export const startRental = asyncHandler(async (req, res) => {
+    if (!rentalsOn()) return refuseRental(res, 404, 'RENTALS_OFF', 'Renting is not set up');
+    const user = req.user.id;
+    const open = { service: SERVICE, user, state: { $ne: 'ended' } };
+    if (await Rental.countDocuments(open) >= RENTAL_RULES.atOnce) {
+        return refuseRental(res, 409, 'ALREADY_RENTING', 'You already have a rented computer. End it before renting another.');
+    }
+
+    let card;
+    let funds;
+    try {
+        [card, funds] = await Promise.all([hyperstack.cards().then((cards) => cards.find((one) => one.flavor === req.body.flavor)), hyperstack.credit()]);
+    } catch (error) {
+        logger.warn('[Rental] Hyperstack could not be asked', { message: error.message });
+        return refuseRental(res, 502, 'HYPERSTACK_DOWN', 'The card could not be rented just now. Nothing was charged.');
+    }
+    if (!card) return refuseRental(res, 404, 'CARD_GONE', 'That card is not free to rent right now. Choose another.');
+
+    const price = rentalPrice(card.cost);
+    const hours = Math.min(req.body.hours || RENTAL_RULES.hours, RENTAL_RULES.mostHours);
+    const limit = req.body.limit || RENTAL_RULES.limit;
+    if (limit < price) return refuseRental(res, 400, 'LIMIT_TOO_SMALL', `The spending limit must cover one hour: at least ${money(price)}.`, { least: price });
+    const { balance } = await balanceOf(user);
+    if (balance < limit) return refuseRental(res, 402, 'NOT_ENOUGH_CREDIT', `You have ${money(balance)} of credit and this sets aside ${money(limit)}. Add credit first.`, { balance, limit });
+
+    // Mollama pays Hyperstack before its customers pay Mollama, so a rental starts only if Mollama's own balance
+    // there covers every open rental to its end and this one too.
+    const owed = stillOwed(await Rental.find({ service: SERVICE, state: { $ne: 'ended' } }));
+    const need = Math.min(hours, limit / price) * card.cost;
+    if (!funds.canCreate || funds.credit - owed - need < RENTAL_RULES.reserve) {
+        logger.warn('[Rental] Refused: Mollama\'s balance at Hyperstack is too low', { credit: funds.credit, owed: Math.round(owed), need: Math.round(need) });
+        tellOwners('rental:funds', `A rental was refused because Mollama's balance at Hyperstack is low (${money(funds.credit)} left).`);
+        return refuseRental(res, 503, 'RENTALS_PAUSED', 'No more computers can be rented right now. Nothing was charged. Try again later.');
+    }
+
+    // Two requests at the same moment both pass the count above, so each open rental takes one of its person's
+    // places, and the database lets a place be taken once.
+    await Rental.init();
+    const id = new mongoose.Types.ObjectId();
+    let rental = null;
+    for (let slot = 0; slot < RENTAL_RULES.atOnce && !rental; slot += 1) {
+        rental = await Rental.create({
+            _id: id, user, slot, price, cost: card.cost, limit, minutes: hours * 60, idleMinutes: RENTAL_RULES.idleMinutes,
+            card: { flavor: card.flavor, gpu: card.gpu, count: card.count, memoryMb: card.memoryMb, region: card.region },
+            machine: { name: `${machinePrefix()}${id}` }
+        }).catch((error) => {
+            if (error?.code !== 11000) throw error;
+            return null;
+        });
+    }
+    if (!rental) return refuseRental(res, 409, 'ALREADY_RENTING', 'You already have a rented computer. End it before renting another.');
+    const drop = async () => Rental.deleteOne({ _id: rental._id });
+    try {
+        await setAside(user, limit, holdOf(rental), `${cardName(card)} rented: up to ${money(limit)} set aside`);
+    } catch (error) {
+        await drop();
+        if (error instanceof BillingError) return refuseRental(res, error.statusCode, error.code, error.message);
+        throw error;
+    }
+
+    const key = crypto.randomBytes(32).toString('hex');
+    const device = await Device.create({
+        name: `Rented ${cardName(card)}`, kind: 'companion', hostname: `${user}:rented-${rental.id}`, registeredBy: user, keyHash: hashKey(key), rental: rental._id
+    });
+    rental.device = device._id;
+    try {
+        const socket = `${process.env.RENTAL_SERVER_URL.replace(/^http/, 'ws').replace(/[/]+$/, '')}/devices`;
+        rental.machine.id = await hyperstack.create({ name: rental.machine.name, flavor: card.flavor, script: machineScript({ socket, deviceId: device.id, key }) });
+        await rental.save();
+    } catch (error) {
+        logger.warn('[Rental] The machine could not be started', { rental: rental.id, message: error.message });
+        // The machine may exist all the same, so the rental is ended the careful way: nothing is given back until it is gone.
+        await rental.save();
+        await beginRentalEnd(rental, 'failed', error instanceof HyperstackError ? error.message : null);
+        return refuseRental(res, 502, 'RENT_FAILED', 'The computer could not be started. Nothing was charged.', { rental: presentRental(rental) });
+    }
+    logger.info('[Rental] Started', { rental: rental.id, user: String(user), flavor: card.flavor, price, limit });
+    getNotificationService().sendToUser(String(user), { type: 'device:changed', data: { deviceId: device.id, online: false } });
+    return res.status(201).json({ success: true, rental: presentRental(rental) });
+});
+
+// A rental ends in two steps. First it is marked as ending, its charge is fixed and its replies are ended; then the
+// machine is deleted, again and again if need be, and only when Hyperstack no longer knows it is the unused credit
+// given back and the rental shown as ended.
+const finishRental = async (rental) => {
+    try {
+        if (!rental.machine.id) {
+            const found = (await hyperstack.list()).find((machine) => machine.name === rental.machine.name);
+            if (found) rental.machine.id = found.id;
+            // A machine whose start was never answered may still appear, so its absence is believed only after a while.
+            else if (Date.now() - rental.createdAt < 3 * MINUTE_MS) return false;
+        }
+        if (rental.machine.id && await hyperstack.state(rental.machine.id) !== 'GONE') {
+            rental.deleteTries += 1;
+            await rental.save();
+            if (rental.deleteTries % 10 === 0) tellOwners('rental:stuck', `A rented machine (${rental.machine.name}) has not gone after ${rental.deleteTries} tries to delete it. Check it at Hyperstack.`);
+            await hyperstack.remove(rental.machine.id);
+            return false;
+        }
+    } catch (error) {
+        logger.warn('[Rental] The machine is not confirmed gone yet', { rental: rental.id, tries: rental.deleteTries, message: error.message });
+        await rental.save().catch(() => {});
+        return false;
+    }
+
+    await settle(rental.user, holdOf(rental), rental.spent, `${cardName(rental.card)} rented: ${money(rental.spent)} used, the rest returned`);
+    if (rental.device) {
+        await Device.deleteOne({ _id: rental.device, service: SERVICE });
+        deviceGateway.disconnect(rental.device);
+        getNotificationService().sendToUser(String(rental.user), { type: 'device:changed', data: { deviceId: String(rental.device), online: false } });
+    }
+    rental.state = 'ended';
+    rental.slot = undefined;
+    rental.endedAt = new Date();
+    await rental.save();
+    logger.info('[Rental] Ended', { rental: rental.id, reason: rental.reason, spent: rental.spent });
+    tellRenter(rental, 'rental:ended', rental.reason === 'asked' ? 'info' : 'warning',
+        `It has ended because ${RENTAL_ENDS[rental.reason]}. It cost ${money(rental.spent)}; ${money(rental.limit - rental.spent)} is back in your credit.`);
+    return true;
+};
+
+const beginRentalEnd = async (rental, reason, detail = null) => {
+    if (rental.state === 'ended') return true;
+    if (rental.state !== 'ending') {
+        rental.state = 'ending';
+        rental.endingAt = new Date();
+        rental.reason = reason;
+        rental.detail = detail;
+        rental.spent = rentalSpent(rental, rental.endingAt);
+        await rental.save();
+        if (rental.device) await endReplies(repliesOn(rental.device), { code: 'RENTAL_ENDED', detail: `It ended because ${RENTAL_ENDS[reason]}.` });
+    }
+    return finishRental(rental);
+};
+
+export const endRental = asyncHandler(async (req, res) => {
+    const rental = await Rental.findOne({ _id: req.params.id, service: SERVICE, user: req.user.id });
+    if (!rental) return refuseRental(res, 404, 'NO_SUCH_RENTAL', 'Rental not found');
+    await beginRentalEnd(rental, 'asked');
+    return res.status(200).json({ success: true, rental: presentRental(rental) });
+});
+
+const markRentalLinked = async (rental) => {
+    if (rental.linkedAt || rental.state !== 'starting') return;
+    rental.linkedAt = new Date();
+    rental.activeAt = rental.linkedAt;
+    rental.readyAt = rental.readyAt || rental.linkedAt;
+    rental.state = 'running';
+    await rental.save();
+    tellRenter(rental, 'rental:ready', 'success', 'It is ready. Download a model onto it from the Models page, then choose it in a chat.');
+};
+deviceGateway.on('online', async (deviceId) => {
+    try {
+        const rental = await Rental.findOne({ service: SERVICE, device: deviceId, state: 'starting' });
+        if (rental) await markRentalLinked(rental);
+    } catch (error) {
+        logger.warn('[Rental] A rented computer came online but could not be marked', { deviceId: String(deviceId), error: error.message });
+    }
+});
+
+const watchRental = async (rental, { alone }) => {
+    if (rental.state === 'ending') return finishRental(rental);
+    const now = Date.now();
+    let status = null;
+    try {
+        if (rental.machine.id) status = await hyperstack.state(rental.machine.id);
+    } catch {
+        // The limits below run on this server's own clock, so they hold while Hyperstack cannot be asked.
+    }
+    if (status === 'ACTIVE' && !rental.readyAt) rental.readyAt = new Date();
+    if (!alone && rental.device && deviceGateway.isOnline(rental.device)) await markRentalLinked(rental);
+
+    if (status === 'GONE' || status === 'ERROR') return beginRentalEnd(rental, rental.linkedAt ? 'gone' : 'failed');
+    if (!rental.linkedAt) {
+        if (now - rental.createdAt > RENTAL_RULES.startMinutes * MINUTE_MS) return beginRentalEnd(rental, 'failed', `It was not ready within ${RENTAL_RULES.startMinutes} minutes.`);
+        if (rental.isModified()) await rental.save();
+        return false;
+    }
+
+    const busy = (!alone && repliesOn(rental.device).length > 0) || Boolean(await Download.exists({ service: SERVICE, device: rental.device, status: 'downloading' }));
+    if (busy) rental.activeAt = new Date();
+    const left = {
+        limit: (rental.limit - rentalSpent(rental)) / rental.price * 60,
+        time: rental.minutes - (now - rental.readyAt) / MINUTE_MS,
+        idle: rental.idleMinutes - (now - rental.activeAt) / MINUTE_MS
+    };
+    const [why, minutes] = Object.entries(left).sort((a, b) => a[1] - b[1])[0];
+    if (rentalSpent(rental) >= rental.limit) return beginRentalEnd(rental, 'limit');
+    if (left.time <= 0) return beginRentalEnd(rental, 'time');
+    if (left.idle <= 0) return beginRentalEnd(rental, 'idle', `Nothing had run on it for ${rental.idleMinutes} minutes.`);
+    if (minutes <= RENTAL_RULES.warnMinutes && !rental.warned.includes(why)) {
+        rental.warned.push(why);
+        tellRenter(rental, 'rental:ending', 'warning', why === 'idle'
+            ? `Nothing is running on it, so it ends in about ${Math.max(1, Math.round(minutes))} minutes.`
+            : `It ends in about ${Math.max(1, Math.round(minutes))} minutes: it is near its ${why === 'time' ? 'time' : 'spending'} limit.`);
+    }
+    if (rental.isModified()) await rental.save();
+    return false;
+};
+
+// A machine with this server's name mark that no open rental knows about is deleted, whoever started it.
+export const sweepRentals = async () => {
+    const machines = await hyperstack.list();
+    let swept = 0;
+    for (const machine of machines) {
+        if (machine.status === 'DELETING') continue;
+        const id = machine.name.slice(machinePrefix().length);
+        const rental = mongoose.isValidObjectId(id) ? await Rental.findOne({ _id: id, service: SERVICE }) : null;
+        if (rental && rental.state !== 'ended') {
+            if (!rental.machine.id) await Rental.updateOne({ _id: rental._id }, { 'machine.id': machine.id });
+            continue;
+        }
+        logger.warn('[Rental] Deleting a machine no rental knows about', { machine: machine.name, id: machine.id });
+        tellOwners('rental:swept', `A machine with no rental (${machine.name}) was found at Hyperstack and deleted.`);
+        await hyperstack.remove(machine.id).catch((error) => logger.warn('[Rental] The machine could not be deleted', { machine: machine.name, message: error.message }));
+        swept += 1;
+    }
+    return swept;
+};
+
+// What Mollama expected Hyperstack to bill for one day (UTC) beside what it did bill, machine by machine.
+export const compareRentals = async (day = new Date(Date.now() - 24 * 60 * MINUTE_MS).toISOString().slice(0, 10)) => {
+    const from = new Date(`${day}T00:00:00Z`);
+    const to = new Date(from.getTime() + 24 * 60 * MINUTE_MS);
+    const rentals = await Rental.find({ service: SERVICE, readyAt: { $lt: to }, 'machine.id': { $ne: null }, $or: [{ endedAt: null }, { endedAt: { $gt: from } }] });
+    let expected = 0;
+    let billed = 0;
+    let charged = 0;
+    let unknown = 0;
+    for (const rental of rentals) {
+        const start = Math.max(rental.readyAt, from);
+        const end = Math.min(rental.endedAt || new Date(), to);
+        expected += Math.max(0, end - start) / (60 * MINUTE_MS) * rental.cost;
+        if (rental.endedAt && rental.endedAt >= from && rental.endedAt < to) charged += rental.spent;
+        const theirs = await hyperstack.billed(rental.machine.id, from, to);
+        if (theirs === null) unknown += 1;
+        else billed += theirs;
+    }
+    const result = { day, rentals: rentals.length, expected: Math.round(expected), billed, charged, unknown, difference: billed - Math.round(expected) };
+    result.matches = unknown === 0 && Math.abs(result.difference) <= Math.max(100, result.expected * 0.1);
+    return result;
+};
+export const getRentalComparison = asyncHandler(async (req, res) => {
+    if (!rentalsOn()) return refuseRental(res, 404, 'RENTALS_OFF', 'Renting is not set up');
+    return res.status(200).json({ success: true, ...await compareRentals(req.query.day) });
+});
+
+let comparedDay = null;
+let watching = false;
+// One pass over every open rental, then the sweep, then once a day the comparison with Hyperstack's bill.
+// alone: run without the server (watch.js), where nothing is known of who is connected or what is being written.
+export const watchRentals = async ({ alone = false } = {}) => {
+    if (!rentalsOn() || watching) return null;
+    watching = true;
+    const report = { seen: 0, ended: 0, swept: 0 };
+    try {
+        for (const rental of await Rental.find({ service: SERVICE, state: { $ne: 'ended' } })) {
+            report.seen += 1;
+            try {
+                if (await watchRental(rental, { alone })) report.ended += 1;
+            } catch (error) {
+                logger.error('[Rental] A rental could not be checked', { rental: rental.id, message: error.message });
+            }
+        }
+        report.swept = await sweepRentals().catch((error) => {
+            logger.warn('[Rental] The sweep could not run', { message: error.message });
+            return 0;
+        });
+        const yesterday = new Date(Date.now() - 24 * 60 * MINUTE_MS).toISOString().slice(0, 10);
+        if (!alone && comparedDay !== yesterday) {
+            comparedDay = yesterday;
+            const compared = await compareRentals(yesterday).catch(() => null);
+            if (compared?.rentals) logger.info('[Rental] Compared with Hyperstack\'s bill', compared);
+            if (compared?.rentals && !compared.matches) {
+                tellOwners('rental:mismatch', `Hyperstack's bill for ${yesterday} does not match: ${money(compared.expected)} expected, ${money(compared.billed)} billed${compared.unknown ? `, ${compared.unknown} machine(s) not answered` : ''}.`);
+            }
+        }
+    } finally {
+        watching = false;
+    }
+    return report;
+};

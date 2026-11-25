@@ -32,6 +32,7 @@ const CSRF_EXEMPT_ROUTES = [
     '/api/v1/auth/refresh-token',
     '/api/v1/auth/verify-email',
     '/api/v1/contact',
+    '/api/v1/billing/stripe', // Signed by Stripe
     '/health',
     '/api/v1/health'
 ];

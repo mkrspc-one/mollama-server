@@ -4,7 +4,7 @@ import * as authMiddleware from '../middleware/auth.middleware.js';
 import { RIGHTS } from '../config/rights.js';
 import { noCacheResponse } from '../middleware/cache.middleware.js';
 import { validateRequest } from '../middleware/validation.middleware.js';
-import { deviceSchemas, modelSchemas, chatSchemas, promptSchemas, guideSchemas, toolSchemas, providerSchemas, skillSchemas, trainingSchemas } from '../models/ai.model.js';
+import { deviceSchemas, modelSchemas, chatSchemas, promptSchemas, guideSchemas, toolSchemas, providerSchemas, skillSchemas, trainingSchemas, rentalSchemas } from '../models/ai.model.js';
 
 const router = Router();
 
@@ -22,6 +22,10 @@ router.validRoutes = [
     '/api/v1/trainings/models',
     '/api/v1/trainings/:id',
     '/api/v1/trainings/:id/stop',
+    '/api/v1/rentals',
+    '/api/v1/rentals/cards',
+    '/api/v1/rentals/compare',
+    '/api/v1/rentals/:id/end',
     '/api/v1/devices/pools/check',
     '/api/v1/devices/:id/pool',
     '/api/v1/devices/:id/pause',
@@ -194,5 +198,11 @@ router.post('/trainings/plan', ...signedIn, validateRequest(trainingSchemas.plan
 router.post('/trainings', ...signedIn, validateRequest(trainingSchemas.start), aiController.startTraining);
 router.post('/trainings/:id/stop', ...signedIn, withTrainingId, aiController.stopTraining);
 router.delete('/trainings/:id', ...signedIn, withTrainingId, aiController.removeTraining);
+
+router.get('/rentals', ...signedIn, aiController.listRentals);
+router.get('/rentals/cards', ...signedIn, aiController.listRentalCards);
+router.get('/rentals/compare', ...signedIn, authMiddleware.checkPermission(RIGHTS.MANAGE_ALL_USERS), validateRequest(rentalSchemas.compare, 'query'), aiController.getRentalComparison);
+router.post('/rentals', ...signedIn, validateRequest(rentalSchemas.start), aiController.startRental);
+router.post('/rentals/:id/end', ...signedIn, validateRequest(rentalSchemas.rentalId, 'params'), aiController.endRental);
 
 export default router;

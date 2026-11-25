@@ -592,6 +592,12 @@ const requestTimeout = (timeoutMs = 30000) => {
     };
 };
 
+// A signed message is checked against the bytes that were sent, so those are kept.
+const SIGNED_BODY_ROUTES = ['/api/v1/billing/stripe'];
+const keepSignedBody = (req, res, buffer) => {
+    if (SIGNED_BODY_ROUTES.includes(req.originalUrl.split('?')[0])) req.rawBody = Buffer.from(buffer);
+};
+
 /**
  * Setup all middleware for the application
  * @param {Object} app - Express application
@@ -617,7 +623,7 @@ const setupMiddleware = async (app) => {
         if (contentType.startsWith('multipart/form-data')) {
             return next();
         }
-        return express.json({limit: maxRequestSize})(req, res, next);
+        return express.json({limit: maxRequestSize, verify: keepSignedBody})(req, res, next);
     });
     app.use(express.urlencoded({extended: true, limit: maxRequestSize})); // Parses URL-encoded data with size limit
 
