@@ -6,6 +6,8 @@ import CreditLine, {BILLING_SERVICE} from '../models/billing.model.js';
 import User from '../models/user.model.js';
 
 const STRIPE_API = 'https://api.stripe.com/v1';
+// Asked for by name, so a later version of Stripe's API changes nothing here until this line does.
+const STRIPE_VERSION = '2026-11-18.endive';
 const SIGNATURE_AGE_SECONDS = 300;
 const WRITE_TRIES = 12;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -196,6 +198,7 @@ const askStripe = async (path, fields, onceKey) => {
             headers: {
                 Authorization: `Bearer ${process.env.STRIPE_SECRET_KEY}`,
                 'Content-Type': 'application/x-www-form-urlencoded',
+                'Stripe-Version': STRIPE_VERSION,
                 ...(onceKey ? {'Idempotency-Key': onceKey} : {})
             },
             body: formFields(fields).toString(),
@@ -283,7 +286,7 @@ const startCheckout = guarded(async (req, res) => {
         cancel_url: `${process.env.APP_URL}/billing?paid=no`,
         client_reference_id: user.id,
         customer_email: user.email,
-        payment_method_types: ['card'],
+        allowed_payment_method_types: ['card'],
         line_items: [{
             quantity: 1,
             price_data: {
