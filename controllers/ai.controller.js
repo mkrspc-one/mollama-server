@@ -7597,10 +7597,103 @@ const runChatTool = async (tool, input, { chat, userId, write, stopped, show, ke
 // sandbox is used. The server checks the lessons, keeps the record of each run and passes on what the app reports.
 // Settings are what was measured on a 0.5B model on an 8 GB card (2026-11-25): a small adapter teaches habits and
 // damages nothing, a large one at full precision teaches facts at some cost to what the model knew.
+// Any chat model on Hugging Face can be trained, if it is in its makers' original form and fits the computer. These are
+// only the ones suggested first; `tried` marks what has been through the whole run.
 export const TRAIN_BASES = [
-    { id: 'qwen2.5:0.5b', source: 'Qwen/Qwen2.5-0.5B-Instruct', label: 'Qwen2.5 0.5B', downloadMb: 950, gpuMb: { habits: 4000, facts: 5000 }, tried: true },
-    { id: 'qwen2.5:1.5b', source: 'Qwen/Qwen2.5-1.5B-Instruct', label: 'Qwen2.5 1.5B', downloadMb: 3100, gpuMb: { habits: 6000, facts: 7500 }, tried: false }
+    { source: 'Qwen/Qwen2.5-0.5B-Instruct', label: 'Qwen2.5 0.5B', tried: true },
+    { source: 'Qwen/Qwen2.5-1.5B-Instruct', label: 'Qwen2.5 1.5B', tried: false },
+    { source: 'HuggingFaceTB/SmolLM2-1.7B-Instruct', label: 'SmolLM2 1.7B', tried: false },
+    { source: 'microsoft/Phi-4-mini-instruct', label: 'Phi-4 mini 3.8B', tried: false },
+    { source: 'Qwen/Qwen2.5-7B-Instruct', label: 'Qwen2.5 7B', tried: false },
+    { source: 'deepseek-ai/DeepSeek-R1-Distill-Qwen-7B', label: 'DeepSeek R1 7B', tried: false }
 ];
+// A model's facts are read from Hugging Face's own public page for it: a fixed address that takes no key, to which only
+// the model's name is sent.
+let trainFetch = null;
+const trainFacts = new Map();
+export const setTrainFetch = (custom = null) => {
+    trainFetch = custom;
+    trainFacts.clear();
+};
+export const trainBase = async (given) => {
+    const name = String(given ?? '').trim().replace(/^https?:\/\/huggingface\.co\//i, '').replace(/\/+$/, '');
+    if (!/^[\w.-]{1,96}\/[\w.-]{1,96}$/.test(name)) return { problem: 'Name the model as it is on Hugging Face: its maker, a slash and its name, such as Qwen/Qwen2.5-7B-Instruct.' };
+    const held = trainFacts.get(name.toLowerCase());
+    if (held && Date.now() - held.at < 10 * 60 * 1000) return held.facts;
+    let reply;
+    let said = null;
+    try {
+        reply = await (trainFetch || fetch)(`https://huggingface.co/api/models/${name}`, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(12000) });
+        said = await reply.json().catch(() => null);
+    } catch {
+        return { problem: 'Hugging Face could not be reached to look the model up. Try again in a moment.' };
+    }
+    const suggested = TRAIN_BASES.find((one) => one.source.toLowerCase() === name.toLowerCase());
+    const facts = [401, 404].includes(reply.status) || !said?.id ? { problem: `There is no model called ${name} on Hugging Face. Copy its name from its page there.` }
+        : said.gated ? { problem: `${said.id} can be downloaded only after agreeing to its makers' terms on Hugging Face, which Mollama cannot do for you yet. Choose a model without that step.` }
+            : ['image-text-to-text', 'any-to-any', 'audio-text-to-text'].includes(said.pipeline_tag) ? { problem: `${said.id} also takes pictures or sound, and training a model of that kind is not built yet. Choose one that works with text alone.` }
+            : said.pipeline_tag !== 'text-generation' || !(said.safetensors?.total > 0) ? { problem: `${said.id} is not a chat model in the form training needs. Choose its makers' original, not a converted copy (GGUF, MLX or ONNX).` }
+                : { source: said.id, label: suggested?.label || said.id.split('/')[1], parameters: said.safetensors.total, licence: typeof said.cardData?.license === 'string' ? said.cardData.license : null, tried: Boolean(suggested?.tried) };
+    trainFacts.delete(name.toLowerCase());
+    trainFacts.set(name.toLowerCase(), { facts, at: Date.now() });
+    if (trainFacts.size > 200) trainFacts.delete(trainFacts.keys().next().value);
+    return facts;
+};
+// What a run takes of a computer: graphics memory to train (measured on a 0.5B model here, and Soup's own table for
+// larger ones), system memory to make the result one file, and disk for the model as its makers publish it.
+export const trainNeeds = (parameters, kind) => {
+    const billions = parameters / 1e9;
+    return {
+        gpuMb: Math.round(kind === 'facts' ? Math.max(3500, billions * 2200 + 2400) : Math.max(2800, billions * 670 + 1100)),
+        memoryMb: Math.round(billions * 3000 + 2000),
+        downloadMb: Math.round(billions * 2000 + 100)
+    };
+};
+// Where a run happens: one of a person's own computers today. A rented graphics card will be another such place, with
+// its own card and memory, so nothing below asks for a computer, only for these numbers.
+const trainPlace = (device) => ({ ...trainingReady(device), memoryMb: device.hardware?.memoryMb || 0 });
+// Whether a place can take that run, and if not, what it lacks, in its numbers.
+const trainFit = (place, base, kind) => {
+    const state = place;
+    const device = { hardware: { memoryMb: place.memoryMb } };
+    const needs = trainNeeds(base.parameters, kind);
+    const gbOf = (mb) => `${Math.max(1, Math.round(mb / 1024))} GB`;
+    const size = `${(base.parameters / 1e9).toFixed(1).replace(/\.0$/, '')}B`;
+    if (!state.ready) return { fits: false, needs, lacks: 'place', reason: state.reason };
+    if (state.gpuMb && state.gpuMb < needs.gpuMb) return { fits: false, needs, lacks: 'card', reason: `${base.label} (${size}) needs about ${gbOf(needs.gpuMb)} on the graphics card to learn ${TRAIN_KINDS[kind].label.toLowerCase()}, and this computer's has ${gbOf(state.gpuMb)}.${kind === 'facts' && state.gpuMb >= trainNeeds(base.parameters, 'habits').gpuMb ? ' It would fit as Habits.' : ' Choose a smaller model.'}` };
+    if (device.hardware?.memoryMb && device.hardware.memoryMb < needs.memoryMb) return { fits: false, needs, lacks: 'memory', reason: `${base.label} (${size}) needs about ${gbOf(needs.memoryMb)} of memory to be made into one file at the end, and this computer has ${gbOf(device.hardware.memoryMb)}. Choose a smaller model.` };
+    return { fits: true, needs, lacks: null, reason: null };
+};
+// The model a downloaded one was made from, on Hugging Face: worked out from what its file says about itself, in the
+// order of how sure each clue is. One is taken only when Hugging Face counts the same number of parameters.
+const TRAIN_MAKERS = [[/^deepseek/i, 'deepseek-ai'], [/^(qwen|qwq)/i, 'Qwen'], [/^phi/i, 'microsoft'], [/^smollm/i, 'HuggingFaceTB'], [/^(mistral|mixtral|ministral|codestral)/i, 'mistralai'], [/^gemma/i, 'google'], [/^(meta-)?llama/i, 'meta-llama'], [/^granite/i, 'ibm-granite'], [/^tinyllama/i, 'TinyLlama']];
+export const trainCandidates = (info = {}) => {
+    const of = (key) => (typeof info?.[`general.${key}`] === 'string' ? info[`general.${key}`].trim() : '');
+    const repo = (address) => address.match(/^https?:\/\/huggingface\.co\/([\w.-]+\/[\w.-]+)/i)?.[1] || null;
+    const found = [];
+    const add = (name) => { if (name && /^[\w.-]+\/[\w.-]+$/.test(name) && !found.includes(name)) found.push(name); };
+    add(repo(of('license.link')));
+    const base = repo(of('base_model.0.repo_url'));
+    const finetune = of('finetune').replace(/\s+/g, '-');
+    if (base && finetune) add(`${base}-${finetune}`);
+    const basename = of('basename').replace(/\s+/g, '-');
+    const stem = [basename, of('size_label'), finetune].filter(Boolean).join('-');
+    const makers = [of('organization'), of('base_model.0.organization'), ...TRAIN_MAKERS.filter(([family]) => family.test(basename)).map(([, maker]) => maker)].filter(Boolean).map((maker) => maker.replace(/\s+/g, '-'));
+    if (basename) for (const maker of makers) add(`${maker}/${stem}`);
+    add(base);
+    return found.slice(0, 5);
+};
+const trainOrigin = async (info) => {
+    const count = Number(info?.['general.parameter_count']) || 0;
+    let terms = null;
+    for (const candidate of trainCandidates(info)) {
+        const facts = await trainBase(candidate);
+        if (!facts.problem && (!count || Math.abs(facts.parameters - count) / count < 0.02)) return facts;
+        if (facts.problem && /agreeing to its makers/.test(facts.problem)) terms = terms || { problem: facts.problem, lacks: 'terms' };
+        if (facts.problem && /pictures or sound/.test(facts.problem)) terms = terms || { problem: facts.problem, lacks: 'kind' };
+    }
+    return terms || { problem: 'Mollama could not find where this model\'s original is published. If you know its page on Hugging Face, name it under "Bring another model".', lacks: 'origin' };
+};
 export const TRAIN_KINDS = {
     habits: { label: 'Habits', about: 'How to behave and what shape to answer in. Fast, and what the model knew stays whole.', r: 64, alpha: 64, quantization: '4bit', updates: 150 },
     facts: { label: 'Facts', about: 'Things to know. Learns far more, and may cost a little of what the model knew: check the score.', r: 256, alpha: 256, quantization: 'none', updates: 350 }
@@ -7678,7 +7771,7 @@ export const trainSettings = (lessons, kind) => {
 // What each desktop app last said about training on its computer, kept in memory like its pooling state.
 const trainKits = new Map();
 const presentTraining = (job) => ({
-    id: job.id, device: String(job.device), name: job.name, base: job.base, kind: job.kind, lessons: job.lessons, status: job.status, stage: job.stage, percent: job.percent, loss: job.loss,
+    id: job.id, where: job.where, device: String(job.device), name: job.name, base: job.base, kind: job.kind, lessons: job.lessons, status: job.status, stage: job.stage, percent: job.percent, loss: job.loss,
     before: job.before?.of ? job.before : null, after: job.after?.of ? job.after : null, seconds: job.seconds, detail: job.detail, startedAt: job.createdAt, finishedAt: job.finishedAt
 });
 const TRAIN_LIVE = ['queued', 'setting-up', 'scoring', 'training', 'saving'];
@@ -7697,7 +7790,7 @@ export const listTrainings = asyncHandler(async (req, res) => {
     const [devices, jobs] = await Promise.all([Device.find({ service: SERVICE, kind: 'companion', registeredBy: req.user.id }), Training.find({ service: SERVICE, owner: req.user.id }).sort({ createdAt: -1 }).limit(30)]);
     res.status(200).json({
         success: true,
-        bases: TRAIN_BASES.map((base) => ({ id: base.id, label: base.label, downloadMb: base.downloadMb, gpuMb: base.gpuMb, tried: base.tried })),
+        bases: TRAIN_BASES,
         kinds: Object.entries(TRAIN_KINDS).map(([id, kind]) => ({ id, label: kind.label, about: kind.about })),
         limits: { least: TRAIN_MIN_LESSONS, most: TRAIN_MAX_LESSONS },
         computers: devices.map((device) => ({ id: device.id, name: device.name, ...trainingReady(device) })),
@@ -7705,16 +7798,60 @@ export const listTrainings = asyncHandler(async (req, res) => {
     });
 });
 
+// What one model would take of one computer, for the page to say before a run is started.
+export const checkTrainingBase = asyncHandler(async (req, res) => {
+    const device = await Device.findOne({ _id: req.query.device, service: SERVICE, kind: 'companion', registeredBy: req.user.id });
+    if (!device) return res.status(404).json({ success: false, message: 'Device not found' });
+    const base = await trainBase(req.query.source);
+    if (base.problem) return res.status(200).json({ success: true, base: null, fits: false, lacks: 'origin', reason: base.problem });
+    res.status(200).json({ success: true, base, ...trainFit(trainPlace(device), base, req.query.kind) });
+});
+// Every model downloaded on one computer, with whether it can be trained there and, if not, exactly why. A model that
+// only lacks a large enough graphics card says how large a card it needs: that is what a rented one will be chosen by.
+export const listTrainable = asyncHandler(async (req, res) => {
+    const device = await Device.findOne({ _id: req.query.device, service: SERVICE, kind: 'companion', registeredBy: req.user.id });
+    if (!device) return res.status(404).json({ success: false, message: 'Device not found' });
+    const place = trainPlace(device);
+    const ollama = createOllamaClient(DEVICE_HOST, deviceGateway.fetcher(device.id));
+    let installed = [];
+    if (deviceGateway.isOnline(device.id)) {
+        try {
+            installed = ((await ollama.list()).models || []).slice(0, 60);
+        } catch {
+            installed = [];
+        }
+    }
+    const models = await Promise.all(installed.map(async (model) => {
+        const about = { name: model.name, sizeMb: Math.round((model.size || 0) / MB) };
+        let shown = null;
+        try {
+            shown = await ollama.show(model.name);
+        } catch {
+            shown = null;
+        }
+        const info = shown?.model_info || {};
+        const parameters = Number(info['general.parameter_count']) || 0;
+        if ((shown?.capabilities || []).includes('embedding') || /embed/i.test(model.name)) return { ...about, parameters, state: 'other', reason: 'This model turns text into numbers for searching. It does not chat, so there is nothing to teach it this way.' };
+        if (!shown || !parameters) return { ...about, parameters, state: 'other', reason: 'This model runs somewhere else, not from a file on this computer, so it cannot be trained here.' };
+        const origin = await trainOrigin(info);
+        if (origin.problem) return { ...about, parameters, state: origin.lacks, reason: origin.problem };
+        const fit = trainFit(place, origin, req.query.kind);
+        return { ...about, parameters, source: origin.source, licence: origin.licence, needs: fit.needs, state: fit.fits ? 'ready' : fit.lacks, reason: fit.reason, ...(fit.lacks === 'card' ? { cardMb: fit.needs.gpuMb } : {}) };
+    }));
+    res.status(200).json({ success: true, computer: { id: device.id, name: device.name, ready: place.ready, reason: place.reason, gpuMb: place.gpuMb || 0, memoryMb: place.memoryMb }, models });
+});
+
 export const startTraining = asyncHandler(async (req, res) => {
     const refuse = (status, code, message) => res.status(status).json({ success: false, code, message });
     const { device: deviceId, base: baseId, name, kind, lessons: given } = req.body;
     const device = await Device.findOne({ _id: deviceId, service: SERVICE, kind: 'companion', registeredBy: req.user.id });
     if (!device) return res.status(404).json({ success: false, message: 'Device not found' });
-    const base = TRAIN_BASES.find((one) => one.id === baseId);
-    if (!base) return refuse(400, 'TRAIN_BASE_UNKNOWN', 'Choose one of the models that can be trained.');
     const state = trainingReady(device);
     if (!state.ready) return refuse(409, 'TRAIN_NOT_READY', state.reason);
-    if (state.gpuMb && state.gpuMb < base.gpuMb[kind]) return refuse(409, 'TRAIN_TOO_LARGE', `${base.label} needs about ${Math.round(base.gpuMb[kind] / 1024)} GB on the graphics card to learn ${TRAIN_KINDS[kind].label.toLowerCase()}, and this computer's has ${Math.round(state.gpuMb / 1024)} GB. Choose a smaller model.`);
+    const base = await trainBase(baseId);
+    if (base.problem) return refuse(400, 'TRAIN_BASE_UNKNOWN', base.problem);
+    const fit = trainFit(trainPlace(device), base, kind);
+    if (!fit.fits) return refuse(409, 'TRAIN_TOO_LARGE', fit.reason);
     const read = readLessons(given);
     if (read.problem) return refuse(400, 'TRAIN_LESSONS', read.problem);
     if (await Training.exists({ service: SERVICE, device: device.id, status: { $in: TRAIN_LIVE } })) return refuse(409, 'TRAIN_BUSY', 'This computer is already training a model. Wait for it, or stop it.');
@@ -7726,13 +7863,14 @@ export const startTraining = asyncHandler(async (req, res) => {
     }
     if (installed.some((model) => model.name === `${name}:latest` || model.name === name)) return refuse(409, 'TRAIN_NAME_TAKEN', `This computer already has a model called ${name}. Choose another name.`);
     const settings = trainSettings(read.lessons, kind);
-    const job = await Training.create({ owner: req.user.id, device: device.id, name, base: base.id, kind, lessons: read.lessons.length, status: 'queued', stage: 'Waiting for the computer' });
+    const job = await Training.create({ owner: req.user.id, device: device.id, name, base: base.source, kind, lessons: read.lessons.length, status: 'queued', stage: 'Waiting for the computer' });
     // The lessons to ask again afterwards, spread over the whole set: how many the model can give back.
     const every = Math.max(1, Math.floor(read.lessons.length / 20));
     const probes = read.lessons.filter((row, at) => at % every === 0).slice(0, 20).map((row) => ({ messages: row.slice(0, -1), answer: row.at(-1).content }));
     const sent = deviceGateway.order(device.id, {
         type: 'train', action: 'run',
-        job: { id: job.id, name, base: base.id, source: base.source, settings, lessons: read.lessons, probes, ordinary: TRAIN_ORDINARY, control: TRAIN_CONTROL.map(([question, must]) => ({ question, must })) }
+        // A larger model is made smaller at the end (4 bits), as Ollama's own are, so it runs where it was trained.
+        job: { id: job.id, name, source: base.source, shrink: base.parameters > 2e9, settings, lessons: read.lessons, probes, ordinary: TRAIN_ORDINARY, control: TRAIN_CONTROL.map(([question, must]) => ({ question, must })) }
     });
     if (!sent) {
         await Training.updateOne({ _id: job.id }, { status: 'failed', detail: 'The computer went offline before the training reached it.', finishedAt: new Date() });

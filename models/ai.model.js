@@ -437,6 +437,8 @@ const trainScoreSchema = new mongoose.Schema({
 const trainingSchema = new mongoose.Schema({
     service: { type: String, default: SERVICE, immutable: true, index: true },
     owner: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+    // Where it runs: one of the person's computers. A rented graphics card will be the second kind.
+    where: { type: String, enum: ['computer'], default: 'computer' },
     device: { type: mongoose.Schema.Types.ObjectId, ref: 'Device', required: true },
     name: { type: String, required: true },
     base: { type: String, required: true },
@@ -455,9 +457,11 @@ const trainingSchema = new mongoose.Schema({
 export const Training = mongoose.models.Training || mongoose.model('Training', trainingSchema);
 export const trainingSchemas = {
     trainingId: Joi.object({ id: Joi.objectId().required() }),
+    base: Joi.object({ device: Joi.objectId().required(), source: Joi.string().trim().max(220).required(), kind: Joi.string().valid('habits', 'facts').default('habits') }),
+    models: Joi.object({ device: Joi.objectId().required(), kind: Joi.string().valid('habits', 'facts').default('habits') }),
     start: Joi.object({
         device: Joi.objectId().required(),
-        base: Joi.string().trim().max(60).required(),
+        base: Joi.string().trim().max(220).required(),
         name: Joi.string().trim().lowercase().pattern(/^[a-z0-9][a-z0-9-]{1,38}$/).required().messages({ 'string.pattern.base': 'Name the model with 2 to 39 small letters, digits and hyphens.' }),
         kind: Joi.string().valid('habits', 'facts').required(),
         lessons: Joi.string().max(1200000).required()

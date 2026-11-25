@@ -17,6 +17,8 @@ router.validRoutes = [
     '/api/v1/devices/:id/memory',
     '/api/v1/devices/pools',
     '/api/v1/trainings',
+    '/api/v1/trainings/base',
+    '/api/v1/trainings/models',
     '/api/v1/trainings/:id',
     '/api/v1/trainings/:id/stop',
     '/api/v1/devices/pools/check',
@@ -185,6 +187,8 @@ router.post('/providers/:id/check', ...signedIn, withProviderId, aiController.ch
 // Training a model on one of a person's own computers, run there by the desktop app.
 const withTrainingId = validateRequest(trainingSchemas.trainingId, 'params');
 router.get('/trainings', ...signedIn, aiController.listTrainings);
+router.get('/trainings/models', ...signedIn, validateRequest(trainingSchemas.models, 'query'), aiController.listTrainable);
+router.get('/trainings/base', ...signedIn, validateRequest(trainingSchemas.base, 'query'), aiController.checkTrainingBase);
 router.post('/trainings', ...signedIn, validateRequest(trainingSchemas.start), aiController.startTraining);
 router.post('/trainings/:id/stop', ...signedIn, withTrainingId, aiController.stopTraining);
 router.delete('/trainings/:id', ...signedIn, withTrainingId, aiController.removeTraining);
