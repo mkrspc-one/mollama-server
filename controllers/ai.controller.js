@@ -7639,28 +7639,64 @@ export const trainBase = async (given) => {
     if (trainFacts.size > 200) trainFacts.delete(trainFacts.keys().next().value);
     return facts;
 };
-// What a run takes of a computer: graphics memory to train (measured on a 0.5B model here, and Soup's own table for
-// larger ones), system memory to make the result one file, and disk for the model as its makers publish it.
-export const trainNeeds = (parameters, kind) => {
+// Soup's own estimate of the graphics memory a run takes at its peak (`estimate_peak_vram_gb`, soup-cli 0.78.0), read
+// off at six model sizes, in its GB: what a run takes before a lesson is read (`still`), what every 1,000 tokens read
+// in one step add (`token`, or `saved` when memory is traded for time), and what a larger adapter (`rank`, for 192
+// more) or one on every layer (`all`, at size 64) adds. On a 0.5B model it was within half a GB of five real runs here.
+const TRAIN_MEMORY = {
+    sizes: [0.5, 1.5, 3.1, 7.6, 14.8, 32.8],
+    still: { '4bit': [1.3, 2.57, 4.09, 7.34, 12.17, 22.86], '8bit': [1.41, 2.99, 5.15, 10.48, 18.83, 38.64], none: [1.64, 3.9, 7.38, 17.02, 32.46, 70.79] },
+    token: { '4bit': [4.39, 5.7, 7.33, 11.63, 14.78, 35.02], '8bit': [4.61, 6, 7.77, 12.5, 15.87, 38.36], none: [3.19, 4.19, 5.28, 7.85, 10.13, 21.32] },
+    saved: { '4bit': [2.37, 2.48, 2.6, 2.8, 2.98, 3.43], '8bit': [2.76, 3.18, 3.64, 4.62, 5.5, 9.27], none: [2.01, 2.12, 2.22, 2.38, 2.55, 2.91] },
+    rank: [0.28, 0.74, 1.11, 1.69, 2.64, 4.23],
+    all: [0.54, 0.94, 1.39, 2.46, 3.39, 8.18]
+};
+// What a run takes of a computer: graphics memory to train, system memory to make the result one file, and disk for
+// the model as its makers publish it. `how` is a run's settings, or a kind for the run usually set for it.
+export const trainNeeds = (parameters, how, longest = 0) => {
     const billions = parameters / 1e9;
+    const set = typeof how === 'string' ? { ...TRAIN_KINDS[how], batch: 8, maxLength: 256 } : how;
+    const at = (values) => {
+        const sizes = TRAIN_MEMORY.sizes;
+        const next = Math.max(1, sizes.findIndex((size, index) => size >= billions || index === sizes.length - 1));
+        return Math.max(values[0] / 2, values[next - 1] + ((values[next] - values[next - 1]) * (billions - sizes[next - 1])) / (sizes[next] - sizes[next - 1]));
+    };
+    const held = TRAIN_MEMORY.still[set.quantization] ? set.quantization : '4bit';
+    // A lesson in tokens: about four characters each, and the words the model's own format puts around it.
+    const row = longest > 0 ? Math.min(set.maxLength, Math.ceil(longest / 4) + 30) : 64;
+    const adapter = set.parts === 'all' ? (at(TRAIN_MEMORY.all) * set.r) / 64 : (at(TRAIN_MEMORY.rank) * (set.r - 64)) / 192;
+    const read = ((set.batch * row) / 1000) * at(TRAIN_MEMORY[set.checkpointing ? 'saved' : 'token'][held]) * (set.parts === 'all' ? 1.3 : 1);
     return {
-        gpuMb: Math.round(kind === 'facts' ? Math.max(3500, billions * 2200 + 2400) : Math.max(2800, billions * 670 + 1100)),
+        // With the tenth Soup keeps free before it agrees to start; its GB are thousands of millions of bytes.
+        gpuMb: Math.round((at(TRAIN_MEMORY.still[held]) + adapter + read) * 1.1 * 953.67),
         memoryMb: Math.round(billions * 3000 + 2000),
         downloadMb: Math.round(billions * 2000 + 100)
     };
 };
 // Where a run happens: one of a person's own computers today. A rented graphics card will be another such place, with
 // its own card and memory, so nothing below asks for a computer, only for these numbers.
-const trainPlace = (device) => ({ ...trainingReady(device), memoryMb: device.hardware?.memoryMb || 0 });
+// `sizes` says the place can be sent a run sized to fit its card (a desktop app that takes settings).
+const trainPlace = (device) => ({ ...trainingReady(device), memoryMb: device.hardware?.memoryMb || 0, sizes: (trainKits.get(String(device.id))?.version || 1) >= 2 });
+const roomOf = (place, base) => (place.sizes && place.gpuMb ? { parameters: base.parameters, gpuMb: place.gpuMb } : null);
 // Whether a place can take that run, and if not, what it lacks, in its numbers.
-const trainFit = (place, base, kind) => {
+const trainFit = (place, base, kind, set = null, longest = 0) => {
     const state = place;
     const device = { hardware: { memoryMb: place.memoryMb } };
-    const needs = trainNeeds(base.parameters, kind);
+    // With no run described, the one that would be set for this model at this place.
+    const how = set || trainSettings({ count: 0, longest }, kind, {}, roomOf(place, base));
+    const needs = trainNeeds(base.parameters, how, longest);
     const gbOf = (mb) => `${Math.max(1, Math.round(mb / 1024))} GB`;
     const size = `${(base.parameters / 1e9).toFixed(1).replace(/\.0$/, '')}B`;
     if (!state.ready) return { fits: false, needs, lacks: 'place', reason: state.reason };
-    if (state.gpuMb && state.gpuMb < needs.gpuMb) return { fits: false, needs, lacks: 'card', reason: `${base.label} (${size}) needs about ${gbOf(needs.gpuMb)} on the graphics card to learn ${TRAIN_KINDS[kind].label.toLowerCase()}, and this computer's has ${gbOf(state.gpuMb)}.${kind === 'facts' && state.gpuMb >= trainNeeds(base.parameters, 'habits').gpuMb ? ' It would fit as Habits.' : ' Choose a smaller model.'}` };
+    if (state.gpuMb && state.gpuMb < needs.gpuMb) {
+        const would = (change) => trainNeeds(base.parameters, { ...how, ...change }, longest).gpuMb <= state.gpuMb;
+        const way = set && how.batch > 1 && would({ batch: 1 }) ? ' It would fit reading one lesson per step.'
+            : set && !how.checkpointing && would({ batch: 1, checkpointing: true }) ? ' It would fit reading one lesson per step with "Use less graphics memory" switched on.'
+                : set && how.quantization !== '4bit' && would({ quantization: '4bit', batch: 1, checkpointing: true }) ? ' It would fit held at 4 bits.'
+                    : set && (how.r > 64 || how.parts === 'all') && would({ r: Math.min(how.r, 64), parts: 'usual', batch: 1, checkpointing: true }) ? ' It would fit with a smaller adapter on the usual two parts.'
+                    : !set && kind === 'facts' && trainFit(place, base, 'habits', null, longest).fits ? ' It would fit as Habits.' : ' Choose a smaller model.';
+        return { fits: false, needs, lacks: 'card', reason: `${base.label} (${size}) needs about ${gbOf(needs.gpuMb)} on the graphics card to learn ${TRAIN_KINDS[kind].label.toLowerCase()}, and this computer's has ${gbOf(state.gpuMb)}.${way}` };
+    }
     if (device.hardware?.memoryMb && device.hardware.memoryMb < needs.memoryMb) return { fits: false, needs, lacks: 'memory', reason: `${base.label} (${size}) needs about ${gbOf(needs.memoryMb)} of memory to be made into one file at the end, and this computer has ${gbOf(device.hardware.memoryMb)}. Choose a smaller model.` };
     return { fits: true, needs, lacks: null, reason: null };
 };
@@ -7759,19 +7795,121 @@ export const readLessons = (given) => {
     if (lessons.length > TRAIN_MAX_LESSONS) return { problem: `There are ${lessons.length.toLocaleString('en-GB')} lessons, and the most is ${TRAIN_MAX_LESSONS.toLocaleString('en-GB')}.` };
     return { lessons, unread };
 };
-// How a run is set: about the same number of updates whatever the number of lessons, and rows as long as the longest.
-export const trainSettings = (lessons, kind) => {
-    const longest = Math.max(...lessons.map((row) => row.reduce((sum, turn) => sum + turn.content.length, 0)));
-    const maxLength = [256, 512, 1024].find((size) => longest / 3 + 48 <= size) || 1024;
-    const batch = maxLength === 256 ? 8 : maxLength === 512 ? 4 : 2;
-    const rows = lessons.length + TRAIN_ORDINARY.length;
+// Every setting of a run a person may change, in the page's own names: what it is called, what it does in plain words
+// and what it may be. The desktop app turns them into the engine's (Soup's); nothing here is Soup's wording, so the
+// page and this server would not change with another engine. Left out: what Soup's own source marks "staged, not
+// enforced" (it would do nothing), and packing short lessons together (its own memory check refuses it at the usual step).
+export const TRAIN_GROUPS = [
+    { id: 'adapter', label: 'The adapter', about: 'Training does not rewrite the model. It adds a small piece beside it, the adapter, and only that piece learns.' },
+    { id: 'precision', label: 'Precision', about: 'How finely the model is held in memory while it learns.' },
+    { id: 'pace', label: 'Pace', about: 'How long it trains and how large each step is.' },
+    { id: 'lessons', label: 'Lessons', about: 'How your lessons are read.' },
+    { id: 'care', label: 'Care', about: 'Guards against a run that goes wrong or does not fit.' },
+    { id: 'result', label: 'The finished model', about: 'What is handed to Ollama at the end.' }
+];
+export const TRAIN_SETTINGS = [
+    { id: 'r', group: 'adapter', type: 'number', from: 'kind', label: 'Adapter size', min: 4, max: 512, whole: true, picks: [[16, 'Small'], [64, 'Medium'], [256, 'Large']], about: 'A larger adapter holds more new things and can push out more of what the model knew. Habits took at 64 in our tests; facts needed 256.' },
+    { id: 'alpha', group: 'adapter', type: 'number', from: 'kind', label: 'Adapter strength', min: 1, max: 1024, whole: true, about: 'How loudly the adapter speaks over the model. Equal to its size is the usual choice and follows the size unless you set it; lower is gentler.' },
+    { id: 'dropout', group: 'adapter', type: 'number', label: 'Share left out at each step', min: 0, max: 0.3, about: 'Leaves out a random share of the adapter at each step, so it learns the point of a lesson and not its exact words. 0.05 is usual.' },
+    { id: 'parts', group: 'adapter', type: 'choice', label: 'Parts of the model it reaches', options: [['usual', 'The usual two'], ['all', 'Every layer']], about: 'The usual two parts are the lightest. Every layer learns much more: in a full run here it gave back 18 of 20 lessons against 8 with the usual two, kept what it knew (14 of 15 both times), and took 0.6 GB more graphics memory and a little longer.' },
+    { id: 'dora', group: 'adapter', type: 'switch', label: 'Also learn how strongly each part speaks (DoRA)', about: 'Said to learn more from a small adapter. In a short run here it changed nothing after one pass, and on every layer it took half as much graphics memory again.' },
+    { id: 'rslora', group: 'adapter', type: 'switch', label: 'Count strength by the square root of size (rsLoRA)', about: 'Keeps a large adapter from going quiet. With strength equal to size it then speaks much louder: at size 64 a full run here gave back 16 of 20 lessons against 8 without it and kept 13 of 15 things it knew against 14, and at size 256 a short run overshot. Lower the strength with a large adapter.' },
+    { id: 'loraplus', group: 'adapter', type: 'number', label: 'One half learns faster (LoRA+)', min: 0, max: 64, about: 'Lets one half of the adapter learn this many times faster than the other, which can shorten training. 0 is off; 16 is the usual value, and on its own it learned a little faster in a short run here (error 1.90 against 2.02 after one pass).' },
+    { id: 'quantization', group: 'precision', type: 'choice', from: 'kind', label: 'How finely the model is held', options: [['4bit', '4 bits'], ['8bit', '8 bits'], ['none', 'Full']], about: 'At 4 bits the model takes the least graphics memory, which is how a large one fits. Full precision takes more, over twice as much for a large model, and it is what made facts stick in our tests.' },
+    { id: 'epochs', group: 'pace', type: 'number', from: 'lessons', label: 'Passes over the lessons', min: 1, max: 40, whole: true, about: 'How many times it reads all the lessons. Too few and nothing sticks; too many and it repeats them word for word. It is worked out from the number of lessons unless you set it.' },
+    { id: 'lr', group: 'pace', type: 'number', label: 'Size of each step (learning rate)', min: 0.000001, max: 0.001, picks: [[0.00005, 'Gentle'], [0.0002, 'Usual'], [0.0005, 'Strong']], about: '0.0002 is what worked in our tests. A tenth of that, Soup\'s own default, taught almost nothing.' },
+    { id: 'batch', group: 'pace', type: 'number', from: 'lessons', label: 'Lessons read per step', min: 1, max: 32, whole: true, about: 'More is steadier and takes more graphics memory. It is set from the length of your lessons unless you set it.' },
+    { id: 'accumulate', group: 'pace', type: 'number', label: 'Steps added up before each change', min: 1, max: 16, whole: true, about: 'Adds this many steps together before changing the adapter: the steadiness of reading more lessons at once without the memory. Each one divides the number of changes, so raise the passes with it.' },
+    { id: 'scheduler', group: 'pace', type: 'choice', label: 'How the steps shrink', options: [['cosine', 'Smoothly'], ['linear', 'Evenly'], ['constant', 'Not at all']], about: 'Steps usually start large and shrink towards the end, so the last lessons do not undo the first.' },
+    { id: 'warmup', group: 'pace', type: 'number', label: 'Share of the run spent easing in', min: 0, max: 0.3, about: 'The first steps are kept small so the adapter does not lurch at the start. 0.03 is usual.' },
+    { id: 'decay', group: 'pace', type: 'number', label: 'Pull back towards nothing (weight decay)', min: 0, max: 0.3, about: 'Gently shrinks the adapter at every step, which keeps it from holding on to noise. 0.01 is usual.' },
+    { id: 'clip', group: 'pace', type: 'number', label: 'Largest single change', min: 0.1, max: 10, about: 'Caps how far one step may move the adapter, so one odd lesson cannot throw the run. 1 is usual.' },
+    { id: 'neftune', group: 'pace', type: 'number', label: 'Noise on the lessons (NEFTune)', min: 0, max: 50, about: 'Adds a little noise to the lessons while it trains, which can help it answer wordings it never saw. 0 is off; 5 is usual. It learns more slowly with it, so give it more passes.' },
+    { id: 'seed', group: 'pace', type: 'number', label: 'Seed', min: 0, max: 999999, whole: true, about: 'Training has chance in it: the same seed gives the same run, another seed another. How much a model forgot changed a lot between seeds in our tests, so a second run with another seed is worth it.' },
+    { id: 'maxLength', group: 'lessons', type: 'number', from: 'lessons', label: 'Longest lesson, in tokens', min: 64, max: 2048, whole: true, about: 'A lesson longer than this is cut. It is set from your longest lesson unless you set it; a larger value takes more graphics memory. A token is about three quarters of a word.' },
+    { id: 'valSplit', group: 'lessons', type: 'number', label: 'Share held back to watch progress', min: 0, max: 0.3, about: 'These lessons are not trained on: the run checks itself against them after each pass. 0.1 is usual.' },
+    { id: 'ordinary', group: 'lessons', type: 'choice', label: 'Everyday questions mixed in', options: [[0, 'None'], [30, '30'], [60, '60']], about: 'Before training, the model answers everyday questions and its own answers are mixed into your lessons. This is what kept it from forgetting what it knew in our tests.' },
+    { id: 'onPrompt', group: 'lessons', type: 'switch', label: 'Learn the questions too', about: 'Usually only the answers are learned. On, it also learns the wording of your questions, which did not help in our tests.' },
+    { id: 'maskHistory', group: 'lessons', type: 'switch', label: 'Only the last answer of a conversation', about: 'For lessons that are whole conversations: learn only the final answer, and read the turns before it as background.' },
+    { id: 'curriculum', group: 'lessons', type: 'switch', label: 'Short lessons first', about: 'Reads the lessons from shortest to longest instead of mixed.' },
+    { id: 'watchdog', group: 'care', type: 'switch', label: 'Stop a run that goes wrong', about: 'Stops the run if its error stays above 3 for five readings in a row (one is taken every ten steps), which only a run that has gone wrong does. Nothing is added to your models then.' },
+    { id: 'checkpointing', group: 'care', type: 'switch', label: 'Use less graphics memory, more slowly', about: 'Recalculates part of each step instead of keeping it in memory. For a model that only just does not fit. In a short run here it took 1.9 GB against 2.8 for the same result.' },
+    { id: 'shrink', group: 'result', type: 'choice', label: 'Size of the finished model', options: [['auto', 'Chosen for you'], ['q8', 'Finer (8 bits)'], ['q4', 'Smaller (4 bits)']], about: 'At 4 bits the model is about half the size and is what Ollama\'s own models use; at 8 bits it loses nothing you would notice. Chosen for you: 8 bits up to 2 billion parameters, 4 bits above.' }
+];
+// What a person changed, checked against that list: the first thing wrong in plain words, or null.
+export const settingsProblem = (given) => {
+    if (given === undefined || given === null) return null;
+    if (typeof given !== 'object' || Array.isArray(given)) return 'The settings were not understood.';
+    for (const [id, value] of Object.entries(given)) {
+        const one = TRAIN_SETTINGS.find((setting) => setting.id === id);
+        if (!one) return `There is no setting called ${clip(id, 40)}.`;
+        if (one.type === 'switch' && typeof value !== 'boolean') return `${one.label} is either on or off.`;
+        if (one.type === 'choice' && !one.options.some(([option]) => option === value)) return `${one.label} must be one of: ${one.options.map(([, label]) => label).join(', ')}.`;
+        if (one.type === 'number' && (typeof value !== 'number' || !Number.isFinite(value) || value < one.min || value > one.max || (one.whole && !Number.isInteger(value)))) return `${one.label} must be ${one.whole ? 'a whole number ' : ''}between ${one.min} and ${one.max}.`;
+    }
+    if (given.onPrompt === true && given.maskHistory === true) return 'Learning the questions too and learning only the last answer of a conversation cannot both be on.';
+    return null;
+};
+// How a run is set. What the person did not set is worked out: about the same number of changes to the adapter whatever
+// the number of lessons, rows as long as the longest lesson, the adapter and precision of what is being taught, and,
+// given the model and the card (`room`), a step small enough to fit.
+const longestOf = (lessons) => Math.max(0, ...lessons.map((row) => row.reduce((sum, turn) => sum + turn.content.length, 0)));
+export const trainSettings = (lessons, kind, given = {}, room = null) => {
+    const count = Array.isArray(lessons) ? lessons.length : Number(lessons?.count) || 0;
+    const longest = Array.isArray(lessons) ? longestOf(lessons) : Number(lessons?.longest) || 0;
+    const own = Object.fromEntries(Object.entries(given || {}).filter(([id]) => TRAIN_SETTINGS.some((one) => one.id === id)));
     const { r, alpha, quantization, updates } = TRAIN_KINDS[kind];
-    return { epochs: Math.min(16, Math.max(3, Math.ceil((updates * batch) / rows))), lr: 0.0002, batch, maxLength, r, alpha, quantization };
+    const maxLength = own.maxLength ?? ([256, 512, 1024].find((size) => longest / 3 + 48 <= size) || 1024);
+    const batch = own.batch ?? (maxLength <= 256 ? 8 : maxLength <= 512 ? 4 : 2);
+    const set = {
+        r, alpha: own.r !== undefined ? own.r : alpha, dropout: 0.05, parts: 'usual', dora: false, rslora: false, loraplus: 0, quantization, epochs: 0, lr: 0.0002, batch, accumulate: 1, scheduler: 'cosine', warmup: 0.03, decay: 0.01, clip: 1, neftune: 0,
+        seed: 42, maxLength, valSplit: 0.1, ordinary: 60, onPrompt: false, maskHistory: false, curriculum: false, watchdog: false, checkpointing: false, shrink: 'auto', ...own
+    };
+    // On a card the usual step does not fit, fewer lessons are read at a time and more steps are added up, which trains
+    // the same way; if one at a time is still too much, memory is traded for time. Never what the person set.
+    if (room?.gpuMb && room.parameters) {
+        const fits = () => trainNeeds(room.parameters, set, longest).gpuMb <= room.gpuMb;
+        while (own.batch === undefined && own.accumulate === undefined && set.batch > 1 && !fits()) {
+            set.batch /= 2;
+            set.accumulate *= 2;
+        }
+        if (own.checkpointing === undefined && !fits()) {
+            set.checkpointing = true;
+            if (!fits()) set.checkpointing = false;
+        }
+    }
+    if (own.epochs === undefined) set.epochs = Math.min(16, Math.max(3, Math.ceil((updates * set.batch * set.accumulate) / Math.max(1, count + set.ordinary))));
+    return set;
+};
+// How many times the adapter is changed in a run: what decides whether lessons stick, more than the passes do.
+export const trainUpdates = (count, set) => Math.ceil((Math.floor((count + set.ordinary) * (1 - set.valSplit)) * set.epochs) / (set.batch * set.accumulate));
+// What our own tests say about a run set this way, for the page to show before it is started.
+export const trainNotes = (count, kind, set, updates, place = {}) => {
+    const notes = [];
+    if ((place.fitted || []).includes('batch')) notes.push(`To fit this graphics card it reads ${set.batch} ${set.batch === 1 ? 'lesson' : 'lessons'} per step and adds ${set.accumulate} steps up, which trains the same way as ${set.batch * set.accumulate} at once, only more slowly.`);
+    if ((place.fitted || []).includes('checkpointing')) notes.push('To fit this graphics card it also uses less of its memory, which is slower.');
+    if (place.gpuMb && place.needs && place.needs.gpuMb <= place.gpuMb && place.needs.gpuMb > place.gpuMb * 0.85) notes.push('This only just fits the graphics card. Close other programs that use it before starting, such as games and video.');
+    if (count > 0 && count < 60) notes.push('With fewer than 60 lessons, ask each thing in several wordings: one lesson alone does not stick.');
+    if (updates !== null && updates < 60) notes.push(`This run changes the adapter only ${updates} times, which may be too few for lessons to stick. More passes, or fewer lessons per step, give more.`);
+    if (updates !== null && updates > 800) notes.push(`This run changes the adapter ${updates} times, which is a lot: it may repeat lessons word for word and forget more of what it knew. Fewer passes would do.`);
+    if (set.lr < 0.00005) notes.push('A step this small taught almost nothing in our tests.');
+    if (set.r >= 128 && set.ordinary < 60) notes.push('A large adapter forgets more. Keep the everyday questions at 60.');
+    if (set.r >= 128 && set.quantization === '4bit') notes.push('A large adapter held at 4 bits learned fewer facts in our tests than at full precision (18 of 24 against 21).');
+    if (kind === 'facts' && set.r < 128) notes.push('Facts did not stick with an adapter this small in our tests (11 of 24 at size 64 against 21 at 256).');
+    if (set.r >= 128) notes.push('How much the model forgets varies from run to run with a large adapter (8 to 14 of 15 in our tests). Check the "still knows" score, and try another seed if it is low.');
+    if (set.rslora && set.parts === 'all') notes.push('Every layer together with rsLoRA made the model forget most of what it knew in two full runs here: it kept 3 and 8 of 15 things, against 14 with every layer alone and 13 with rsLoRA alone. Use one of them.');
+    if (set.rslora && set.loraplus > 0) notes.push('rsLoRA and LoRA+ together made the error blow up in a short run here (7.6 against 2.0). Use one of them, or a step a quarter the size.');
+    else if (set.loraplus > 0 && set.parts === 'all') notes.push('LoRA+ on every layer left the error high in a short run here (4.3 against 1.8). Take a smaller step with it.');
+    if (set.rslora && set.alpha / Math.sqrt(set.r) > 10) notes.push(`With rsLoRA on, a strength of ${set.alpha} at size ${set.r} speaks ${Math.round(set.alpha / Math.sqrt(set.r))} times louder than usual, and 16 times overshot in a short run here. A strength near ${Math.round(Math.sqrt(set.r) * 4)} is safer.`);
+    if (set.dora && set.parts === 'all') notes.push('DoRA on every layer took half as much graphics memory again in a short run here (5.1 GB against 3.4), which the estimate above does not count.');
+    if (set.neftune > 0) notes.push('With noise on it learned more slowly in a short run here (error 2.7 against 2.1 on lessons held back, after one pass), and the error shown while it trains reads higher still. Give it a few more passes.');
+    if (set.onPrompt) notes.push('The error shown then counts the questions too, so it reads higher (3.3 against 2.0 in a short run here) and cannot be compared with a usual run.');
+    return notes;
 };
 // What each desktop app last said about training on its computer, kept in memory like its pooling state.
 const trainKits = new Map();
 const presentTraining = (job) => ({
-    id: job.id, where: job.where, device: String(job.device), name: job.name, base: job.base, kind: job.kind, lessons: job.lessons, status: job.status, stage: job.stage, percent: job.percent, loss: job.loss,
+    id: job.id, where: job.where, device: String(job.device), name: job.name, base: job.base, kind: job.kind, settings: job.settings || null, lessons: job.lessons, status: job.status, stage: job.stage, percent: job.percent, loss: job.loss,
     before: job.before?.of ? job.before : null, after: job.after?.of ? job.after : null, seconds: job.seconds, detail: job.detail, startedAt: job.createdAt, finishedAt: job.finishedAt
 });
 const TRAIN_LIVE = ['queued', 'setting-up', 'scoring', 'training', 'saving'];
@@ -7792,6 +7930,8 @@ export const listTrainings = asyncHandler(async (req, res) => {
         success: true,
         bases: TRAIN_BASES,
         kinds: Object.entries(TRAIN_KINDS).map(([id, kind]) => ({ id, label: kind.label, about: kind.about })),
+        groups: TRAIN_GROUPS,
+        settings: TRAIN_SETTINGS,
         limits: { least: TRAIN_MIN_LESSONS, most: TRAIN_MAX_LESSONS },
         computers: devices.map((device) => ({ id: device.id, name: device.name, ...trainingReady(device) })),
         trainings: jobs.map(presentTraining)
@@ -7841,19 +7981,44 @@ export const listTrainable = asyncHandler(async (req, res) => {
     res.status(200).json({ success: true, computer: { id: device.id, name: device.name, ready: place.ready, reason: place.reason, gpuMb: place.gpuMb || 0, memoryMb: place.memoryMb }, models });
 });
 
+// What a run would be with the settings as they stand: every value, the number of changes to the adapter, whether it
+// fits, and what our own tests say about it. Asked for as a person edits; the lessons themselves are not sent.
+export const planTraining = asyncHandler(async (req, res) => {
+    const { device: deviceId, base: source, kind, count = 0, longest = 0, settings: given = {} } = req.body;
+    const device = await Device.findOne({ _id: deviceId, service: SERVICE, kind: 'companion', registeredBy: req.user.id });
+    if (!device) return res.status(404).json({ success: false, message: 'Device not found' });
+    const wrong = settingsProblem(given);
+    if (wrong) return res.status(400).json({ success: false, code: 'TRAIN_SETTINGS', message: wrong });
+    const base = await trainBase(source);
+    const place = trainPlace(device);
+    const plain = trainSettings({ count, longest }, kind, given);
+    const settings = base.problem ? plain : trainSettings({ count, longest }, kind, given, roomOf(place, base));
+    // What was set to fit this card instead of by the lessons, for the page to say so.
+    const fitted = ['batch', 'accumulate', 'checkpointing'].filter((id) => plain[id] !== settings[id]);
+    const fit = base.problem ? { fits: false, needs: null, lacks: 'origin', reason: base.problem } : trainFit(place, base, kind, settings, longest);
+    const updates = count > 0 ? trainUpdates(count, settings) : null;
+    res.status(200).json({ success: true, settings, fitted, updates, base: base.problem ? null : base, ...fit, notes: trainNotes(count, kind, settings, updates, { fitted, needs: fit.needs, gpuMb: place.gpuMb }), canChange: place.sizes });
+});
+
 export const startTraining = asyncHandler(async (req, res) => {
     const refuse = (status, code, message) => res.status(status).json({ success: false, code, message });
-    const { device: deviceId, base: baseId, name, kind, lessons: given } = req.body;
+    const { device: deviceId, base: baseId, name, kind, lessons: given, settings: changed = {} } = req.body;
     const device = await Device.findOne({ _id: deviceId, service: SERVICE, kind: 'companion', registeredBy: req.user.id });
     if (!device) return res.status(404).json({ success: false, message: 'Device not found' });
     const state = trainingReady(device);
     if (!state.ready) return refuse(409, 'TRAIN_NOT_READY', state.reason);
     const base = await trainBase(baseId);
     if (base.problem) return refuse(400, 'TRAIN_BASE_UNKNOWN', base.problem);
-    const fit = trainFit(trainPlace(device), base, kind);
-    if (!fit.fits) return refuse(409, 'TRAIN_TOO_LARGE', fit.reason);
+    const wrong = settingsProblem(changed);
+    if (wrong) return refuse(400, 'TRAIN_SETTINGS', wrong);
+    // A desktop app from before the settings could be changed trains with the usual ones only, and would not say so.
+    if (Object.keys(changed).length > 0 && !trainPlace(device).sizes) return refuse(409, 'TRAIN_NOT_READY', 'Update the desktop app on that computer to change the settings: its version trains with the usual ones only.');
     const read = readLessons(given);
     if (read.problem) return refuse(400, 'TRAIN_LESSONS', read.problem);
+    const place = trainPlace(device);
+    const settings = trainSettings(read.lessons, kind, changed, roomOf(place, base));
+    const fit = trainFit(place, base, kind, settings, longestOf(read.lessons));
+    if (!fit.fits) return refuse(409, 'TRAIN_TOO_LARGE', fit.reason);
     if (await Training.exists({ service: SERVICE, device: device.id, status: { $in: TRAIN_LIVE } })) return refuse(409, 'TRAIN_BUSY', 'This computer is already training a model. Wait for it, or stop it.');
     let installed = [];
     try {
@@ -7862,15 +8027,14 @@ export const startTraining = asyncHandler(async (req, res) => {
         installed = [];
     }
     if (installed.some((model) => model.name === `${name}:latest` || model.name === name)) return refuse(409, 'TRAIN_NAME_TAKEN', `This computer already has a model called ${name}. Choose another name.`);
-    const settings = trainSettings(read.lessons, kind);
-    const job = await Training.create({ owner: req.user.id, device: device.id, name, base: base.source, kind, lessons: read.lessons.length, status: 'queued', stage: 'Waiting for the computer' });
+    const job = await Training.create({ owner: req.user.id, device: device.id, name, base: base.source, kind, settings, lessons: read.lessons.length, status: 'queued', stage: 'Waiting for the computer' });
     // The lessons to ask again afterwards, spread over the whole set: how many the model can give back.
     const every = Math.max(1, Math.floor(read.lessons.length / 20));
     const probes = read.lessons.filter((row, at) => at % every === 0).slice(0, 20).map((row) => ({ messages: row.slice(0, -1), answer: row.at(-1).content }));
     const sent = deviceGateway.order(device.id, {
         type: 'train', action: 'run',
-        // A larger model is made smaller at the end (4 bits), as Ollama's own are, so it runs where it was trained.
-        job: { id: job.id, name, source: base.source, shrink: base.parameters > 2e9, settings, lessons: read.lessons, probes, ordinary: TRAIN_ORDINARY, control: TRAIN_CONTROL.map(([question, must]) => ({ question, must })) }
+        // Unless the person chose, a larger model is made smaller at the end (4 bits), as Ollama's own are, so it runs where it was trained.
+        job: { id: job.id, name, source: base.source, shrink: settings.shrink === 'q4' || (settings.shrink === 'auto' && base.parameters > 2e9), large: base.parameters > 2e9, settings, lessons: read.lessons, probes, ordinary: TRAIN_ORDINARY.slice(0, settings.ordinary), control: TRAIN_CONTROL.map(([question, must]) => ({ question, must })) }
     });
     if (!sent) {
         await Training.updateOne({ _id: job.id }, { status: 'failed', detail: 'The computer went offline before the training reached it.', finishedAt: new Date() });
@@ -7912,7 +8076,7 @@ const scoreOf = (given) => {
 };
 deviceGateway.on('train', async (deviceId, data) => {
     try {
-        trainKits.set(String(deviceId), { kit: ['ready', 'none', 'unsupported'].includes(data?.kit) ? data.kit : 'none', detail: data?.detail ? clip(String(data.detail), 200) : null });
+        trainKits.set(String(deviceId), { version: Number.isInteger(data?.version) ? data.version : 1, kit: ['ready', 'none', 'unsupported'].includes(data?.kit) ? data.kit : 'none', detail: data?.detail ? clip(String(data.detail), 200) : null });
         const report = data?.job;
         if (!report || !mongoose.isValidObjectId(report.id) || !TRAIN_STATES.includes(report.status)) return;
         const job = await Training.findOne({ _id: report.id, service: SERVICE, device: deviceId });

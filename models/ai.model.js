@@ -443,6 +443,7 @@ const trainingSchema = new mongoose.Schema({
     name: { type: String, required: true },
     base: { type: String, required: true },
     kind: { type: String, enum: ['habits', 'facts'], required: true },
+    settings: { type: mongoose.Schema.Types.Mixed, default: null },
     lessons: { type: Number, required: true },
     status: { type: String, enum: ['queued', 'setting-up', 'scoring', 'training', 'saving', 'done', 'failed', 'stopped'], default: 'queued' },
     stage: { type: String, default: null },
@@ -464,7 +465,16 @@ export const trainingSchemas = {
         base: Joi.string().trim().max(220).required(),
         name: Joi.string().trim().lowercase().pattern(/^[a-z0-9][a-z0-9-]{1,38}$/).required().messages({ 'string.pattern.base': 'Name the model with 2 to 39 small letters, digits and hyphens.' }),
         kind: Joi.string().valid('habits', 'facts').required(),
-        lessons: Joi.string().max(1200000).required()
+        lessons: Joi.string().max(1200000).required(),
+        settings: Joi.object().unknown(true).max(40)
+    }),
+    plan: Joi.object({
+        device: Joi.objectId().required(),
+        base: Joi.string().trim().max(220).required(),
+        kind: Joi.string().valid('habits', 'facts').required(),
+        count: Joi.number().integer().min(0).max(100000).default(0),
+        longest: Joi.number().integer().min(0).max(2000000).default(0),
+        settings: Joi.object().unknown(true).max(40)
     })
 };
 
