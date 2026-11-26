@@ -3,6 +3,7 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { statfs, readFile, readdir } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
+import logger from '../utils/app.logger.js';
 import { EventEmitter } from 'node:events';
 import dns from 'node:dns/promises';
 import https from 'node:https';
@@ -2806,8 +2807,13 @@ export const runpod = {
     async catalogue() {
         if (runpodKept && Date.now() - runpodKept.at < CARDS_KEPT_MS) return runpodKept.cards;
         const data = await askRunpod('GET', '/catalog/gpus?include=AVAILABILITY&product=POD&cloud=SECURE');
+        // Each card RunPod sent, its stock and Secure Cloud price, and why one is left out: one line in the log for admins.
+        const priceOf = (gpu) => Number(typeof gpu.price === 'object' ? gpu.price?.secure : gpu.price) || 0;
+        logger.info('[Rental] RunPod catalogue', {
+            cards: (data?.gpus || []).map((gpu) => `${gpu.id} ${gpu.availability || '?'} ${priceOf(gpu) ? `USD ${priceOf(gpu)}` : 'no-price'}${gpu.secure === false ? ' not-secure' : ''}`).join('; ')
+        });
         const cards = (data?.gpus || [])
-            .filter((gpu) => gpu.secure !== false && Number(gpu.price?.secure) > 0)
+            .filter((gpu) => gpu.secure !== false && priceOf(gpu) > 0)
             .map((gpu) => ({
                 flavor: gpu.id,
                 gpu: gpu.name || gpu.id,
@@ -2818,7 +2824,7 @@ export const runpod = {
                 diskGb: RUNPOD_DISK_GB,
                 region: (gpu.dataCenters || []).find((place) => place.availability && place.availability !== 'NONE')?.id || null,
                 spot: false,
-                cost: centsOf(gpu.price.secure),
+                cost: centsOf(priceOf(gpu)),
                 available: Boolean(gpu.availability) && gpu.availability !== 'NONE'
             }));
         runpodKept = { at: Date.now(), cards };
