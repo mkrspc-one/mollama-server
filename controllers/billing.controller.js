@@ -192,18 +192,19 @@ const formFields = (value, prefix = '', out = new URLSearchParams()) => {
     return out;
 };
 
-const askStripe = async (path, fields, onceKey) => {
+const askStripe = async (path, fields, onceKey, method = 'POST') => {
+    const reading = method === 'GET';
     let response;
     try {
-        response = await stripeFetch(`${STRIPE_API}${path}`, {
-            method: 'POST',
+        response = await stripeFetch(`${STRIPE_API}${path}${reading ? `?${formFields(fields)}` : ''}`, {
+            method,
             headers: {
                 Authorization: `Bearer ${process.env.STRIPE_SECRET_KEY}`,
-                'Content-Type': 'application/x-www-form-urlencoded',
                 'Stripe-Version': STRIPE_VERSION,
+                ...(reading ? {} : {'Content-Type': 'application/x-www-form-urlencoded'}),
                 ...(onceKey ? {'Idempotency-Key': onceKey} : {})
             },
-            body: formFields(fields).toString(),
+            ...(reading ? {} : {body: formFields(fields).toString()}),
             signal: AbortSignal.timeout(20000)
         });
     } catch (error) {
@@ -392,7 +393,18 @@ const DISPUTE_ENDS = {won: 'won', lost: 'lost', warning_closed: 'closed', preven
 const countDispute = async (dispute, opened) => {
     const payment = idOf(dispute.payment_intent);
     if (!payment) return;
-    const bought = await CreditLine.findOne({...ledger(), kind: 'topup', 'ref.payment': payment});
+    const purchase = () => CreditLine.findOne({...ledger(), kind: 'topup', 'ref.payment': payment});
+    let bought = await purchase();
+    // Stripe does not promise the order of its messages: a dispute may arrive before the payment it is about. If the
+    // payment came from one of this app's payment pages, that purchase is counted first.
+    if (!bought && opened) {
+        const pages = await askStripe('/checkout/sessions', {payment_intent: payment, limit: 1}, null, 'GET').catch(() => null);
+        const page = pages?.data?.[0];
+        if (page?.metadata?.service === BILLING_SERVICE) {
+            await countPayment(page);
+            bought = await purchase();
+        }
+    }
     if (!bought) return;
     const taken = await CreditLine.findOne({...ledger(), key: `dispute:${dispute.id}`});
     const tell = (title, message) => getNotificationService().notifyRole(['OWNER', 'ADMIN'], 'billing:dispute', {level: 'warning', title, message, path: '/billing'});
