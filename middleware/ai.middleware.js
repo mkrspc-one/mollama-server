@@ -2653,6 +2653,8 @@ const CARD_MEMORY_GB = [[/A4000/i, 16], [/A5000|4090|3090/i, 24], [/A6000|A40\b|
 const CARDS_KEPT_MS = 60000;
 
 let cardsKept = null;
+let cardsSkipped = null;
+export const skippedCards = () => cardsSkipped;
 let hyperstackFetch = realFetch;
 export const setHyperstackFetch = (replacement) => {
     hyperstackFetch = replacement || realFetch;
@@ -2741,8 +2743,23 @@ export const hyperstack = {
         if (!region) throw new HyperstackError(404, `Hyperstack has no environment named ${process.env.HYPERSTACK_ENVIRONMENT}`);
         const priceOf = new Map((Array.isArray(prices) ? prices : prices?.data || []).map((entry) => [entry.name, centsOf(entry.value)]));
         const address = MACHINE_PUBLIC_ADDRESS ? priceOf.get('PublicIP') || 0 : 0;
-        const cards = (flavors.data || []).flatMap((group) => group.flavors || [])
-            .filter((flavor) => flavor.region_name === region && flavor.gpu && flavor.gpu_count > 0 && flavor.stock_available && priceOf.get(flavor.gpu) > 0 && !/spot/i.test(flavor.name))
+        const all = (flavors.data || []).flatMap((group) => (group.flavors || []).map((flavor) => ({ region_name: group.region_name, gpu: group.gpu, ...flavor })));
+        // Why each machine type in the region was left out, for admins: Hyperstack's names are matched here by hand.
+        const whyNot = (flavor) => [
+            flavor.region_name !== region && 'other region',
+            !(flavor.gpu && flavor.gpu_count > 0) && 'no graphics card',
+            !flavor.stock_available && 'not in stock',
+            !(priceOf.get(flavor.gpu) > 0) && 'no price found',
+            /spot/i.test(flavor.name) && 'spot'
+        ].filter(Boolean);
+        cardsSkipped = {
+            region,
+            skipped: all.filter((flavor) => flavor.region_name === region && whyNot(flavor).length > 0)
+                .map((flavor) => ({ flavor: flavor.name, gpu: flavor.gpu || null, why: whyNot(flavor) })),
+            priceNames: [...priceOf.keys()].slice(0, 80)
+        };
+        const cards = all
+            .filter((flavor) => whyNot(flavor).length === 0)
             .map((flavor) => ({
                 flavor: flavor.name,
                 gpu: flavor.gpu,

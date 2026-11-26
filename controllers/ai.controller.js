@@ -17,7 +17,7 @@ import {
     searchReady, searchWeb, readPage, deviceGateway,
     CLOUD_PROVIDERS, PROVIDER_HEALTH, createCloudClient, ollamaOnlineNames, runsOnline,
     TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, toolKeyNeeded, listedTool, seal, unseal, accountKeeper, withToolServer, finishToolSignIn, readTools, toolFault, ToolSignInError,
-    hyperstack, hyperstackReady, machinePrefix, machineScript, HyperstackError
+    hyperstack, hyperstackReady, machinePrefix, machineScript, HyperstackError, skippedCards
 } from '../middleware/ai.middleware.js';
 import { billingOn, balanceOf, setAside, settle, money, BillingError, moneyIsReal } from './billing.controller.js';
 
@@ -8223,7 +8223,8 @@ export const listRentalCards = asyncHandler(async (req, res) => {
             on: true,
             cards: cards.map((card) => ({ flavor: card.flavor, name: cardName(card), gpu: card.gpu, count: card.count, memoryMb: card.memoryMb, cpu: card.cpu, ramGb: card.ramGb, diskGb: card.diskGb, price: rentalPrice(card.cost) })),
             rules: { limit: RENTAL_RULES.limit, hours: RENTAL_RULES.hours, mostHours: RENTAL_RULES.mostHours, idleMinutes: RENTAL_RULES.idleMinutes, atOnce: RENTAL_RULES.atOnce },
-            balance: totals.balance
+            balance: totals.balance,
+            ...(hasRight(req.user.roles, RIGHTS.MANAGE_ALL_USERS) ? { left: skippedCards() } : {})
         });
     } catch (error) {
         logger.warn('[Rental] The cards could not be read', { reason: error.message });
