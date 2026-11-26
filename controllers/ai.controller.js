@@ -17,7 +17,8 @@ import {
     searchReady, searchWeb, readPage, deviceGateway,
     CLOUD_PROVIDERS, PROVIDER_HEALTH, createCloudClient, ollamaOnlineNames, runsOnline,
     TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, toolKeyNeeded, listedTool, seal, unseal, accountKeeper, withToolServer, finishToolSignIn, readTools, toolFault, ToolSignInError,
-    hyperstack, hyperstackReady, machinePrefix, machineScript, HyperstackError, skippedCards
+    hyperstack, hyperstackReady, machinePrefix, machineScript, HyperstackError, skippedCards, otherCards,
+    ProviderError, rentalProviders, providerOf, containerScript
 } from '../middleware/ai.middleware.js';
 import { billingOn, balanceOf, setAside, settle, money, BillingError, moneyIsReal } from './billing.controller.js';
 
@@ -8151,7 +8152,7 @@ const RENTAL_ENDS = {
     time: 'it reached its time limit',
     idle: 'nothing had run on it for a while',
     failed: 'it could not be started',
-    gone: 'the machine stopped at Hyperstack'
+    gone: 'the machine stopped unexpectedly'
 };
 const MINUTE_MS = 60000;
 const holdOf = (rental) => `rental:${rental.id}`;
@@ -8160,7 +8161,7 @@ const cardName = (card) => `${card.count > 1 ? `${card.count} x ` : ''}${card.gp
 // Test credit is not real money, but a rental spends real money at Hyperstack. With billing in test mode, renting
 // is on only where ADMIN_ONLY keeps everyone but admins and owners out (and in the test suite).
 export const rentalsSafeHere = () => moneyIsReal() || process.env.ADMIN_ONLY === 'true' || process.env.NODE_ENV === 'test';
-export const rentalsOn = () => billingOn() && hyperstackReady() && rentalsSafeHere();
+export const rentalsOn = () => billingOn() && rentalProviders().length > 0 && rentalsSafeHere();
 export const rentalPrice = (cost) => Math.ceil(cost * (1 + RENTAL_RULES.markup));
 
 // What a rental has cost its person so far: whole minutes from the moment the machine was running at Hyperstack,
@@ -8177,7 +8178,7 @@ const presentRental = (rental) => {
     return {
         id: rental.id,
         state: rental.state,
-        card: { flavor: rental.card.flavor, gpu: rental.card.gpu, count: rental.card.count, memoryMb: rental.card.memoryMb, name: cardName(rental.card) },
+        card: { flavor: rental.card.key || cardKey(rental.card), gpu: rental.card.gpu, count: rental.card.count, memoryMb: rental.card.memoryMb, name: cardName(rental.card) },
         device: rental.device ? String(rental.device) : null,
         price: rental.price,
         limit: rental.limit,
@@ -8207,7 +8208,43 @@ const tellOwners = (type, message) => {
 
 const refuseRental = (res, status, code, message, extra = {}) => res.status(status).json({ success: false, code, message, ...extra });
 
-// What Mollama may still owe Hyperstack for the rentals that are open: each one's cost to the end of its time or money.
+
+// One name for each kind of card across providers, so the page lists it once, at the price of whoever supplies it,
+// and never says who that is.
+const CARD_FAMILIES = ['rtxpro6000', 'rtx6000ada', 'rtxa6000', 'rtxa5000', 'rtxa4000', 'rtx5090', 'rtx4090', 'rtx3090', 'l40s', 'l40', 'l4', 'a100', 'h100', 'h200', 'b200', 'a40', 'a10', 'v100'];
+export const cardKey = (card) => {
+    const name = String(card.gpu || '').toLowerCase().replace(/nvidia|geforce|-?spot/g, '').replace(/[^a-z0-9]/g, '');
+    const family = CARD_FAMILIES.find((one) => name.includes(one)) || name;
+    const memory = Math.round((card.memoryMb || 0) / 1024 / (card.count || 1));
+    return `${family}-${memory}x${card.count || 1}${card.spot ? '-spot' : ''}`;
+};
+
+// Every card any provider has, grouped by kind. The options of a kind that can be had now are in the order they are
+// tried: RunPod before Hyperstack, cheaper first within one provider.
+const rentalOffers = async () => {
+    const providers = rentalProviders();
+    const lists = await Promise.allSettled(providers.map((provider) => provider.catalogue()));
+    if (lists.length === 0 || lists.every((list) => list.status === 'rejected')) throw lists[0]?.reason || new ProviderError(0, 'No provider is set up');
+    const failures = lists.map((list, at) => (list.status === 'rejected' ? { provider: providers[at].label, reason: list.reason?.message } : null)).filter(Boolean);
+    const kinds = new Map();
+    lists.forEach((list, at) => {
+        if (list.status !== 'fulfilled') return;
+        for (const card of list.value) {
+            const key = cardKey(card);
+            if (!kinds.has(key)) kinds.set(key, []);
+            kinds.get(key).push({ provider: providers[at], rank: at, card });
+        }
+    });
+    const offers = [...kinds.entries()].map(([key, all]) => {
+        const options = all.filter((one) => one.card.available).sort((a, b) => a.rank - b.rank || a.card.cost - b.card.cost);
+        return { key, options, shown: options[0] || [...all].sort((a, b) => a.card.cost - b.card.cost)[0] };
+    });
+    return { offers, failures };
+};
+const presentCard = (key, card) => ({ flavor: key, name: cardName(card), gpu: card.gpu, count: card.count, memoryMb: card.memoryMb, cpu: card.cpu, ramGb: card.ramGb, diskGb: card.diskGb, spot: Boolean(card.spot), price: rentalPrice(card.cost) });
+const canSeeProviders = (req) => hasRight(req.user.roles, RIGHTS.MANAGE_ALL_USERS);
+
+// What Mollama may still owe a provider for the rentals that are open: each one's cost to the end of its time or money.
 const stillOwed = (rentals) => rentals.reduce((sum, rental) => {
     const hours = Math.min(rental.minutes / 60, rental.limit / rental.price);
     const used = rental.readyAt ? (Date.now() - rental.readyAt) / (60 * MINUTE_MS) : 0;
@@ -8217,19 +8254,23 @@ const stillOwed = (rentals) => rentals.reduce((sum, rental) => {
 export const listRentalCards = asyncHandler(async (req, res) => {
     if (!rentalsOn()) return res.status(200).json({ success: true, on: false });
     try {
-        const [cards, totals] = await Promise.all([hyperstack.cards(), balanceOf(req.user.id)]);
+        const [{ offers, failures }, totals] = await Promise.all([rentalOffers(), balanceOf(req.user.id)]);
+        if (failures.length) logger.warn('[Rental] A provider could not be read', { failures });
+        const byPrice = (a, b) => a.price - b.price;
         return res.status(200).json({
             success: true,
             on: true,
-            cards: cards.map((card) => ({ flavor: card.flavor, name: cardName(card), gpu: card.gpu, count: card.count, memoryMb: card.memoryMb, cpu: card.cpu, ramGb: card.ramGb, diskGb: card.diskGb, price: rentalPrice(card.cost) })),
+            cards: offers.filter((offer) => offer.options.length).map((offer) => presentCard(offer.key, offer.shown.card)).sort(byPrice),
+            // The rest, greyed out on the page.
+            unavailable: offers.filter((offer) => !offer.options.length).map((offer) => ({ ...presentCard(offer.key, offer.shown.card), why: 'Out of stock right now' })).sort(byPrice),
             rules: { limit: RENTAL_RULES.limit, hours: RENTAL_RULES.hours, mostHours: RENTAL_RULES.mostHours, idleMinutes: RENTAL_RULES.idleMinutes, atOnce: RENTAL_RULES.atOnce },
             balance: totals.balance,
-            ...(hasRight(req.user.roles, RIGHTS.MANAGE_ALL_USERS) ? { left: skippedCards() } : {})
+            ...(canSeeProviders(req) ? { left: { ...(skippedCards() || {}), failures } } : {})
         });
     } catch (error) {
         logger.warn('[Rental] The cards could not be read', { reason: error.message });
-        // Admins and owners are told Hyperstack's own reason, so a wrong key or environment name shows on the page.
-        return refuseRental(res, 502, 'HYPERSTACK_DOWN', 'The cards for rent could not be read just now. Try again in a minute.', hasRight(req.user.roles, RIGHTS.MANAGE_ALL_USERS) ? { detail: error.message } : {});
+        // Admins and owners are told the provider's own reason, so a wrong key or setting shows on the page.
+        return refuseRental(res, 502, 'PROVIDER_DOWN', 'The cards for rent could not be read just now. Try again in a minute.', canSeeProviders(req) ? { detail: error.message } : {});
     }
 });
 
@@ -8250,32 +8291,55 @@ export const startRental = asyncHandler(async (req, res) => {
         return refuseRental(res, 409, 'ALREADY_RENTING', 'You already have a rented computer. End it before renting another.');
     }
 
-    let card;
-    let funds;
+    // The kind of card asked for (or, from older pages, one provider's own name for it), and who can supply it now.
+    let offer;
     try {
-        [card, funds] = await Promise.all([hyperstack.cards().then((cards) => cards.find((one) => one.flavor === req.body.flavor)), hyperstack.credit()]);
+        const { offers } = await rentalOffers();
+        offer = offers.find((one) => one.key === req.body.flavor);
+        if (!offer) {
+            const named = offers.find((one) => one.options.some((option) => option.card.flavor === req.body.flavor));
+            if (named) offer = { ...named, options: named.options.filter((option) => option.card.flavor === req.body.flavor) };
+        }
     } catch (error) {
-        logger.warn('[Rental] Hyperstack could not be asked', { reason: error.message });
-        return refuseRental(res, 502, 'HYPERSTACK_DOWN', 'The card could not be rented just now. Nothing was charged.', hasRight(req.user.roles, RIGHTS.MANAGE_ALL_USERS) ? { detail: error.message } : {});
+        logger.warn('[Rental] The providers could not be asked', { reason: error.message });
+        return refuseRental(res, 502, 'PROVIDER_DOWN', 'The card could not be rented just now. Nothing was charged.', canSeeProviders(req) ? { detail: error.message } : {});
     }
-    if (!card) return refuseRental(res, 404, 'CARD_GONE', 'That card is not free to rent right now. Choose another.');
+    if (!offer?.options.length) return refuseRental(res, 404, 'CARD_GONE', 'That card is not free to rent right now. Choose another.');
 
-    const price = rentalPrice(card.cost);
+    const first = offer.options[0];
+    const price = rentalPrice(first.card.cost);
+    // Never more than the person saw: a dearer price is shown to them first.
+    if (Number.isInteger(req.body.price) && price > req.body.price) {
+        return refuseRental(res, 409, 'PRICE_CHANGED', `That card now costs ${money(price)} an hour. Rent it again at the new price if you want it.`, { price });
+    }
     const hours = Math.min(req.body.hours || RENTAL_RULES.hours, RENTAL_RULES.mostHours);
     const limit = req.body.limit || RENTAL_RULES.limit;
     if (limit < price) return refuseRental(res, 400, 'LIMIT_TOO_SMALL', `The spending limit must cover one hour: at least ${money(price)}.`, { least: price });
     const { balance } = await balanceOf(user);
     if (balance < limit) return refuseRental(res, 402, 'NOT_ENOUGH_CREDIT', `You have ${money(balance)} of credit and this sets aside ${money(limit)}. Add credit first.`, { balance, limit });
 
-    // Mollama pays Hyperstack before its customers pay Mollama, so a rental starts only if Mollama's own balance
-    // there covers every open rental to its end and this one too.
-    const owed = stillOwed(await Rental.find({ service: SERVICE, state: { $ne: 'ended' } }));
-    const need = Math.min(hours, limit / price) * card.cost;
-    if (!funds.canCreate || funds.credit - owed - need < RENTAL_RULES.reserve) {
-        logger.warn('[Rental] Refused: Mollama\'s balance at Hyperstack is too low', { credit: funds.credit, owed: Math.round(owed), need: Math.round(need) });
-        tellOwners('rental:funds', `A rental was refused because Mollama's balance at Hyperstack is low (${money(funds.credit)} left).`);
-        return refuseRental(res, 503, 'RENTALS_PAUSED', 'No more computers can be rented right now. Nothing was charged. Try again later.');
+    // Mollama pays a provider before its customers pay Mollama, so a provider is used only if Mollama's own balance
+    // there covers every open rental with it to its end and this one too. A fallback never costs the person more.
+    const openRentals = await Rental.find({ service: SERVICE, state: { $ne: 'ended' } });
+    const candidates = [];
+    for (const option of offer.options.filter((one) => rentalPrice(one.card.cost) <= price)) {
+        let funds;
+        try {
+            funds = await option.provider.credit();
+        } catch (error) {
+            logger.warn('[Rental] A provider\'s balance could not be read', { provider: option.provider.id, reason: error.message });
+            continue;
+        }
+        const owed = stillOwed(openRentals.filter((rental) => (rental.provider || 'hyperstack') === option.provider.id));
+        const need = Math.min(hours, limit / price) * option.card.cost;
+        if (funds.canCreate && funds.credit - owed - need >= RENTAL_RULES.reserve) candidates.push(option);
+        else {
+            logger.warn('[Rental] A provider was passed over: Mollama\'s balance there is too low', { provider: option.provider.id, credit: funds.credit, owed: Math.round(owed), need: Math.round(need) });
+            tellOwners('rental:funds', `Mollama's balance at ${option.provider.label} is low (${money(funds.credit)} left), so it was passed over for a rental.`);
+        }
     }
+    if (!candidates.length) return refuseRental(res, 503, 'RENTALS_PAUSED', 'No more computers can be rented right now. Nothing was charged. Try again later.');
+    const card = { ...candidates[0].card, key: offer.key };
 
     // Two requests at the same moment both pass the count above, so each open rental takes one of its person's
     // places, and the database lets a place be taken once.
@@ -8284,8 +8348,8 @@ export const startRental = asyncHandler(async (req, res) => {
     let rental = null;
     for (let slot = 0; slot < RENTAL_RULES.atOnce && !rental; slot += 1) {
         rental = await Rental.create({
-            _id: id, user, slot, price, cost: card.cost, limit, minutes: hours * 60, idleMinutes: RENTAL_RULES.idleMinutes,
-            card: { flavor: card.flavor, gpu: card.gpu, count: card.count, memoryMb: card.memoryMb, region: card.region },
+            _id: id, user, slot, price, cost: card.cost, limit, minutes: hours * 60, idleMinutes: RENTAL_RULES.idleMinutes, provider: candidates[0].provider.id,
+            card: { key: card.key, flavor: card.flavor, gpu: card.gpu, count: card.count, memoryMb: card.memoryMb, region: card.region || '' },
             machine: { name: `${machinePrefix()}${id}` }
         }).catch((error) => {
             if (error?.code !== 11000) throw error;
@@ -8309,16 +8373,34 @@ export const startRental = asyncHandler(async (req, res) => {
     rental.device = device._id;
     try {
         const socket = `${process.env.RENTAL_SERVER_URL.replace(/^http/, 'ws').replace(/[/]+$/, '')}/devices`;
-        rental.machine.id = await hyperstack.create({ name: rental.machine.name, flavor: card.flavor, script: machineScript({ socket, deviceId: device.id, key }) });
+        const link = { socket, deviceId: device.id, key };
+        // The first provider is tried, then the next when it has no machine to give after all. A machine a refused
+        // start left behind carries this rental's name and is found by that provider's sweep.
+        let started = null;
+        let last = null;
+        for (const option of candidates) {
+            try {
+                const machine = await option.provider.create({ name: rental.machine.name, flavor: option.card.flavor, script: option.provider.id === 'runpod' ? containerScript(link) : machineScript(link) });
+                started = { option, machine };
+                break;
+            } catch (error) {
+                last = error;
+                logger.warn('[Rental] A provider could not start the machine', { rental: rental.id, provider: option.provider.id, reason: error.message });
+            }
+        }
+        if (!started) throw last || new ProviderError(502, 'No provider started the machine');
+        Object.assign(rental, { provider: started.option.provider.id, cost: started.option.card.cost, price: rentalPrice(started.option.card.cost) });
+        Object.assign(rental.card, { flavor: started.option.card.flavor, gpu: started.option.card.gpu, region: started.option.card.region || '' });
+        rental.machine.id = started.machine;
         await rental.save();
     } catch (error) {
         logger.warn('[Rental] The machine could not be started', { rental: rental.id, reason: error.message });
         // The machine may exist all the same, so the rental is ended the careful way: nothing is given back until it is gone.
         await rental.save();
-        await beginRentalEnd(rental, 'failed', error instanceof HyperstackError ? error.message : null);
+        await beginRentalEnd(rental, 'failed', null);
         return refuseRental(res, 502, 'RENT_FAILED', 'The computer could not be started. Nothing was charged.', { rental: presentRental(rental) });
     }
-    logger.info('[Rental] Started', { rental: rental.id, user: String(user), flavor: card.flavor, price, limit });
+    logger.info('[Rental] Started', { rental: rental.id, user: String(user), provider: rental.provider, flavor: rental.card.flavor, price: rental.price, limit });
     getNotificationService().sendToUser(String(user), { type: 'device:changed', data: { deviceId: device.id, online: false } });
     return res.status(201).json({ success: true, rental: presentRental(rental) });
 });
@@ -8329,16 +8411,16 @@ export const startRental = asyncHandler(async (req, res) => {
 const finishRental = async (rental) => {
     try {
         if (!rental.machine.id) {
-            const found = (await hyperstack.list()).find((machine) => machine.name === rental.machine.name);
+            const found = (await providerOf(rental.provider).list()).find((machine) => machine.name === rental.machine.name);
             if (found) rental.machine.id = found.id;
             // A machine whose start was never answered may still appear, so its absence is believed only after a while.
             else if (Date.now() - rental.createdAt < 3 * MINUTE_MS) return false;
         }
-        if (rental.machine.id && await hyperstack.state(rental.machine.id) !== 'GONE') {
+        if (rental.machine.id && await providerOf(rental.provider).state(rental.machine.id) !== 'GONE') {
             rental.deleteTries += 1;
             await rental.save();
-            if (rental.deleteTries % 10 === 0) tellOwners('rental:stuck', `A rented machine (${rental.machine.name}) has not gone after ${rental.deleteTries} tries to delete it. Check it at Hyperstack.`);
-            await hyperstack.remove(rental.machine.id);
+            if (rental.deleteTries % 10 === 0) tellOwners('rental:stuck', `A rented machine (${rental.machine.name}) has not gone after ${rental.deleteTries} tries to delete it. Check it at ${providerOf(rental.provider).label}.`);
+            await providerOf(rental.provider).remove(rental.machine.id);
             return false;
         }
     } catch (error) {
@@ -8407,9 +8489,9 @@ const watchRental = async (rental, { alone }) => {
     const now = Date.now();
     let status = null;
     try {
-        if (rental.machine.id) status = await hyperstack.state(rental.machine.id);
+        if (rental.machine.id) status = await providerOf(rental.provider).state(rental.machine.id);
     } catch {
-        // The limits below run on this server's own clock, so they hold while Hyperstack cannot be asked.
+        // The limits below run on this server's own clock, so they hold while the provider cannot be asked.
     }
     if (status === 'ACTIVE' && !rental.readyAt) rental.readyAt = new Date();
     if (!alone && rental.device && deviceGateway.isOnline(rental.device)) await markRentalLinked(rental);
@@ -8444,25 +8526,29 @@ const watchRental = async (rental, { alone }) => {
 
 // A machine with this server's name mark that no open rental knows about is deleted, whoever started it.
 export const sweepRentals = async () => {
-    const machines = await hyperstack.list();
     let swept = 0;
-    for (const machine of machines) {
-        if (machine.status === 'DELETING') continue;
-        const id = machine.name.slice(machinePrefix().length);
-        const rental = mongoose.isValidObjectId(id) ? await Rental.findOne({ _id: id, service: SERVICE }) : null;
-        if (rental && rental.state !== 'ended') {
-            if (!rental.machine.id) await Rental.updateOne({ _id: rental._id }, { 'machine.id': machine.id });
-            continue;
+    for (const provider of rentalProviders()) {
+        const machines = await provider.list();
+        for (const machine of machines) {
+            if (machine.status === 'DELETING') continue;
+            const id = machine.name.slice(machinePrefix().length);
+            const rental = mongoose.isValidObjectId(id) ? await Rental.findOne({ _id: id, service: SERVICE }) : null;
+            // Known only when the open rental is with this provider: a start refused at one provider can leave a
+            // machine behind there while the rental runs at the next.
+            if (rental && rental.state !== 'ended' && (rental.provider || 'hyperstack') === provider.id) {
+                if (!rental.machine.id) await Rental.updateOne({ _id: rental._id }, { 'machine.id': machine.id });
+                continue;
+            }
+            logger.warn('[Rental] Deleting a machine no rental knows about', { provider: provider.id, machine: machine.name, id: machine.id });
+            tellOwners('rental:swept', `A machine with no rental (${machine.name}) was found at ${provider.label} and deleted.`);
+            await provider.remove(machine.id).catch((error) => logger.warn('[Rental] The machine could not be deleted', { provider: provider.id, machine: machine.name, reason: error.message }));
+            swept += 1;
         }
-        logger.warn('[Rental] Deleting a machine no rental knows about', { machine: machine.name, id: machine.id });
-        tellOwners('rental:swept', `A machine with no rental (${machine.name}) was found at Hyperstack and deleted.`);
-        await hyperstack.remove(machine.id).catch((error) => logger.warn('[Rental] The machine could not be deleted', { machine: machine.name, reason: error.message }));
-        swept += 1;
     }
     return swept;
 };
 
-// What Mollama expected Hyperstack to bill for one day (UTC) beside what it did bill, machine by machine.
+// What Mollama expected its providers to bill for one day (UTC) beside what they did bill, machine by machine.
 export const compareRentals = async (day = new Date(Date.now() - 24 * 60 * MINUTE_MS).toISOString().slice(0, 10)) => {
     const from = new Date(`${day}T00:00:00Z`);
     const to = new Date(from.getTime() + 24 * 60 * MINUTE_MS);
@@ -8476,7 +8562,7 @@ export const compareRentals = async (day = new Date(Date.now() - 24 * 60 * MINUT
         const end = Math.min(rental.endedAt || new Date(), to);
         expected += Math.max(0, end - start) / (60 * MINUTE_MS) * rental.cost;
         if (rental.endedAt && rental.endedAt >= from && rental.endedAt < to) charged += rental.spent;
-        const theirs = await hyperstack.billed(rental.machine.id, from, to);
+        const theirs = await providerOf(rental.provider).billed(rental.machine.id, from, to);
         if (theirs === null) unknown += 1;
         else billed += theirs;
     }
@@ -8491,7 +8577,7 @@ export const getRentalComparison = asyncHandler(async (req, res) => {
 
 let comparedDay = null;
 let watching = false;
-// One pass over every open rental, then the sweep, then once a day the comparison with Hyperstack's bill.
+// One pass over every open rental, then the sweep, then once a day the comparison with the providers' bills.
 // alone: run without the server (watch.js), where nothing is known of who is connected or what is being written.
 export const watchRentals = async ({ alone = false } = {}) => {
     if (!rentalsOn() || watching) return null;
@@ -8514,9 +8600,9 @@ export const watchRentals = async ({ alone = false } = {}) => {
         if (!alone && comparedDay !== yesterday) {
             comparedDay = yesterday;
             const compared = await compareRentals(yesterday).catch(() => null);
-            if (compared?.rentals) logger.info('[Rental] Compared with Hyperstack\'s bill', compared);
+            if (compared?.rentals) logger.info('[Rental] Compared with the providers\' bills', compared);
             if (compared?.rentals && !compared.matches) {
-                tellOwners('rental:mismatch', `Hyperstack's bill for ${yesterday} does not match: ${money(compared.expected)} expected, ${money(compared.billed)} billed${compared.unknown ? `, ${compared.unknown} machine(s) not answered` : ''}.`);
+                tellOwners('rental:mismatch', `The providers' bills for ${yesterday} do not match: ${money(compared.expected)} expected, ${money(compared.billed)} billed${compared.unknown ? `, ${compared.unknown} machine(s) not answered` : ''}.`);
             }
         }
     } finally {

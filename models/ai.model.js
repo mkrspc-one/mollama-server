@@ -560,13 +560,16 @@ export const chatSchemas = {
 };
 
 // One rented graphics card: a machine at Hyperstack that is one of its person's computers for as long as it runs.
-// price is what the person pays an hour and cost what Hyperstack charges Mollama, both in cents; limit is the credit
-// set aside for it. It counts as ended only once Hyperstack confirms the machine is gone.
+// price is what the person pays an hour and cost what the provider charges Mollama, both in cents; limit is the credit
+// set aside for it. provider says who runs the machine (never shown to the person). It counts as ended only once the
+// provider confirms the machine is gone.
 const rentalSchema = new mongoose.Schema({
     service: { type: String, default: SERVICE, immutable: true, index: true },
     user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
     device: { type: mongoose.Schema.Types.ObjectId, ref: 'Device', default: null },
+    provider: { type: String, enum: ['runpod', 'hyperstack'], default: 'hyperstack' },
     card: {
+        key: { type: String, default: '' },
         flavor: { type: String, required: true },
         gpu: { type: String, required: true },
         count: { type: Number, default: 1 },
@@ -579,7 +582,7 @@ const rentalSchema = new mongoose.Schema({
     minutes: { type: Number, required: true },
     idleMinutes: { type: Number, required: true },
     state: { type: String, enum: ['starting', 'running', 'ending', 'ended'], default: 'starting', index: true },
-    machine: { id: { type: Number, default: null }, name: { type: String, required: true } },
+    machine: { id: { type: mongoose.Schema.Types.Mixed, default: null }, name: { type: String, required: true } },
     readyAt: { type: Date, default: null },
     linkedAt: { type: Date, default: null },
     activeAt: { type: Date, default: null },
@@ -600,7 +603,9 @@ export const rentalSchemas = {
     start: Joi.object({
         flavor: Joi.string().trim().max(80).required(),
         hours: Joi.number().integer().min(1).max(24),
-        limit: Joi.number().integer().min(1).max(100000)
+        limit: Joi.number().integer().min(1).max(100000),
+        // The price an hour the person saw, in cents: never charged more without being shown it first.
+        price: Joi.number().integer().min(0).max(1000000)
     }),
     compare: Joi.object({ day: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/) })
 };

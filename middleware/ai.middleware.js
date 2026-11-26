@@ -2644,7 +2644,8 @@ export const runsOnline = (entry, names) => names.has(entry.tag) || (Boolean(ent
 // A machine gets a start-up script with its link to this server and the small program that keeps that link
 // (templates/rented.computer.js); nothing can reach it from outside. Optional: without its settings nothing is rented.
 const HYPERSTACK_API = 'https://infrahub-api.nexgencloud.com/v1';
-const RENTAL_SETTINGS = ['HYPERSTACK_API_KEY', 'HYPERSTACK_ENVIRONMENT', 'HYPERSTACK_KEY_NAME', 'RENTAL_SERVER_URL', 'RENTAL_LABEL'];
+const SHARED_RENTAL_SETTINGS = ['RENTAL_SERVER_URL', 'RENTAL_LABEL'];
+const RENTAL_SETTINGS = ['HYPERSTACK_API_KEY', 'HYPERSTACK_ENVIRONMENT', 'HYPERSTACK_KEY_NAME', ...SHARED_RENTAL_SETTINGS];
 const MACHINE_IMAGE = 'Ubuntu Server 24.04 LTS R570 CUDA 12.8';
 const MACHINE_NODE = { version: 'v22.23.5', sha256: 'cdeb8670a0c81f51b4dc4ac61919f9b1ad917b304bf8221eb939570663d240f8' };
 // Whether a machine is given a public address. None of its doors are open either way; the trial decides if it is needed.
@@ -2655,22 +2656,29 @@ const CARDS_KEPT_MS = 60000;
 let cardsKept = null;
 let cardsSkipped = null;
 export const skippedCards = () => cardsSkipped;
+let cardsElsewhere = [];
+export const otherCards = () => cardsElsewhere;
 let hyperstackFetch = realFetch;
 export const setHyperstackFetch = (replacement) => {
     hyperstackFetch = replacement || realFetch;
     cardsKept = null;
 };
 export const hyperstackReady = () => RENTAL_SETTINGS.every((name) => process.env[name]);
+export const runpodReady = () => ['RUNPOD_API_KEY', ...SHARED_RENTAL_SETTINGS].every((name) => process.env[name]);
 export const machinePrefix = () => `mollama-${String(process.env.RENTAL_LABEL || '').toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 12)}-`;
 
-export class HyperstackError extends Error {
+export class ProviderError extends Error {
     constructor(status, message, reason = null) {
         super(message);
-        this.name = 'HyperstackError';
+        this.name = 'ProviderError';
         this.status = status;
         this.reason = reason;
     }
 }
+export const HyperstackError = ProviderError;
+// The providers in the order they are tried: RunPod first, Hyperstack when RunPod has none of a card.
+export const rentalProviders = () => [runpod, hyperstack].filter((provider) => provider.ready());
+export const providerOf = (id) => (id === 'runpod' ? runpod : hyperstack);
 
 const askHyperstack = async (method, path, body) => {
     let response;
@@ -2682,11 +2690,11 @@ const askHyperstack = async (method, path, body) => {
             signal: AbortSignal.timeout(30000)
         });
     } catch {
-        throw new HyperstackError(0, 'Hyperstack could not be reached');
+        throw new ProviderError(0, 'Hyperstack could not be reached');
     }
     const data = await response.json().catch(() => null);
     if (!response.ok || data?.status === false) {
-        throw new HyperstackError(response.status, String(data?.message || `Hyperstack answered ${response.status}`).slice(0, 300), data?.error_reason || null);
+        throw new ProviderError(response.status, String(data?.message || `Hyperstack answered ${response.status}`).slice(0, 300), data?.error_reason || null);
     }
     return data;
 };
@@ -2730,7 +2738,161 @@ export const machineScript = ({ socket, deviceId, key }) => {
 
 const centsOf = (dollars) => Number(dollars) * 100;
 
+// RunPod (Secure Cloud only: its Community Cloud runs on other people's computers) is the first provider; Hyperstack
+// is the fallback. Neither is ever named to the people renting. RunPod's machines are containers started from an image,
+// so the start-up script is the container's command rather than cloud-init.
+const RUNPOD_API = 'https://api.runpod.io/v2';
+const RUNPOD_IMAGE = 'ubuntu:24.04';
+const RUNPOD_DISK_GB = 80;
+let runpodFetch = realFetch;
+let runpodKept = null;
+export const setRunpodFetch = (replacement) => {
+    runpodFetch = replacement || realFetch;
+    runpodKept = null;
+};
+
+const askRunpod = async (method, path, body) => {
+    let response;
+    try {
+        response = await runpodFetch(`${RUNPOD_API}${path}`, {
+            method,
+            headers: { Authorization: `Bearer ${process.env.RUNPOD_API_KEY}`, accept: 'application/json', ...(body ? { 'content-type': 'application/json' } : {}) },
+            body: body ? JSON.stringify(body) : undefined,
+            signal: AbortSignal.timeout(30000)
+        });
+    } catch {
+        throw new ProviderError(0, 'RunPod could not be reached');
+    }
+    if (response.status === 204) return null;
+    const data = await response.json().catch(() => null);
+    if (!response.ok) throw new ProviderError(response.status, String(data?.detail || data?.title || `RunPod answered ${response.status}`).slice(0, 300), data?.code || null);
+    return data;
+};
+
+// The same machine as for Hyperstack, run as a container's command: no systemd, so Ollama and the link run here.
+export const containerScript = ({ socket, deviceId, key }) => {
+    const program = readFileSync(new URL('../templates/rented.computer.js', import.meta.url), 'utf8');
+    const node = `node-${MACHINE_NODE.version}-linux-x64`;
+    return [
+        '#!/bin/bash',
+        'exec > /var/log/mollama-setup.log 2>&1',
+        'export HOME=/root DEBIAN_FRONTEND=noninteractive',
+        'mkdir -p /opt/mollama && cd /opt/mollama || exit 1',
+        'umask 077',
+        "cat > link.json <<'MOLLAMA_LINK'",
+        JSON.stringify({ socket, deviceId, key }),
+        'MOLLAMA_LINK',
+        "cat > computer.mjs <<'MOLLAMA_PROGRAM'",
+        program.trimEnd(),
+        'MOLLAMA_PROGRAM',
+        'for attempt in 1 2 3 4 5; do apt-get update && apt-get install -y --no-install-recommends curl ca-certificates xz-utils zstd pciutils && break; sleep 10; done',
+        'for attempt in 1 2 3 4 5; do curl -fsSL https://ollama.com/install.sh | sh && break; sleep 10; done',
+        `for attempt in 1 2 3 4 5; do curl -fsSLO https://nodejs.org/dist/${MACHINE_NODE.version}/${node}.tar.xz && break; sleep 10; done`,
+        `echo "${MACHINE_NODE.sha256}  ${node}.tar.xz" | sha256sum -c - || exit 1`,
+        `tar -xJf ${node}.tar.xz && rm ${node}.tar.xz`,
+        'ollama serve > /var/log/ollama.log 2>&1 &',
+        `while true; do /opt/mollama/${node}/bin/node /opt/mollama/computer.mjs; sleep 5; done`,
+        ''
+    ].join('\n');
+};
+
+const RUNPOD_STATES = { RUNNING: 'ACTIVE', PROVISIONING: 'CREATING', STARTING: 'CREATING', EXITED: 'ERROR', ERROR: 'ERROR', TERMINATED: 'GONE' };
+
+export const runpod = {
+    id: 'runpod',
+    label: 'RunPod',
+    ready: () => runpodReady(),
+    // Every Secure Cloud card with a price, whether it can be had right now, and its price an hour (cents).
+    async catalogue() {
+        if (runpodKept && Date.now() - runpodKept.at < CARDS_KEPT_MS) return runpodKept.cards;
+        const data = await askRunpod('GET', '/catalog/gpus?include=AVAILABILITY&product=POD&cloud=SECURE');
+        const cards = (data?.gpus || [])
+            .filter((gpu) => gpu.secure !== false && Number(gpu.price?.secure) > 0)
+            .map((gpu) => ({
+                flavor: gpu.id,
+                gpu: gpu.name || gpu.id,
+                count: 1,
+                memoryMb: (Number(gpu.memory) || 0) * 1024,
+                cpu: gpu.minVcpuCount || null,
+                ramGb: gpu.minRam || null,
+                diskGb: RUNPOD_DISK_GB,
+                region: (gpu.dataCenters || []).find((place) => place.availability && place.availability !== 'NONE')?.id || null,
+                spot: false,
+                cost: centsOf(gpu.price.secure),
+                available: Boolean(gpu.availability) && gpu.availability !== 'NONE'
+            }));
+        runpodKept = { at: Date.now(), cards };
+        return cards;
+    },
+    async credit() {
+        const data = await askRunpod('GET', '/billing/balance');
+        const credit = Math.floor(centsOf(data?.balanceAmount || 0));
+        return { credit, canCreate: credit > 0 };
+    },
+    async create({ name, flavor, script }) {
+        const made = await askRunpod('POST', '/pods', {
+            name,
+            image: RUNPOD_IMAGE,
+            gpu: { id: flavor, count: 1 },
+            cloud: 'SECURE',
+            disk: RUNPOD_DISK_GB,
+            env: { MOLLAMA_START: Buffer.from(script).toString('base64') },
+            cmd: ['bash', '-c', 'echo "$MOLLAMA_START" | base64 -d > /mollama-start.sh && exec bash /mollama-start.sh']
+        });
+        if (!made?.id) throw new ProviderError(502, 'RunPod did not say which machine it made');
+        return String(made.id);
+    },
+    // ACTIVE, CREATING or ERROR, or GONE once RunPod no longer knows the machine.
+    async state(id) {
+        try {
+            const pod = await askRunpod('GET', `/pods/${encodeURIComponent(id)}`);
+            return RUNPOD_STATES[String(pod?.status || '').toUpperCase()] || 'UNKNOWN';
+        } catch (error) {
+            if (error.status === 404) return 'GONE';
+            throw error;
+        }
+    },
+    async remove(id) {
+        try {
+            await askRunpod('DELETE', `/pods/${encodeURIComponent(id)}`);
+        } catch (error) {
+            if (error.status !== 404) throw error;
+        }
+    },
+    // Every machine that carries this server's name mark, whatever started it.
+    async list() {
+        const found = [];
+        let cursor = null;
+        for (let page = 0; page < 20; page += 1) {
+            const data = await askRunpod('GET', `/pods?includeClusterPods=false&limit=500${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`);
+            found.push(...(data?.pods || []).filter((pod) => String(pod.name || '').startsWith(machinePrefix())).map((pod) => ({
+                id: String(pod.id), name: pod.name, status: pod.status === 'TERMINATED' ? 'DELETING' : String(pod.status || ''), createdAt: pod.createdAt ? new Date(pod.createdAt) : null
+            })));
+            if (!data?.pagination?.hasNextPage) break;
+            cursor = data.pagination.nextCursor;
+        }
+        return found;
+    },
+    // What RunPod billed for one machine between two moments, in cents; null when it does not say.
+    async billed(id, from, to) {
+        try {
+            const data = await askRunpod('GET', `/billing/pods?podId=${encodeURIComponent(id)}&startTime=${new Date(from).toISOString()}&endTime=${new Date(to).toISOString()}&bucketSize=day`);
+            return Math.round((data?.records || []).reduce((sum, line) => sum + centsOf(line.totalAmount || 0), 0));
+        } catch {
+            return null;
+        }
+    }
+};
+
 export const hyperstack = {
+    id: 'hyperstack',
+    label: 'Hyperstack',
+    ready: () => hyperstackReady(),
+    // Every card with a price: the ones that can be had now, then the rest marked as not.
+    async catalogue() {
+        const cards = await this.cards();
+        return [...cards.map((card) => ({ ...card, available: true })), ...cardsElsewhere.map((card) => ({ ...card, available: false }))];
+    },
     // The cards that can be rented now where Mollama's machines live, each with what Hyperstack charges an hour (cents).
     async cards() {
         if (cardsKept && Date.now() - cardsKept.at < CARDS_KEPT_MS) return cardsKept.cards;
@@ -2740,7 +2902,7 @@ export const hyperstack = {
             askHyperstack('GET', '/pricebook')
         ]);
         const region = (environments.environments || []).find((entry) => entry.name === process.env.HYPERSTACK_ENVIRONMENT)?.region;
-        if (!region) throw new HyperstackError(404, `Hyperstack has no environment named ${process.env.HYPERSTACK_ENVIRONMENT}`);
+        if (!region) throw new ProviderError(404, `Hyperstack has no environment named ${process.env.HYPERSTACK_ENVIRONMENT}`);
         const priceOf = new Map((Array.isArray(prices) ? prices : prices?.data || []).map((entry) => [entry.name, centsOf(entry.value)]));
         const address = MACHINE_PUBLIC_ADDRESS ? priceOf.get('PublicIP') || 0 : 0;
         const all = (flavors.data || []).flatMap((group) => (group.flavors || []).map((flavor) => ({ region_name: group.region_name, gpu: group.gpu, ...flavor })));
@@ -2749,8 +2911,7 @@ export const hyperstack = {
             flavor.region_name !== region && 'other region',
             !(flavor.gpu && flavor.gpu_count > 0) && 'no graphics card',
             !flavor.stock_available && 'not in stock',
-            !(priceOf.get(flavor.gpu) > 0) && 'no price found',
-            /spot/i.test(flavor.name) && 'spot'
+            !(priceOf.get(flavor.gpu) > 0) && 'no price found'
         ].filter(Boolean);
         cardsSkipped = {
             region,
@@ -2758,20 +2919,30 @@ export const hyperstack = {
                 .map((flavor) => ({ flavor: flavor.name, gpu: flavor.gpu || null, why: whyNot(flavor) })),
             priceNames: [...priceOf.keys()].slice(0, 80)
         };
-        const cards = all
-            .filter((flavor) => whyNot(flavor).length === 0)
-            .map((flavor) => ({
-                flavor: flavor.name,
-                gpu: flavor.gpu,
-                count: flavor.gpu_count,
-                memoryMb: (CARD_MEMORY_GB.find(([pattern]) => pattern.test(flavor.gpu))?.[1] || 0) * 1024 * flavor.gpu_count,
-                cpu: flavor.cpu,
-                ramGb: flavor.ram,
-                diskGb: flavor.disk,
-                region,
-                cost: priceOf.get(flavor.gpu) * flavor.gpu_count + address
-            }))
-            .sort((a, b) => a.cost - b.cost);
+        const cardOf = (flavor) => ({
+            flavor: flavor.name,
+            gpu: flavor.gpu,
+            count: flavor.gpu_count,
+            memoryMb: (CARD_MEMORY_GB.find(([pattern]) => pattern.test(flavor.gpu))?.[1] || 0) * 1024 * flavor.gpu_count,
+            cpu: flavor.cpu,
+            ramGb: flavor.ram,
+            diskGb: flavor.disk,
+            region: flavor.region_name,
+            spot: /spot/i.test(flavor.name),
+            cost: priceOf.get(flavor.gpu) * flavor.gpu_count + address
+        });
+        const cards = all.filter((flavor) => whyNot(flavor).length === 0).map(cardOf).sort((a, b) => a.cost - b.cost);
+        // Every other machine type with a price, shown greyed out with why it cannot be rented here: in stock in
+        // another region, or out of stock everywhere. One line per type.
+        const rentable = new Set(cards.map((card) => card.flavor));
+        const elsewhere = new Map();
+        for (const flavor of all.filter((one) => one.gpu && one.gpu_count > 0 && priceOf.get(one.gpu) > 0 && !rentable.has(one.name))) {
+            const known = elsewhere.get(flavor.name);
+            if (known?.why !== 'Out of stock' && known) continue;
+            if (flavor.stock_available) elsewhere.set(flavor.name, { ...cardOf(flavor), why: `Only in ${flavor.region_name}` });
+            else if (!known) elsewhere.set(flavor.name, { ...cardOf(flavor), why: 'Out of stock' });
+        }
+        cardsElsewhere = [...elsewhere.values()].sort((a, b) => a.cost - b.cost);
         cardsKept = { at: Date.now(), cards };
         return cards;
     },
@@ -2795,7 +2966,7 @@ export const hyperstack = {
             user_data: script
         });
         const id = made.instances?.[0]?.id;
-        if (!Number.isInteger(id)) throw new HyperstackError(502, 'Hyperstack did not say which machine it made');
+        if (!Number.isInteger(id)) throw new ProviderError(502, 'Hyperstack did not say which machine it made');
         return id;
     },
 

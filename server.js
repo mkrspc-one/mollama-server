@@ -151,14 +151,20 @@ class Server {
             }
         }
 
-        // Optional. Rented computers are on only when all of their settings are set (and billing is on).
-        const rentalVars = ['HYPERSTACK_API_KEY', 'HYPERSTACK_ENVIRONMENT', 'HYPERSTACK_KEY_NAME', 'RENTAL_SERVER_URL', 'RENTAL_LABEL'];
-        const missingRentalVars = rentalVars.filter(varName => !process.env[varName]);
-        if (missingRentalVars.length > 0 && missingRentalVars.length < rentalVars.length) {
-            throw new Error(`Rented computers need all of ${rentalVars.join(', ')}; missing: ${missingRentalVars.join(', ')}`);
+        // Optional. Rented computers come from RunPod (RUNPOD_API_KEY) first and Hyperstack (its three settings, all or
+        // none) as the fallback; either needs this server's address and label (and billing on).
+        const hyperstackVars = ['HYPERSTACK_API_KEY', 'HYPERSTACK_ENVIRONMENT', 'HYPERSTACK_KEY_NAME', 'RENTAL_SERVER_URL', 'RENTAL_LABEL'];
+        const missingHyperstack = hyperstackVars.slice(0, 3).filter(varName => !process.env[varName]);
+        if (missingHyperstack.length > 0 && missingHyperstack.length < 3) {
+            throw new Error(`Rented computers need all of ${hyperstackVars.join(', ')}; missing: ${missingHyperstack.join(', ')}`);
+        }
+        const rentalProvider = missingHyperstack.length === 0 || Boolean(process.env.RUNPOD_API_KEY);
+        const missingShared = ['RENTAL_SERVER_URL', 'RENTAL_LABEL'].filter(varName => !process.env[varName]);
+        if (rentalProvider && missingShared.length > 0) {
+            throw new Error(`Rented computers need all of ${hyperstackVars.join(', ')}; missing: ${missingShared.join(', ')}`);
         }
         const testMoney = !/^(sk|rk)_live_/.test(process.env.STRIPE_SECRET_KEY || '');
-        if (missingRentalVars.length === 0 && testMoney && process.env.ADMIN_ONLY !== 'true' && process.env.NODE_ENV !== 'test') {
+        if (rentalProvider && testMoney && process.env.ADMIN_ONLY !== 'true' && process.env.NODE_ENV !== 'test') {
             logger.warn('Rented computers stay off: billing is in test mode and ADMIN_ONLY is not on, so anyone could rent a real machine with test credit');
         }
     }
