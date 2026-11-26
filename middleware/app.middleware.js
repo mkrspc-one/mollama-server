@@ -626,6 +626,11 @@ const setupMiddleware = async (app) => {
         return express.json({limit: maxRequestSize, verify: keepSignedBody})(req, res, next);
     });
     app.use(express.urlencoded({extended: true, limit: maxRequestSize})); // Parses URL-encoded data with size limit
+    // Express 5 leaves req.body undefined when a request has no body; the handlers were written for an empty object.
+    app.use((req, res, next) => {
+        req.body ??= {};
+        next();
+    });
 
     // Cookie parser for authentication token cookies
     app.use(cookieParser());

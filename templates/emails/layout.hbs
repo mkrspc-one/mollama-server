@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en" xmlns="http://www.w3.org/1999/xhtml">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="x-apple-disable-message-reformatting">
+    {{#unless look.themed}}<meta name="color-scheme" content="light dark">
+    <meta name="supported-color-schemes" content="light dark">{{/unless}}
+    <title>{{title}}</title>
+    <link href="https://fonts.googleapis.com/css2?family=Montserrat+Alternates:wght@700&family=Urbanist:wght@400;600;700&display=swap" rel="stylesheet">
+    <style>
+        body { margin: 0; padding: 0; width: 100% !important; -webkit-text-size-adjust: 100%; }
+        table { border-collapse: collapse; }
+        img { border: 0; display: block; }
+        @media only screen and (max-width: 620px) {
+            .card { border-radius: 0 !important; border-left: 0 !important; border-right: 0 !important; }
+            .pad { padding-left: 24px !important; padding-right: 24px !important; }
+            .title { font-size: 22px !important; line-height: 30px !important; }
+        }
+        {{#unless look.themed}}
+        @media (prefers-color-scheme: dark) {
+            .page { background-color: #0B1F36 !important; }
+            .card { background-color: #12355B !important; border-color: #1A4A7A !important; border-top-color: #FF570A !important; }
+            .ink, .ink p, .ink li, .ink td, .title, .mark { color: #F5F9FD !important; }
+            .muted, .muted a { color: #A5D8FF !important; }
+            .panel { background-color: #1A4A7A !important; border-color: #A5D8FF !important; }
+            .panel-warn { background-color: #3A2A10 !important; border-color: #E88500 !important; }
+            .panel-warn, .panel-warn p, .panel-warn li { color: #FFD9A8 !important; }
+            .rule { border-color: #1A4A7A !important; }
+            .code { background-color: #0B1F36 !important; color: #A5D8FF !important; border-color: #1A4A7A !important; }
+            .step { background-color: #A5D8FF !important; color: #0B1F36 !important; }
+        }
+        {{/unless}}
+    </style>
+</head>
+<body class="page" style="margin:0; padding:0; background-color:{{look.page}};{{#if look.patternUrl}} background-image:url('{{look.patternUrl}}');{{/if}}">
+<div style="display:none; max-height:0; overflow:hidden; mso-hide:all; font-size:1px; line-height:1px; color:{{look.page}}; opacity:0;">{{preheader}}&#8199;&#847;&#8199;&#847;&#8199;&#847;&#8199;&#847;&#8199;&#847;&#8199;&#847;&#8199;&#847;&#8199;&#847;</div>
+<table role="presentation" class="page" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="{{look.page}}"{{#if look.patternUrl}} background="{{look.patternUrl}}"{{/if}} style="background-color:{{look.page}};{{#if look.patternUrl}} background-image:url('{{look.patternUrl}}'); background-repeat:repeat;{{/if}}">
+    <tr>
+        <td align="center" style="padding:40px 12px;">
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="max-width:560px;">
+                <tr>
+                    <td class="pad" style="padding:0 40px 20px 40px;">
+                        <a href="{{appUrl}}" class="mark" style="font-family:'Montserrat Alternates', 'Segoe UI', Arial, sans-serif; font-size:22px; font-weight:700; letter-spacing:-0.3px; color:{{look.mark}}; text-decoration:none;">{{appName}}</a>
+                    </td>
+                </tr>
+                <tr>
+                    <td class="card" bgcolor="{{look.card}}" style="background-color:{{look.card}}; border:1px solid {{look.border}}; border-top:4px solid {{look.button}}; border-radius:12px;">
+                        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+                            <tr>
+                                <td class="pad ink" style="padding:36px 40px 40px 40px; font-family:'Urbanist', 'Segoe UI', Arial, sans-serif; font-size:16px; line-height:26px; color:{{look.text}};">
+                                    <h1 class="title" style="margin:0 0 16px 0; font-family:'Urbanist', 'Segoe UI', Arial, sans-serif; font-size:26px; line-height:34px; font-weight:700; color:{{look.heading}};">{{title}}</h1>
+                                    {{> @partial-block}}
+                                </td>
+                            </tr>
+                        </table>
+                    </td>
+                </tr>
+                <tr>
+                    <td class="pad muted" style="padding:24px 40px 0 40px; font-family:'Urbanist', 'Segoe UI', Arial, sans-serif; font-size:13px; line-height:20px; color:{{look.footer}};">
+                        <p style="margin:0 0 6px 0;"><strong>{{appName}}</strong> {{appTagline}}</p>
+                        {{#if recipient}}<p style="margin:0 0 6px 0;">Sent to {{recipient}}{{#if reason}} {{reason}}{{/if}}.</p>{{/if}}
+                        <p style="margin:0;"><a href="{{appUrl}}" style="color:{{look.footer}}; text-decoration:underline;">{{appHost}}</a> &nbsp;&middot;&nbsp; &copy; {{currentYear}} {{appName}}</p>
+                    </td>
+                </tr>
+            </table>
+        </td>
+    </tr>
+</table>
+</body>
+</html>

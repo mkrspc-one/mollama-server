@@ -163,6 +163,8 @@ const formatUserResponse = (user) => {
         emailVerified: user.emailVerified,
         twoFactorEnabled: user.twoFactorEnabled,
         profilePhoto: user.profilePhoto,
+        favoriteTheme: user.favoriteTheme || null,
+        favoriteColors: user.favoriteColors?.page ? user.favoriteColors : null,
         active: active
     };
 };
@@ -194,7 +196,7 @@ const sendWelcomeEmail = async (user, transporter = null) => {
         to: user.email, subject: 'Welcome to Mollama!', template: 'welcome', data: {
             firstName: user.firstName || user.name || 'User',
             email: user.email,
-            loginUrl: `${process.env.APP_URL}/auth/login`
+            loginUrl: `${process.env.APP_URL}/login`
         }
     }, transporter);
 };
@@ -831,8 +833,8 @@ const authController = {
             // Clear user profile cache after password reset token update
             await cache.invalidateUserCaches(user.id);
 
-            const resetUrl = `${req.protocol}://${req.get('host')}/auth/reset-password/${resetToken}`;
-            logger.info(`[Auth Controller] Password reset token generated for ${email}`, {userId: user.id, resetUrl});
+            const resetUrl = `${process.env.APP_URL}/reset-password/${resetToken}`;
+            logger.info(`[Auth Controller] Password reset token generated for ${email}`, {userId: user.id});
             // Send password reset email
             try {
                 await sendPasswordResetEmail(user, resetToken, resetUrl, getEmailTransporter());
@@ -1288,7 +1290,7 @@ const authController = {
 
     sendVerificationEmail: asyncHandler(async (req, res) => {
         const userId = req.user.id;
-        const {email} = req.body;
+        const {email} = req.body || {};
 
         logger.info('Email verification requested', {userId, email});
         logger.verbose('[Auth Controller - Email Verification] Request details:', {
@@ -1302,6 +1304,12 @@ const authController = {
         if (!user) {
             logger.error('[Auth Controller - Email Verification] User not found:', {userId});
             throw new AppError('User not found', 404);
+        }
+
+        const transporter = getEmailTransporter();
+        if (!transporter) {
+            logger.error('[Auth Controller - Email Verification] Email is not set up on this server');
+            throw new AppError('Email is not set up on this server, so no verification email can be sent.', 503);
         }
 
         // Check rate limiting - only allow one email per 5 minutes
@@ -1372,7 +1380,7 @@ const authController = {
                     appName: process.env.APP_NAME,
                     supportEmail: process.env.EMAIL_FROM
                 }
-            }, getEmailTransporter());
+            }, transporter);
 
             logger.info('Verification email sent successfully', {userId, email: targetEmail});
 
@@ -1390,6 +1398,7 @@ const authController = {
             user.pendingEmail = undefined;
             await user.save({validateBeforeSave: false});
 
+            await cache.del(rateLimitKey);
             logger.error('Failed to send verification email:', {userId, error: emailError.message});
             throw new AppError('Failed to send verification email. Please try again later.', 500);
         }

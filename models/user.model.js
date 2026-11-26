@@ -95,6 +95,25 @@ const userSchema = new mongoose.Schema({
     profilePhoto: {
         type: String, default: 'default.jpg'
     },
+    // The theme and its light or dark variant the person last chose, as "theme:mode". Shared by every app on this account.
+    favoriteTheme: {
+        type: String, match: /^[a-z0-9-]{1,80}:(light|dark)$/
+    },
+    // The favourite theme's colours as the web app showed them, and its page pattern, so emails can wear it.
+    favoriteColors: {
+        page: {type: String, match: /^#[0-9a-fA-F]{6}$/},
+        card: {type: String, match: /^#[0-9a-fA-F]{6}$/},
+        text: {type: String, match: /^#[0-9a-fA-F]{6}$/},
+        muted: {type: String, match: /^#[0-9a-fA-F]{6}$/},
+        heading: {type: String, match: /^#[0-9a-fA-F]{6}$/},
+        primary: {type: String, match: /^#[0-9a-fA-F]{6}$/},
+        onPrimary: {type: String, match: /^#[0-9a-fA-F]{6}$/},
+        button: {type: String, match: /^#[0-9a-fA-F]{6}$/},
+        buttonText: {type: String, match: /^#[0-9a-fA-F]{6}$/},
+        border: {type: String, match: /^#[0-9a-fA-F]{6}$/},
+        warning: {type: String, match: /^#[0-9a-fA-F]{6}$/},
+        pattern: {type: String, match: /^[a-z]{0,20}$/}
+    },
     twoFactorEnabled: {
         type: Boolean, default: false
     },

@@ -83,7 +83,7 @@ router.get('/me',
     async (req, res) => {
         // Bio lives only in the DB, not in the JWT claims
         const User = (await import('../models/user.model.js')).default;
-        const dbUser = await User.findById(req.user.id).select('bio').lean();
+        const dbUser = await User.findById(req.user.id).select('bio favoriteTheme favoriteColors').lean();
         // Use formatUserResponse for consistent response structure
         // Format user response directly (internal formatting logic)
         const formattedUser = {
@@ -99,6 +99,8 @@ router.get('/me',
                 emailVerified: req.user.emailVerified,
                 twoFactorEnabled: req.user.twoFactorEnabled,
                 profilePhoto: req.user.profilePhoto,
+                favoriteTheme: dbUser?.favoriteTheme || null,
+                favoriteColors: dbUser?.favoriteColors?.page ? dbUser.favoriteColors : null,
                 active: req.user.active !== undefined ? req.user.active : true
             }
         };

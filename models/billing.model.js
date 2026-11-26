@@ -1,7 +1,7 @@
 import mongoose from 'mongoose';
 
 export const BILLING_SERVICE = 'ai-base';
-export const LINE_KINDS = ['topup', 'charge', 'hold', 'refund', 'adjustment'];
+export const LINE_KINDS = ['topup', 'charge', 'hold', 'refund', 'adjustment', 'dispute'];
 
 /**
  * One line of a person's credit ledger. Lines are added and never changed.
@@ -45,5 +45,22 @@ const neverChanged = function () {
     .forEach((operation) => creditLineSchema.pre(operation, neverChanged));
 
 const CreditLine = mongoose.models.CreditLine || mongoose.model('CreditLine', creditLineSchema);
+
+/**
+ * A payment page that is open. A person has at most one at a time, so a limit on what they may buy cannot be passed
+ * by opening several and paying each. Gone once paid, replaced or past its end.
+ */
+const checkoutSchema = new mongoose.Schema({
+    service: { type: String, default: BILLING_SERVICE },
+    live: { type: Boolean, required: true },
+    user: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+    session: { type: String },
+    amount: { type: Number, required: true },
+    endsAt: { type: Date, required: true }
+});
+checkoutSchema.index({ service: 1, live: 1, user: 1 }, { unique: true });
+checkoutSchema.index({ service: 1, session: 1 });
+
+export const Checkout = mongoose.models.Checkout || mongoose.model('Checkout', checkoutSchema);
 
 export default CreditLine;

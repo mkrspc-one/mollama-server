@@ -111,6 +111,21 @@ export const userSchemas = {
         username: Joi.string().min(3).max(30).pattern(/^[a-zA-Z0-9_]+$/),
         email: Joi.string().email(),
         profilePhoto: Joi.string(),
+        favoriteTheme: Joi.string().pattern(/^[a-z0-9-]{1,80}:(light|dark)$/).allow(null),
+        favoriteColors: Joi.object({
+            page: Joi.string().pattern(/^#[0-9a-fA-F]{6}$/),
+            card: Joi.string().pattern(/^#[0-9a-fA-F]{6}$/),
+            text: Joi.string().pattern(/^#[0-9a-fA-F]{6}$/),
+            muted: Joi.string().pattern(/^#[0-9a-fA-F]{6}$/),
+            heading: Joi.string().pattern(/^#[0-9a-fA-F]{6}$/),
+            primary: Joi.string().pattern(/^#[0-9a-fA-F]{6}$/),
+            onPrimary: Joi.string().pattern(/^#[0-9a-fA-F]{6}$/),
+            button: Joi.string().pattern(/^#[0-9a-fA-F]{6}$/),
+            buttonText: Joi.string().pattern(/^#[0-9a-fA-F]{6}$/),
+            border: Joi.string().pattern(/^#[0-9a-fA-F]{6}$/),
+            warning: Joi.string().pattern(/^#[0-9a-fA-F]{6}$/),
+            pattern: Joi.string().allow('').pattern(/^[a-z]{0,20}$/)
+        }).allow(null),
         roles: Joi.array().items(Joi.string().valid(...VALID_ROLES)),
         active: Joi.boolean()
     }).min(1),
@@ -748,7 +763,8 @@ const themeTokensSchema = Joi.object({
         fab: cssLength(),
         progress: cssLength(),
         notification: cssLength()
-    })
+    }),
+    pageBackground: Joi.string().allow('').pattern(/^[a-z]{0,20}$/)
 });
 
 export const themeSchemas = {

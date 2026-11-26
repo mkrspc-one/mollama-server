@@ -1,6 +1,7 @@
 import logger from '../utils/app.logger.js';
 import Log from '../models/log.model.js';
 import Theme from '../models/theme.model.js';
+import User from '../models/user.model.js';
 import {hasRight, RIGHTS} from '../config/rights.js';
 import mongoose from 'mongoose';
 import {cache} from '../middleware/cache.middleware.js';
@@ -1424,6 +1425,78 @@ const clearLogs = asyncHandler(async (req, res, next) => {
     }
 });
 
+// Every email is drawn on templates/emails/layout.hbs with these few parts, so they share one look.
+const EMAIL_FONT = "font-family:'Urbanist', 'Segoe UI', Arial, sans-serif;";
+const EMAIL_TAGLINE = 'runs AI models on your own computers.';
+const L = (name) => `{{@root.look.${name}}}`;
+const EMAIL_PARTS = {
+    button: `<table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:28px 0;"><tr><td class="button" bgcolor="${L('button')}" style="border-radius:8px; background-color:${L('button')};"><a href="{{url}}" style="display:inline-block; padding:14px 28px; ${EMAIL_FONT} font-size:16px; font-weight:700; line-height:20px; color:${L('buttonText')}; text-decoration:none; border:1px solid ${L('button')}; border-radius:8px; background-color:${L('button')};">{{label}}</a></td></tr></table>`,
+    fallback: `<p class="muted" style="margin:0 0 6px 0; font-size:13px; line-height:20px; color:${L('muted')};">If the button does not work, paste this address into your browser:</p><p class="code" style="margin:0 0 24px 0; padding:10px 12px; font-family:'JetBrains Mono', Consolas, monospace; font-size:12px; line-height:18px; color:${L('text')}; background-color:${L('codeBg')}; border:1px solid ${L('rule')}; border-radius:6px; word-break:break-all;"><a href="{{url}}" style="color:inherit; text-decoration:none;">{{url}}</a></p>`,
+    note: `<div class="panel" style="margin:0 0 16px 0; padding:14px 16px; background-color:${L('tint')}; border-left:3px solid ${L('primary')}; border-radius:6px; font-size:14px; line-height:22px; color:${L('text')};">{{> @partial-block}}</div>`,
+    warn: `<div class="panel-warn" style="margin:0 0 16px 0; padding:14px 16px; background-color:${L('warnBg')}; border-left:3px solid ${L('warning')}; border-radius:6px; font-size:14px; line-height:22px; color:${L('warnText')};">{{> @partial-block}}</div>`,
+    details: `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" class="rule" style="margin:0 0 24px 0; border-top:1px solid ${L('rule')};">{{> @partial-block}}</table>`,
+    row: `<tr><td class="rule muted" style="padding:10px 16px 10px 0; width:96px; border-bottom:1px solid ${L('rule')}; font-size:13px; line-height:20px; color:${L('muted')}; vertical-align:top;">{{label}}</td><td class="rule" style="padding:10px 0; border-bottom:1px solid ${L('rule')}; font-size:14px; line-height:20px; font-weight:600; color:${L('text')}; vertical-align:top; word-break:break-word;">{{value}}</td></tr>`,
+    step: `<tr><td class="rule" style="padding:12px 14px 12px 0; width:28px; border-bottom:1px solid ${L('rule')}; vertical-align:top;"><div class="step" style="width:28px; height:28px; border-radius:14px; background-color:${L('primary')}; color:${L('onPrimary')}; ${EMAIL_FONT} font-size:14px; font-weight:700; line-height:28px; text-align:center;">{{number}}</div></td><td class="rule" style="padding:12px 0; border-bottom:1px solid ${L('rule')}; font-size:14px; line-height:21px; color:${L('text')}; vertical-align:top;"><strong style="font-size:15px;">{{title}}</strong><br><span class="muted" style="color:${L('muted')};">{{text}}</span></td></tr>`
+};
+
+// The app's own look, used when the reader has no favourite theme or its colours would be hard to read.
+const EMAIL_LOOK = {
+    page: '#F5F9FD', card: '#FFFFFF', text: '#12355B', muted: '#4D6680', heading: '#12355B', primary: '#12355B', onPrimary: '#FFFFFF',
+    button: '#FF570A', buttonText: '#0B1F36', border: '#D3DEE9', warning: '#E88500',
+    tint: '#E3F1FE', rule: '#E6EDF4', warnBg: '#FFF4E5', warnText: '#8F5200', codeBg: '#F5F9FD', footer: '#4D6680', mark: '#12355B', themed: false
+};
+// Patterns with a picture in the web app's public/email folder, one in dark ink and one in light.
+const EMAIL_PATTERNS = ['grid', 'graph', 'dots', 'lines', 'diagonal', 'crosshatch', 'checker', 'hex', 'plus', 'waves', 'zigzag'];
+const rgbOf = (hex) => [1, 3, 5].map((at) => parseInt(hex.slice(at, at + 2), 16));
+const glowOf = (hex) => {
+    const [r, g, b] = rgbOf(hex).map((v) => v / 255).map((v) => (v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4));
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+};
+const contrastOf = (a, b) => {
+    const [hi, lo] = [glowOf(a), glowOf(b)].sort((x, y) => y - x);
+    return (hi + 0.05) / (lo + 0.05);
+};
+const mixOf = (a, b, share) => `#${rgbOf(a).map((v, i) => Math.round(v * share + rgbOf(b)[i] * (1 - share)).toString(16).padStart(2, '0')).join('')}`;
+const isHex = (value) => /^#[0-9a-fA-F]{6}$/.test(value || '');
+
+/** The colours an email is drawn in: the reader's favourite theme when it reads well, else the app's own look. */
+const emailLook = (colors) => {
+    const given = colors && ['page', 'card', 'text', 'button', 'buttonText'].every((key) => isHex(colors[key])) ? colors : null;
+    if (!given) return EMAIL_LOOK;
+    const pick = (key, fallback) => (isHex(given[key]) ? given[key] : fallback);
+    const look = {
+        page: given.page, card: given.card, text: given.text, button: given.button, buttonText: given.buttonText,
+        heading: pick('heading', given.text), muted: pick('muted', given.text), primary: pick('primary', given.button),
+        onPrimary: pick('onPrimary', given.buttonText), border: pick('border', mixOf(given.text, given.card, 0.2)), warning: pick('warning', EMAIL_LOOK.warning)
+    };
+    if (contrastOf(look.text, look.card) < 4.5 || contrastOf(look.buttonText, look.button) < 4.5) return EMAIL_LOOK;
+    if (contrastOf(look.heading, look.card) < 3) look.heading = look.text;
+    if (contrastOf(look.muted, look.card) < 4.5) look.muted = look.text;
+    if (contrastOf(look.onPrimary, look.primary) < 4.5) Object.assign(look, {primary: look.button, onPrimary: look.buttonText});
+    look.tint = mixOf(look.primary, look.card, 0.12);
+    look.rule = mixOf(look.text, look.card, 0.14);
+    look.warnBg = mixOf(look.warning, look.card, 0.14);
+    look.warnText = contrastOf(look.warning, look.warnBg) >= 4.5 ? look.warning : look.text;
+    look.codeBg = look.page === look.card ? look.tint : look.page;
+    look.footer = [look.muted, look.text, look.heading].find((tone) => contrastOf(tone, look.page) >= 4.5) || (glowOf(look.page) > 0.4 ? '#000000' : '#FFFFFF');
+    look.mark = contrastOf(look.heading, look.page) >= 3 ? look.heading : look.footer;
+    if (EMAIL_PATTERNS.includes(given.pattern) && process.env.APP_URL) {
+        look.patternUrl = `${process.env.APP_URL.replace(/\/$/, '')}/email/${given.pattern}-${glowOf(look.page) > 0.4 ? 'dark' : 'light'}.png`;
+    }
+    look.themed = true;
+    return look;
+};
+
+let emailPartsReady = null;
+const prepareEmailParts = () => emailPartsReady ||= (async () => {
+    handlebars.registerHelper('concat', (...values) => values.slice(0, -1).join(''));
+    for (const [name, source] of Object.entries(EMAIL_PARTS)) handlebars.registerPartial(name, source);
+    handlebars.registerPartial('layout', await fs.readFile(path.join(__dirname, '../templates/emails/layout.hbs'), 'utf8'));
+})().catch((error) => {
+    emailPartsReady = null;
+    throw error;
+});
+
 /**
  * Load and compile email template
  * @param {string} templateName - Name of the template file (without .hbs extension)
@@ -1449,6 +1522,7 @@ const loadTemplate = async (templateName) => {
             return emailTemplatesCache.get(templateName);
         }
 
+        await prepareEmailParts();
         // Read template file
         const templatePath = path.join(__dirname, '../templates/emails', `${templateName}.hbs`);
         const templateContent = await fs.readFile(templatePath, 'utf8');
@@ -1486,10 +1560,15 @@ const sendEmail = async ({to, subject, template, data, from, replyTo}, transport
 
         // Load and render template
         const compiledTemplate = await loadTemplate(template);
+        const reader = to ? await User.findOne({email: String(to).toLowerCase()}).select('favoriteColors').lean().catch(() => null) : null;
         const htmlContent = compiledTemplate({
             ...data,
+            look: emailLook(reader?.favoriteColors),
+            appTagline: EMAIL_TAGLINE,
+            recipient: to,
             appName: process.env.APP_NAME,
             appUrl: process.env.APP_URL,
+            appHost: (process.env.APP_URL || '').replace(/^https?:\/\//, '').replace(/\/$/, ''),
             currentYear: new Date().getFullYear()
         });
 
@@ -1587,6 +1666,11 @@ const getEmailTransporter = () => {
     return emailTransporter;
 };
 
+// The tests' stand-in for the mail connection.
+const setEmailTransporter = (transporter) => {
+    emailTransporter = transporter;
+};
+
 /**
  * @desc    Render email template for preview
  * @route   POST /api/v1/email/template/render
@@ -1606,6 +1690,8 @@ const renderEmailTemplate = asyncHandler(async (req, res, next) => {
         const compiledTemplate = await loadTemplate(template);
         const htmlContent = compiledTemplate({
             ...data,
+            look: emailLook(data?.colors),
+            appTagline: EMAIL_TAGLINE,
             appName: process.env.APP_NAME ,
             appUrl: process.env.APP_URL,
             currentYear: new Date().getFullYear()
@@ -2819,6 +2905,8 @@ export {
     initializeEmailService,
     isEmailReady,
     getEmailTransporter,
+    setEmailTransporter,
+    emailLook,
     parseFilters,
     applyFilters,
     applySmartPagination,

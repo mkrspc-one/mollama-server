@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import mongoose from 'mongoose';
 import logger from '../utils/app.logger.js';
 import {asyncHandler, getNotificationService} from '../middleware/app.middleware.js';
-import CreditLine, {BILLING_SERVICE} from '../models/billing.model.js';
+import CreditLine, {BILLING_SERVICE, Checkout} from '../models/billing.model.js';
 import User from '../models/user.model.js';
 
 const STRIPE_API = 'https://api.stripe.com/v1';
@@ -11,6 +11,8 @@ const STRIPE_VERSION = '2026-11-18.endive';
 const SIGNATURE_AGE_SECONDS = 300;
 const WRITE_TRIES = 12;
 const DAY_MS = 24 * 60 * 60 * 1000;
+// Stripe keeps a payment page open at least 30 minutes; a little more, so its clock and ours never disagree.
+const PAGE_OPEN_SECONDS = 31 * 60;
 const PAGE = 50;
 
 // All money is in cents. Suggested values, for the owner to confirm.
@@ -278,10 +280,34 @@ const startCheckout = guarded(async (req, res) => {
         throw new BillingError('TOO_LARGE', why, 400, {most: limit.most});
     }
 
+    // One open payment page per person. An earlier one is closed at Stripe first; if it was paid meanwhile, its
+    // credit is still on its way, and the limit above is read again once it has arrived.
+    const mine = {...ledger(), user: user._id};
+    await Checkout.deleteMany({...mine, endsAt: {$lt: new Date()}});
+    const open = await Checkout.findOne(mine);
+    if (open?.session) {
+        const closed = await askStripe(`/checkout/sessions/${encodeURIComponent(open.session)}/expire`, {}).catch(() => null);
+        if (closed?.status !== 'expired') {
+            throw new BillingError('PAYMENT_UNDER_WAY', 'Your last payment is still being counted. Try again in a minute.', 409);
+        }
+        await Checkout.deleteOne({_id: open._id});
+    } else if (open) {
+        throw new BillingError('PAYMENT_UNDER_WAY', 'A payment page is being opened for you already. Try again in a minute.', 409);
+    }
+    const endsAt = Math.floor(Date.now() / 1000) + PAGE_OPEN_SECONDS;
+    let page;
+    try {
+        page = await Checkout.create({...mine, amount, endsAt: new Date(endsAt * 1000)});
+    } catch (error) {
+        if (error?.code === 11000) throw new BillingError('PAYMENT_UNDER_WAY', 'A payment page is being opened for you already. Try again in a minute.', 409);
+        throw error;
+    }
+
     const who = {...stripeMark(), user: user.id};
     const onStatement = statementName();
     const session = await askStripe('/checkout/sessions', {
         mode: 'payment',
+        expires_at: endsAt,
         success_url: `${process.env.APP_URL}/billing?paid=yes`,
         cancel_url: `${process.env.APP_URL}/billing?paid=no`,
         client_reference_id: user.id,
@@ -298,7 +324,11 @@ const startCheckout = guarded(async (req, res) => {
         metadata: who,
         payment_intent_data: {metadata: who, ...(onStatement ? {statement_descriptor_suffix: onStatement} : {})},
         ...(limit.isNew ? {payment_method_options: {card: {request_three_d_secure: 'any'}}} : {})
+    }).catch(async (error) => {
+        await Checkout.deleteOne({_id: page._id});
+        throw error;
     });
+    await Checkout.updateOne({_id: page._id}, {session: session.id});
 
     let address;
     try {
@@ -306,7 +336,10 @@ const startCheckout = guarded(async (req, res) => {
     } catch {
         address = null;
     }
-    if (address?.protocol !== 'https:') throw new BillingError('STRIPE_REFUSED', 'Stripe gave no payment page', 502);
+    if (address?.protocol !== 'https:') {
+        await Checkout.deleteOne({_id: page._id});
+        throw new BillingError('STRIPE_REFUSED', 'Stripe gave no payment page', 502);
+    }
     res.status(200).json({success: true, url: address.href});
 });
 
@@ -342,6 +375,7 @@ const countPayment = async (session) => {
         about: 'Credit bought',
         ref: {session: session.id, payment: idOf(session.payment_intent)}
     });
+    await Checkout.deleteOne({...ledger(), session: session.id});
     if (repeated) return;
     getNotificationService().notify(userId, 'billing:credit', {
         level: 'success',
@@ -349,6 +383,46 @@ const countPayment = async (session) => {
         message: `${money(cents)} of credit was added. You have ${money(line.balance)}.`,
         path: '/billing'
     });
+};
+
+// A person told their bank they did not mean to pay. The bank takes the money back until the dispute is decided, so
+// the credit is taken back too: what is left of the purchase, as far as it is unspent. If the dispute is won it is
+// given back. Owners are told either way, since a lost one also costs Stripe's dispute fee.
+const DISPUTE_ENDS = {won: 'won', lost: 'lost', warning_closed: 'closed', prevented: 'closed'};
+const countDispute = async (dispute, opened) => {
+    const payment = idOf(dispute.payment_intent);
+    if (!payment) return;
+    const bought = await CreditLine.findOne({...ledger(), kind: 'topup', 'ref.payment': payment});
+    if (!bought) return;
+    const taken = await CreditLine.findOne({...ledger(), key: `dispute:${dispute.id}`});
+    const tell = (title, message) => getNotificationService().notifyRole(['OWNER', 'ADMIN'], 'billing:dispute', {level: 'warning', title, message, path: '/billing'});
+    if (opened) {
+        if (taken) return;
+        const left = bought.amount - (await takenBack(bought)).total;
+        const more = Math.max(0, Math.min(dispute.amount || 0, left));
+        const take = Math.min(more, (await balanceOf(bought.user)).balance);
+        const {repeated} = await writeLine(bought.user, {
+            kind: 'dispute', amount: -take, key: `dispute:${dispute.id}`, about: 'Payment disputed with the bank',
+            ref: {line: bought._id, payment}, short: more - take
+        });
+        if (repeated) return;
+        logger.warn('[Billing] A payment was disputed', {user: String(bought.user), dispute: dispute.id, taken: take, short: more - take});
+        tell('A payment was disputed', `${money(dispute.amount || 0)} was disputed with the bank. ${money(take)} of credit was taken back${more > take ? `; ${money(more - take)} had already been spent` : ''}. Answer it in Stripe.`);
+        getNotificationService().notify(bought.user, 'billing:dispute', {
+            level: 'warning',
+            title: 'Payment disputed',
+            message: `${money(take)} of credit is held back while your bank looks into a payment.`,
+            path: '/billing'
+        });
+        return;
+    }
+    const end = DISPUTE_ENDS[dispute.status];
+    if (!end || !taken) return;
+    if (end === 'won' && taken.amount < 0) {
+        const {repeated} = await writeLine(bought.user, {kind: 'dispute', amount: -taken.amount, key: `dispute-won:${dispute.id}`, about: 'Disputed payment kept: credit given back', ref: {line: bought._id, payment}});
+        if (repeated) return;
+    }
+    tell(`A dispute was ${end}`, `The dispute over ${money(dispute.amount || 0)} was ${end}.`);
 };
 
 const takenBack = async (bought) => {
@@ -396,6 +470,8 @@ const stripeMessage = guarded(async (req, res) => {
         await countPayment(subject);
     } else if (event.type === 'charge.refunded') {
         await countRefund(subject, event.id);
+    } else if (event.type === 'charge.dispute.created' || event.type === 'charge.dispute.closed') {
+        await countDispute(subject, event.type === 'charge.dispute.created');
     }
     res.status(200).json({received: true});
 });

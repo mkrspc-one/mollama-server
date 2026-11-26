@@ -102,7 +102,10 @@ const themeSchema = new mongoose.Schema({
             fab: {type: String, default: '50%', maxlength: 20},
             progress: {type: String, default: '9999px', maxlength: 20},
             notification: {type: String, default: '0.5rem', maxlength: 20}
-        }
+        },
+        /** The name of one of the web app's page backgrounds (grid, lines, glow…), 'none' for plain pages, or empty
+         *  to leave each page its own. Letters only, since it becomes a CSS value. */
+        pageBackground: {type: String, default: '', match: /^[a-z]{0,20}$/}
     },
     /** How many accounts/portfolios currently apply this theme (denormalized counter) */
     appliedCount: {
