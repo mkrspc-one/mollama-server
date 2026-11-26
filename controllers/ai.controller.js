@@ -8226,8 +8226,9 @@ export const listRentalCards = asyncHandler(async (req, res) => {
             balance: totals.balance
         });
     } catch (error) {
-        logger.warn('[Rental] The cards could not be read', { message: error.message });
-        return refuseRental(res, 502, 'HYPERSTACK_DOWN', 'The cards for rent could not be read just now. Try again in a minute.');
+        logger.warn('[Rental] The cards could not be read', { reason: error.message });
+        // Admins and owners are told Hyperstack's own reason, so a wrong key or environment name shows on the page.
+        return refuseRental(res, 502, 'HYPERSTACK_DOWN', 'The cards for rent could not be read just now. Try again in a minute.', hasRight(req.user.roles, RIGHTS.MANAGE_ALL_USERS) ? { detail: error.message } : {});
     }
 });
 
@@ -8253,8 +8254,8 @@ export const startRental = asyncHandler(async (req, res) => {
     try {
         [card, funds] = await Promise.all([hyperstack.cards().then((cards) => cards.find((one) => one.flavor === req.body.flavor)), hyperstack.credit()]);
     } catch (error) {
-        logger.warn('[Rental] Hyperstack could not be asked', { message: error.message });
-        return refuseRental(res, 502, 'HYPERSTACK_DOWN', 'The card could not be rented just now. Nothing was charged.');
+        logger.warn('[Rental] Hyperstack could not be asked', { reason: error.message });
+        return refuseRental(res, 502, 'HYPERSTACK_DOWN', 'The card could not be rented just now. Nothing was charged.', hasRight(req.user.roles, RIGHTS.MANAGE_ALL_USERS) ? { detail: error.message } : {});
     }
     if (!card) return refuseRental(res, 404, 'CARD_GONE', 'That card is not free to rent right now. Choose another.');
 
@@ -8310,7 +8311,7 @@ export const startRental = asyncHandler(async (req, res) => {
         rental.machine.id = await hyperstack.create({ name: rental.machine.name, flavor: card.flavor, script: machineScript({ socket, deviceId: device.id, key }) });
         await rental.save();
     } catch (error) {
-        logger.warn('[Rental] The machine could not be started', { rental: rental.id, message: error.message });
+        logger.warn('[Rental] The machine could not be started', { rental: rental.id, reason: error.message });
         // The machine may exist all the same, so the rental is ended the careful way: nothing is given back until it is gone.
         await rental.save();
         await beginRentalEnd(rental, 'failed', error instanceof HyperstackError ? error.message : null);
@@ -8340,7 +8341,7 @@ const finishRental = async (rental) => {
             return false;
         }
     } catch (error) {
-        logger.warn('[Rental] The machine is not confirmed gone yet', { rental: rental.id, tries: rental.deleteTries, message: error.message });
+        logger.warn('[Rental] The machine is not confirmed gone yet', { rental: rental.id, tries: rental.deleteTries, reason: error.message });
         await rental.save().catch(() => {});
         return false;
     }
@@ -8454,7 +8455,7 @@ export const sweepRentals = async () => {
         }
         logger.warn('[Rental] Deleting a machine no rental knows about', { machine: machine.name, id: machine.id });
         tellOwners('rental:swept', `A machine with no rental (${machine.name}) was found at Hyperstack and deleted.`);
-        await hyperstack.remove(machine.id).catch((error) => logger.warn('[Rental] The machine could not be deleted', { machine: machine.name, message: error.message }));
+        await hyperstack.remove(machine.id).catch((error) => logger.warn('[Rental] The machine could not be deleted', { machine: machine.name, reason: error.message }));
         swept += 1;
     }
     return swept;
@@ -8501,11 +8502,11 @@ export const watchRentals = async ({ alone = false } = {}) => {
             try {
                 if (await watchRental(rental, { alone })) report.ended += 1;
             } catch (error) {
-                logger.error('[Rental] A rental could not be checked', { rental: rental.id, message: error.message });
+                logger.error('[Rental] A rental could not be checked', { rental: rental.id, reason: error.message });
             }
         }
         report.swept = await sweepRentals().catch((error) => {
-            logger.warn('[Rental] The sweep could not run', { message: error.message });
+            logger.warn('[Rental] The sweep could not run', { reason: error.message });
             return 0;
         });
         const yesterday = new Date(Date.now() - 24 * 60 * MINUTE_MS).toISOString().slice(0, 10);
