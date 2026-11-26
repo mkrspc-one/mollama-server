@@ -252,6 +252,7 @@ const getBilling = asyncHandler(async (req, res) => {
         success: true,
         on: true,
         real: moneyIsReal(),
+        inPage: Boolean(process.env.STRIPE_PUBLISHABLE_KEY),
         balance,
         held,
         currency: BILLING_RULES.currency,
@@ -306,11 +307,16 @@ const startCheckout = guarded(async (req, res) => {
 
     const who = {...stripeMark(), user: user.id};
     const onStatement = statementName();
+    // In the app's own page Stripe's card field takes the card; Stripe comes back to return_url only for a card
+    // that needs a redirect. Otherwise the person pays on Stripe's page.
+    const inPage = req.body?.inPage === true && Boolean(process.env.STRIPE_PUBLISHABLE_KEY);
+    const comeBack = inPage
+        ? {ui_mode: 'elements', return_url: `${process.env.APP_URL}/billing?paid=yes`}
+        : {success_url: `${process.env.APP_URL}/billing?paid=yes`, cancel_url: `${process.env.APP_URL}/billing?paid=no`};
     const session = await askStripe('/checkout/sessions', {
         mode: 'payment',
         expires_at: endsAt,
-        success_url: `${process.env.APP_URL}/billing?paid=yes`,
-        cancel_url: `${process.env.APP_URL}/billing?paid=no`,
+        ...comeBack,
         client_reference_id: user.id,
         customer_email: user.email,
         allowed_payment_method_types: ['card'],
@@ -330,6 +336,14 @@ const startCheckout = guarded(async (req, res) => {
         throw error;
     });
     await Checkout.updateOne({_id: page._id}, {session: session.id});
+
+    if (inPage) {
+        if (typeof session.client_secret !== 'string' || !session.client_secret) {
+            await Checkout.deleteOne({_id: page._id});
+            throw new BillingError('STRIPE_REFUSED', 'Stripe gave no payment page', 502);
+        }
+        return res.status(200).json({success: true, clientSecret: session.client_secret, publishableKey: process.env.STRIPE_PUBLISHABLE_KEY});
+    }
 
     let address;
     try {
