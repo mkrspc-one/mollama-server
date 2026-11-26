@@ -13,6 +13,8 @@ const WRITE_TRIES = 12;
 const DAY_MS = 24 * 60 * 60 * 1000;
 // Stripe keeps a payment page open at least 30 minutes; a little more, so its clock and ours never disagree.
 const PAGE_OPEN_SECONDS = 31 * 60;
+// Ways to pay that settle at once. Apple Pay and Google Pay come with cards; Stripe shows each only where it works.
+const PAYMENT_METHODS = ['card', 'link', 'cashapp', 'amazon_pay'];
 const PAGE = 50;
 
 // All money is in cents. Suggested values, for the owner to confirm.
@@ -319,7 +321,7 @@ const startCheckout = guarded(async (req, res) => {
         ...comeBack,
         client_reference_id: user.id,
         customer_email: user.email,
-        allowed_payment_method_types: ['card'],
+        allowed_payment_method_types: PAYMENT_METHODS,
         line_items: [{
             quantity: 1,
             price_data: {

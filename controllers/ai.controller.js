@@ -19,7 +19,7 @@ import {
     TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, toolKeyNeeded, listedTool, seal, unseal, accountKeeper, withToolServer, finishToolSignIn, readTools, toolFault, ToolSignInError,
     hyperstack, hyperstackReady, machinePrefix, machineScript, HyperstackError
 } from '../middleware/ai.middleware.js';
-import { billingOn, balanceOf, setAside, settle, money, BillingError } from './billing.controller.js';
+import { billingOn, balanceOf, setAside, settle, money, BillingError, moneyIsReal } from './billing.controller.js';
 
 const MB = 1024 * 1024;
 // Models seen in the live list from ollama.com, remembered so installed models can show their description and size.
@@ -8157,7 +8157,10 @@ const MINUTE_MS = 60000;
 const holdOf = (rental) => `rental:${rental.id}`;
 const cardName = (card) => `${card.count > 1 ? `${card.count} x ` : ''}${card.gpu}`;
 
-export const rentalsOn = () => billingOn() && hyperstackReady();
+// Test credit is not real money, but a rental spends real money at Hyperstack. With billing in test mode, renting
+// is on only where ADMIN_ONLY keeps everyone but admins and owners out (and in the test suite).
+export const rentalsSafeHere = () => moneyIsReal() || process.env.ADMIN_ONLY === 'true' || process.env.NODE_ENV === 'test';
+export const rentalsOn = () => billingOn() && hyperstackReady() && rentalsSafeHere();
 export const rentalPrice = (cost) => Math.ceil(cost * (1 + RENTAL_RULES.markup));
 
 // What a rental has cost its person so far: whole minutes from the moment the machine was running at Hyperstack,

@@ -157,6 +157,10 @@ class Server {
         if (missingRentalVars.length > 0 && missingRentalVars.length < rentalVars.length) {
             throw new Error(`Rented computers need all of ${rentalVars.join(', ')}; missing: ${missingRentalVars.join(', ')}`);
         }
+        const testMoney = !/^(sk|rk)_live_/.test(process.env.STRIPE_SECRET_KEY || '');
+        if (missingRentalVars.length === 0 && testMoney && process.env.ADMIN_ONLY !== 'true' && process.env.NODE_ENV !== 'test') {
+            logger.warn('Rented computers stay off: billing is in test mode and ADMIN_ONLY is not on, so anyone could rent a real machine with test credit');
+        }
     }
 
     /**
