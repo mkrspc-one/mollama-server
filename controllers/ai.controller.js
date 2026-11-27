@@ -8213,7 +8213,8 @@ const refuseRental = (res, status, code, message, extra = {}) => res.status(stat
 // and never says who that is.
 const CARD_FAMILIES = ['rtxpro6000', 'rtx6000ada', 'rtxa6000', 'rtxa5000', 'rtxa4000', 'rtx5090', 'rtx4090', 'rtx3090', 'l40s', 'l40', 'l4', 'a100', 'h100', 'h200', 'b200', 'a40', 'a10', 'v100'];
 export const cardKey = (card) => {
-    const name = String(card.gpu || '').toLowerCase().replace(/nvidia|geforce|-?spot/g, '').replace(/[^a-z0-9]/g, '');
+    // Hyperstack writes the RTX 6000 Ada as RTX-A6000-ada, which must not be read as the older RTX A6000.
+    const name = String(card.gpu || '').toLowerCase().replace(/nvidia|geforce|-?spot/g, '').replace(/[^a-z0-9]/g, '').replace('rtxa6000ada', 'rtx6000ada');
     const family = CARD_FAMILIES.find((one) => name.includes(one)) || name;
     const memory = Math.round((card.memoryMb || 0) / 1024 / (card.count || 1));
     return `${family}-${memory}x${card.count || 1}${card.spot ? '-spot' : ''}`;
@@ -8257,12 +8258,15 @@ export const listRentalCards = asyncHandler(async (req, res) => {
         const [{ offers, failures }, totals] = await Promise.all([rentalOffers(), balanceOf(req.user.id)]);
         if (failures.length) logger.warn('[Rental] A provider could not be read', { failures });
         const byPrice = (a, b) => a.price - b.price;
+        // Admins and owners see who supplies each card and under what name, to check the list; nobody else does.
+        const admin = canSeeProviders(req);
+        const sourceOf = (offer) => (admin ? { source: (offer.options.length ? offer.options : [offer.shown]).map((option) => `${option.provider.label}: ${option.card.flavor} (${money(option.card.cost)}/h)`).join(' · ') } : {});
         return res.status(200).json({
             success: true,
             on: true,
-            cards: offers.filter((offer) => offer.options.length).map((offer) => presentCard(offer.key, offer.shown.card)).sort(byPrice),
+            cards: offers.filter((offer) => offer.options.length).map((offer) => ({ ...presentCard(offer.key, offer.shown.card), ...sourceOf(offer) })).sort(byPrice),
             // The rest, greyed out on the page.
-            unavailable: offers.filter((offer) => !offer.options.length).map((offer) => ({ ...presentCard(offer.key, offer.shown.card), why: 'Out of stock right now' })).sort(byPrice),
+            unavailable: offers.filter((offer) => !offer.options.length).map((offer) => ({ ...presentCard(offer.key, offer.shown.card), why: 'Out of stock right now', ...sourceOf(offer) })).sort(byPrice),
             rules: { limit: RENTAL_RULES.limit, hours: RENTAL_RULES.hours, mostHours: RENTAL_RULES.mostHours, idleMinutes: RENTAL_RULES.idleMinutes, atOnce: RENTAL_RULES.atOnce },
             balance: totals.balance,
             ...(canSeeProviders(req) ? { left: { ...(skippedCards() || {}), failures } } : {})
