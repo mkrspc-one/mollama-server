@@ -434,8 +434,10 @@ const providerSchema = new mongoose.Schema({
     name: { type: String, required: true },
     sealed: { type: String, default: null, select: false },
     models: { type: [new mongoose.Schema({ name: String, title: String, contextLength: Number, vision: Boolean, maxOutput: Number, tools: Boolean, costIn: Number, costOut: Number }, { _id: false })], default: [] },
-    // Cloud only: what has been used but not yet charged, in cents (the ledger takes whole cents).
+    // Cloud only: what has been used but not yet charged, in cents (the ledger takes whole cents), and whether the
+    // person turned it off.
     owed: { type: Number, default: 0 },
+    off: { type: Boolean, default: false },
     health: { type: String, enum: PROVIDER_HEALTH_STATES, default: 'unchecked' },
     checkedAt: { type: Date, default: null }
 }, { timestamps: true });
@@ -519,7 +521,8 @@ export const trainingSchemas = {
 export const providerSchemas = {
     providerId: Joi.object({ id: Joi.objectId().required() }),
     add: Joi.object({ kind: Joi.string().pattern(/^[a-z]{2,20}$/).required(), key: providerKey }),
-    update: Joi.object({ key: providerKey })
+    update: Joi.object({ key: providerKey }),
+    cloud: Joi.object({ on: Joi.boolean().required() })
 };
 
 const generationOptions = Joi.object({

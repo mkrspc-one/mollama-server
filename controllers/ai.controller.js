@@ -489,9 +489,11 @@ const getOllama = async () => {
     if (target.kind === 'cloud') {
         const provider = await Provider.findOne({ _id: target.id, service: SERVICE }).select('+sealed');
         if (provider?.kind === CLOUD_SERVICE.id) {
-            const allowed = cloudOn() && await User.exists({ _id: provider.owner, roles: { $in: Object.keys(RIGHT_ASSIGNMENT).filter((role) => hasRight([role], RIGHTS.USE_CLOUD_MODELS)) } });
-            if (!allowed) return createOllamaClient(DEVICE_HOST, () => Promise.reject(new OllamaError('CLOUD_OFF')));
-            return meteredCloud(createCloudClient(CLOUD_SERVICE, process.env.HYPERSTACK_API_KEY, provider.models), provider);
+            const allowed = cloudOn() && !provider.off && await User.exists({ _id: provider.owner, roles: { $in: Object.keys(RIGHT_ASSIGNMENT).filter((role) => hasRight([role], RIGHTS.USE_CLOUD_MODELS)) } });
+            const client = createCloudClient(CLOUD_SERVICE, process.env.HYPERSTACK_API_KEY || 'none', provider.models);
+            // Off or not allowed: the models can still be named, but nothing is asked of the service.
+            if (!allowed) return { ...client, chat: async () => { throw new OllamaError('CLOUD_OFF'); } };
+            return meteredCloud(client, provider);
         }
         const entry = CLOUD_PROVIDERS.find((one) => one.id === provider?.kind);
         const key = provider ? unseal(provider.sealed)?.key : null;
@@ -1364,7 +1366,7 @@ export const listDevices = asyncHandler(async (req, res) => {
         devices: [
             ...await Promise.all(devices.map(async (device) => presentDevice(device, await ollamaOf(device)))),
             ...(req.query?.with === 'online' ? [await presentPool(req.user.id)].filter(Boolean) : []),
-            ...(req.query?.with === 'online' ? (await shownProviders(req)).map(presentOnlineDevice) : [])
+            ...(req.query?.with === 'online' ? (await shownProviders(req, { usable: true })).map(presentOnlineDevice) : [])
         ],
         current: ['companion', 'cloud', 'pool'].includes(target.kind) ? target.id : local?.id ?? null,
         permissions: { manage: canManage(req) }
@@ -2553,8 +2555,10 @@ const listOnlineModels = async (req, res) => {
     const provider = await Provider.findOne({ _id: currentTarget().id, service: SERVICE });
     const models = (provider?.models || []).map((model) => ({
         name: model.name, displayName: model.title || knownModels.get(model.name.replace(/[-:]cloud$/i, ''))?.name || cloudTitle(model.name), description: '', sizeBytes: 0, family: null, parameterSize: null, quantization: null,
-        contextLength: model.contextLength || null, capabilities: ['completion', 'tools', ...(model.vision ? ['vision'] : [])], modifiedAt: null, personal: false,
-        fit: { verdict: 'cloud', label: 'Online', fits: true }, ready: true, canChat: true, usedBy: []
+        contextLength: model.contextLength || null, capabilities: ['completion', ...(model.tools === false ? [] : ['tools']), ...(model.vision ? ['vision'] : [])], modifiedAt: null, personal: false,
+        fit: { verdict: 'cloud', label: 'Online', fits: true }, ready: true, canChat: true, usedBy: [],
+        // Cloud's models carry what the person pays, in dollars per million tokens read and written.
+        ...(provider.kind === CLOUD_SERVICE.id ? { price: { input: cloudPrice(model.costIn), output: cloudPrice(model.costOut) } } : {})
     }));
     res.status(200).json({ success: true, device: currentTarget().id || null, ollamaAvailable: provider?.health === 'healthy', ollamaVersion: null, webSearch: false, models, disk: { usedByModelsMb: 0, freeMb: 0, totalMb: 0 }, online: true, permissions: { manage: false } });
 };
@@ -8211,7 +8215,7 @@ const presentProvider = (provider) => ({
     modelCount: provider.models.length,
     models: provider.models.slice(0, 300).map((model) => model.name),
     // Cloud's models with what each costs the person, in dollars per million tokens.
-    ...(provider.kind === CLOUD_SERVICE.id ? { cloud: true, priced: provider.models.slice(0, 300).map((model) => ({ name: model.name, title: model.title, contextLength: model.contextLength, vision: model.vision, tools: model.tools !== false, input: cloudPrice(model.costIn), output: cloudPrice(model.costOut) })) } : {}),
+    ...(provider.kind === CLOUD_SERVICE.id ? { cloud: true, on: !provider.off, credit: provider.credit !== false, priced: provider.models.slice(0, 300).map((model) => ({ name: model.name, title: model.title, contextLength: model.contextLength, vision: model.vision, tools: model.tools !== false, input: cloudPrice(model.costIn), output: cloudPrice(model.costOut) })) } : {}),
     health: { state: provider.health, label: PROVIDER_HEALTH[provider.health].label, needs: PROVIDER_HEALTH[provider.health].needs, checkedAt: provider.checkedAt }
 });
 // How a connected provider appears among the computers a chat can use.
@@ -8248,12 +8252,26 @@ const findProvider = async (req, res) => {
 };
 
 // The online services a person sees: Cloud when they may use it, and those whose kind Mollama still offers (Ollama's
-// own entry stays stored only so its chats can be moved to Cloud).
-const shownProviders = async (req) => {
+// own entry stays stored only so its chats can be moved to Cloud). Cloud is marked by whether there is credit enough
+// to use it; among the places a chat can run (`usable`) it is left out while it is off or the credit is too low.
+const shownProviders = async (req, { usable = false } = {}) => {
     await syncCloud(req);
     const known = new Set([CLOUD_SERVICE.id, ...CLOUD_PROVIDERS.map((one) => one.id)]);
-    return (await Provider.find({ service: SERVICE, owner: req.user.id }).sort({ name: 1 })).filter((provider) => known.has(provider.kind));
+    const providers = (await Provider.find({ service: SERVICE, owner: req.user.id }).sort({ name: 1 })).filter((provider) => known.has(provider.kind));
+    const cloud = providers.find((provider) => provider.kind === CLOUD_SERVICE.id);
+    if (cloud) cloud.credit = (await balanceOf(req.user.id)).balance - Math.ceil(cloud.owed || 0) >= CLOUD_RULES.least;
+    return usable ? providers.filter((provider) => provider !== cloud || (!cloud.off && cloud.credit)) : providers;
 };
+
+// Turns Cloud on or off for the person; off, its models leave the model picker and no chat can use them.
+export const switchCloud = asyncHandler(async (req, res) => {
+    const provider = await Provider.findOne({ _id: req.params.id, service: SERVICE, owner: req.user.id, kind: CLOUD_SERVICE.id });
+    if (!provider) return res.status(404).json({ success: false, message: 'Cloud is not available to you.' });
+    provider.off = !req.body.on;
+    await provider.save();
+    provider.credit = (await balanceOf(req.user.id)).balance - Math.ceil(provider.owed || 0) >= CLOUD_RULES.least;
+    res.status(200).json({ success: true, provider: presentProvider(provider) });
+});
 
 export const listProviders = asyncHandler(async (req, res) => {
     const providers = await shownProviders(req);

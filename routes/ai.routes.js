@@ -78,6 +78,7 @@ router.validRoutes = [
     '/api/v1/providers',
     '/api/v1/providers/:id',
     '/api/v1/providers/:id/check',
+    '/api/v1/providers/:id/cloud',
     '/api/v1/tools/catalogue',
     '/api/v1/tools/servers',
     '/api/v1/tools/servers/:id',
@@ -193,6 +194,7 @@ router.post('/providers', ...signedIn, validateRequest(providerSchemas.add), aiC
 router.patch('/providers/:id', ...signedIn, withProviderId, validateRequest(providerSchemas.update), aiController.updateProvider);
 router.delete('/providers/:id', ...signedIn, withProviderId, aiController.removeProvider);
 router.post('/providers/:id/check', ...signedIn, withProviderId, aiController.checkProviderNow);
+router.put('/providers/:id/cloud', ...signedIn, withProviderId, validateRequest(providerSchemas.cloud), aiController.switchCloud);
 
 // Training a model on one of a person's own computers, run there by the desktop app.
 const withTrainingId = validateRequest(trainingSchemas.trainingId, 'params');
