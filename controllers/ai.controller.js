@@ -1250,6 +1250,13 @@ const setPaused = (paused) => asyncHandler(async (req, res) => {
 // says who pools with whom: a lending computer's gate is told the main computer's address and admits nothing else.
 const POOL_SETUP = ['none', 'asking', 'downloading', 'ready', 'declined', 'failed', 'unsupported'];
 const reaches = new Map();
+// What an address is reached over: a cable (169.254, 10.254 or a port's own IPv6 address), or by what the computer says
+// of that address on its home network, by cable or Wi-Fi.
+const reachedOver = (address, network) => {
+    if (!address) return null;
+    if (address.includes(':') || privateKind(address) === 'cable') return 'cable';
+    return (network?.addresses || []).find((entry) => entry.address === address)?.wired ? 'wired' : 'wifi';
+};
 // An address a lending computer's gate may listen on: a home or cable IPv4 address, or a cable port's own IPv6 one.
 const gateAddress = (address) => /^(10|192\.168|169\.254|172\.(1[6-9]|2\d|3[01]))\.\d+\.\d+\.\d+$/.test(address) || /^fe80:[0-9a-f:]+$/.test(address);
 // How a lender's address is written for llama.cpp and the probe: an IPv6 one in brackets.
@@ -1266,6 +1273,7 @@ const poolStateOf = (deviceId) => {
         address: typeof state.address === 'string' ? state.address.slice(0, 45) : null,
         addresses: (Array.isArray(state.addresses) ? state.addresses : typeof state.address === 'string' ? [state.address] : []).map((one) => String(one).toLowerCase().slice(0, 45)).filter(gateAddress).slice(0, 8),
         many: Array.isArray(state.addresses),
+        passes: Array.isArray(state.passes) ? state.passes.filter((pass) => pass && Number.isInteger(pass.port) && typeof pass.to === 'string').slice(0, 8).map((pass) => ({ port: pass.port, to: pass.to.slice(0, 60).toLowerCase() })) : null,
         port: Number.isInteger(state.port) ? state.port : null,
         allow: Array.isArray(state.allow) ? state.allow.map((one) => String(one).toLowerCase()).slice(0, 16) : [],
         running: typeof state.running === 'string' ? state.running.slice(0, 200) : null,
@@ -1286,34 +1294,107 @@ const poolComputers = async (userId) => (await ownDevices(userId)).filter((devic
 const groupOf = (groups, one, other) => groups.find((group) => group.computers.some((entry) => entry.id === one) && group.computers.some((entry) => entry.id === other)) || null;
 const addressIn = (group, id) => group?.computers.find((entry) => entry.id === id)?.address || null;
 
+// Routes: a secondary computer the primary one does not reach directly is reached through the computers between them,
+// each passing the traffic on to the next (desktop app 1.0.25 on). The route is the shortest the last checks found, by
+// who reached whom, at most POOL_HOPS computers in between, since each adds a little delay. Every computer on a route
+// opens a pass-through on the lender's own port (POOL_PASS_PORT and up, one per routed lender), admitting only the
+// computer before it and forwarding to the one after; the last one forwards to the lender's gate, which admits it.
+const POOL_HOPS = 3;
+const POOL_PASS_PORT = 50053;
+const POOL_LEND_PORT = 50052;
+// Who reached whom in the last checks, by which address, the fastest when there were several.
+const reachedBy = (userId) => {
+    const best = new Map();
+    for (const result of linkChecks.get(String(userId))?.results || []) {
+        if (!result.ok || !result.address) continue;
+        const key = `${result.from}|${result.to}`;
+        const had = best.get(key);
+        const cable = result.via === 'cable';
+        // A cable is always taken over Wi-Fi or the home network; among the same kind, the fastest.
+        if (!had || (cable && !had.cable) || (cable === had.cable && (result.ms ?? Infinity) < (had.ms ?? Infinity))) best.set(key, { address: String(result.address).toLowerCase(), ms: result.ms ?? null, cable });
+    }
+    return best;
+};
+export const poolRoutes = (reached, computers, mainId) => {
+    const routes = new Map();
+    if (!mainId) return routes;
+    const online = computers.filter((one) => one.online && !one.paused).map((one) => one.id);
+    const before = new Map([[mainId, null]]);
+    const queue = [mainId];
+    while (queue.length > 0) {
+        const at = queue.shift();
+        for (const id of online) {
+            if (before.has(id) || !reached.has(`${at}|${id}`)) continue;
+            before.set(id, at);
+            queue.push(id);
+        }
+    }
+    const lenders = computers.filter((one) => one.role === 'lend' && one.online && !one.paused && one.id !== mainId).map((one) => one.id).sort();
+    let next = 0;
+    for (const lender of lenders) {
+        if (!before.has(lender) || before.get(lender) === mainId) continue;
+        const path = [lender];
+        while (before.get(path[0])) path.unshift(before.get(path[0]));
+        if (path.length - 2 > POOL_HOPS) continue;
+        // addresses[k] is the address of path[k + 1] as path[k] reached it.
+        routes.set(lender, { path, port: POOL_PASS_PORT + next, addresses: path.slice(1).map((id, at) => reached.get(`${path[at]}|${id}`).address) });
+        next += 1;
+    }
+    return routes;
+};
 // What each computer should be doing now. A computer already doing it, or still setting up or waiting for its person
 // to agree, is not told again.
-const orderFor = (computer, main, groups) => {
-    if (computer.role !== 'lend') return { role: computer.role };
-    const shared = main ? groups.filter((group) => group.computers.some((entry) => entry.id === computer.id) && group.computers.some((entry) => entry.id === main.id)) : [];
-    const of = (id) => [...new Set(shared.flatMap((group) => group.computers.filter((entry) => entry.id === id).flatMap((entry) => entry.addresses || [entry.address])))].filter(Boolean);
-    const binds = of(computer.id);
+const orderFor = (computer, main, groups, routes = new Map()) => {
+    const sharedWith = (other) => groups.filter((group) => group.computers.some((entry) => entry.id === computer.id) && group.computers.some((entry) => entry.id === other));
+    const addressesOf = (id, shared) => [...new Set(shared.flatMap((group) => group.computers.filter((entry) => entry.id === id).flatMap((entry) => entry.addresses || [entry.address])))].filter(Boolean);
+    // The pass-throughs this computer opens on the routes it stands on.
+    const passes = [];
+    for (const route of routes.values()) {
+        const at = route.path.indexOf(computer.id);
+        if (at <= 0 || at >= route.path.length - 1) continue;
+        const behind = route.path[at - 1];
+        const ahead = route.path[at + 1];
+        passes.push({ port: route.port, listen: [route.addresses[at - 1]], allow: addressesOf(behind, sharedWith(behind)), to: { address: route.addresses[at], port: ahead === route.path.at(-1) ? POOL_LEND_PORT : route.port } });
+    }
+    if (computer.role !== 'lend') return { role: computer.role, passes };
+    const shared = main ? sharedWith(main.id) : [];
+    let binds = addressesOf(computer.id, shared);
     // Every address the main computer has there is let in: with two cables it has one on each, and only one of them is
     // the cable to this computer.
-    return { role: 'lend', bind: binds.find((address) => !address.includes(':')) || null, binds, allow: main ? of(main.id) : [] };
+    let allow = main ? addressesOf(main.id, shared) : [];
+    const route = routes.get(computer.id);
+    if (route) {
+        const last = route.path.at(-2);
+        binds = [...new Set([...binds, route.addresses.at(-1)])];
+        allow = [...new Set([...allow, ...addressesOf(last, sharedWith(last))])];
+    }
+    return { role: 'lend', bind: binds.find((address) => !address.includes(':')) || null, binds, allow, passes };
 };
 const settledOn = (state, order) => {
     if (!state) return order.role === 'off';
     if (state.role !== order.role) return false;
     if (['asking', 'downloading', 'declined', 'failed', 'unsupported'].includes(state.setup)) return true;
+    if (!passesSettled(state, order)) return false;
     if (order.role !== 'lend') return true;
     if (order.allow.length === 0) return !state.lending;
     const same = (a, b) => [...a].sort().join() === [...b].sort().join();
     // An app before 1.0.24 opens only the one gate it was told of, by `bind`.
     return state.lending && same(state.addresses, state.many ? order.binds : [order.bind]) && same(state.allow, order.allow);
 };
+// Whether a computer runs the pass-throughs it was told of: an app before 1.0.25 runs none and is told of none again.
+const passesSettled = (state, order) => {
+    const wanted = (order.passes || []).map((pass) => `${pass.port}>${pass.to.address}:${pass.to.port}`).sort().join();
+    if (!state?.passes) return wanted === '' || state?.many === false;
+    return state.passes.map((pass) => `${pass.port}>${pass.to}`).sort().join() === wanted;
+};
 export const syncPools = async (userId) => {
     const computers = await poolComputers(userId);
     const { groups } = poolGroups(computers);
     const main = computers.find((one) => one.role === 'main' && one.online && !one.paused) || null;
+    const routes = poolRoutes(reachedBy(userId), computers, main?.id);
     for (const computer of computers) {
         if (!computer.online) continue;
-        const order = orderFor(computer, main, groups);
+        const order = orderFor(computer, main, groups, routes);
         if (!settledOn(computer.state, order)) deviceGateway.order(computer.id, { type: 'pool', action: 'apply', ...order });
     }
 };
@@ -1333,10 +1414,31 @@ const checkReach = async (deviceId) => {
     if (!lender?.registeredBy || !state?.lending || state.addresses.length === 0) return reaches.delete(String(deviceId));
     const main = (await ownDevices(lender.registeredBy)).find((one) => one.poolRole === 'main' && deviceGateway.isOnline(one.id));
     if (!main) return reaches.delete(String(deviceId));
-    const checked = (linkChecks.get(String(lender.registeredBy))?.results || []).filter((result) => result.from === main.id && result.to === String(deviceId) && result.ok).sort((a, b) => (a.ms ?? Infinity) - (b.ms ?? Infinity)).map((result) => String(result.address || '').toLowerCase());
+    // A lender on a route is probed through it: the primary computer connects to the first pass-through on the route.
+    const route = poolRoutes(reachedBy(lender.registeredBy), await poolComputers(lender.registeredBy), main.id).get(String(deviceId));
+    if (route) {
+        let answer = null;
+        try {
+            answer = await deviceGateway.probe(main.id, route.addresses[0], route.port);
+        } catch {
+            answer = null;
+        }
+        reaches.set(String(deviceId), {
+            main: main.id,
+            address: route.addresses[0],
+            port: route.port,
+            via: route.path.slice(1, -1),
+            reachable: answer ? answer.reachable === true : null,
+            detail: answer ? String(answer.detail || '').slice(0, 600) || null : 'The primary computer could not check it: update its desktop app.'
+        });
+        return undefined;
+    }
+    // The addresses the last check reached it by, a cable's first, then the fastest.
+    const checked = (linkChecks.get(String(lender.registeredBy))?.results || []).filter((result) => result.from === main.id && result.to === String(deviceId) && result.ok)
+        .sort((a, b) => Number(b.via === 'cable') - Number(a.via === 'cable') || (a.ms ?? Infinity) - (b.ms ?? Infinity)).map((result) => String(result.address || '').toLowerCase());
     const order = [...new Set([...checked.filter((address) => state.addresses.includes(address)), ...state.addresses])];
     let answer = null;
-    let reachedBy = order[0];
+    let probedAt = order[0];
     for (const address of order) {
         try {
             answer = await deviceGateway.probe(main.id, address, state.port);
@@ -1344,12 +1446,12 @@ const checkReach = async (deviceId) => {
             answer = null;
             break;
         }
-        reachedBy = address;
+        probedAt = address;
         if (answer?.reachable === true) break;
     }
     reaches.set(String(deviceId), {
         main: main.id,
-        address: reachedBy,
+        address: probedAt,
         reachable: answer ? answer.reachable === true : null,
         detail: answer ? String(answer.detail || '').slice(0, 600) || null : 'The primary computer could not check it: update its desktop app.'
     });
@@ -1515,17 +1617,33 @@ export const poolScene = ({ computers = [], networks = [], checks = null, main =
         for (const problem of one.problems || []) if (problem.level === 'problem') add({ computer: one.id }, { title: problem.title, text: problem.text, steps: problem.steps || [] });
         if (one.role !== 'off' && one.online && !one.reason) {
             if (!one.known) add({ computer: one.id }, { title: 'Needs an update', text: 'Its desktop app cannot pool yet. Update the Mollama desktop app on it.' });
+            else if (one.setup === 'asking') add({ computer: one.id }, { title: `Waiting on ${one.name}`, text: `${one.name} is asking whether to set up pooling. Answer on its screen.` });
             else if (['declined', 'failed', 'unsupported'].includes(one.setup)) add({ computer: one.id }, { level: 'error', title: 'Pooling not set up', text: one.detail || 'Pooling could not be set up on it.' });
-            else if (one.role === 'lend' && main && one.reachable === false) {
+            else if (one.role === 'lend' && main && one.reachable === true && (one.through || []).length > 0) {
+                // Reached through other computers: it works, a little slower than a cable of its own.
+                add({ computer: one.id }, {
+                    title: 'Through another computer',
+                    text: `${name(main)} reaches ${one.name} through ${one.through.map(name).join(' and ')}, a little slower than a cable of its own.`,
+                    steps: [`For the fastest pool, join ${one.name} and ${name(main)} with a cable. Mollama uses it by itself once it is there.`]
+                });
+            } else if (one.role === 'lend' && main && one.reachable === true && one.over === 'wifi') {
+                add({ computer: one.id }, {
+                    title: 'Pooled over Wi-Fi',
+                    text: `${name(main)} reaches ${one.name} over Wi-Fi, which is slower and less steady than a cable, so replies come more slowly.`,
+                    steps: [`For a faster pool, join ${one.name} and ${name(main)} with a cable. Mollama uses it by itself once it is there.`]
+                });
+            } else if (one.role === 'lend' && main && one.reachable === false) {
                 // The primary computer must reach a secondary one directly. When the check found no way between them, that
                 // is said plainly, with what they share through another computer, instead of guessing at a firewall.
                 const through = [...byId.keys()].find((id) => id !== one.id && id !== main && cables.some((c) => [c.a, c.b].includes(id) && [c.a, c.b].includes(one.id)) && cables.some((c) => [c.a, c.b].includes(id) && [c.a, c.b].includes(main)));
                 if (checks && !mainReaches(one.id)) {
                     add({ computer: one.id }, {
                         level: 'error',
-                        title: 'No connection of its own',
-                        text: through ? `${one.name} reaches ${name(main)} only through ${name(through)}, and a secondary computer needs its own connection to the primary one.` : `${name(main)}, the primary computer, has no way to reach ${one.name}.`,
-                        steps: [`Join ${one.name} and ${name(main)} with a cable, or put both on the same Wi-Fi (a Private one on Windows).`, `Or make ${through ? name(through) : 'another computer'} the primary computer, if it reaches every computer you want to pool.`]
+                        title: through ? 'Route not working yet' : 'No connection of its own',
+                        text: through ? `${one.name} reaches ${name(main)} only through ${name(through)}, which is not passing its memory along yet.` : `${name(main)}, the primary computer, has no way to reach ${one.name}.`,
+                        steps: through
+                            ? [`Update the Mollama desktop app to 1.0.25 or later on ${one.name}, ${name(through)} and ${name(main)}, so ${name(through)} passes its memory along.`, `Or join ${one.name} and ${name(main)} with a cable of their own.`]
+                            : [`Join ${one.name} and ${name(main)} with a cable, or put both on the same Wi-Fi (a Private one on Windows).`]
                     });
                 } else add({ computer: one.id }, { level: 'error', title: 'Primary cannot reach it', text: one.detail || `${name(main)}, the primary computer, cannot reach it.` });
             }
@@ -1563,6 +1681,11 @@ export const poolScene = ({ computers = [], networks = [], checks = null, main =
     const flows = [];
     for (const one of computers) {
         if (!main || one.id === main || one.role !== 'lend' || !one.lending || one.reachable === false) continue;
+        // Through other computers: along each step of the route, from the lender to the primary computer.
+        if ((one.through || []).length > 0) {
+            if (one.reachable === true) flows.push({ from: one.id, to: main, hops: [one.id, ...[...one.through].reverse(), main] });
+            continue;
+        }
         const reached = (via) => pairs.find((pair) => pair.via === via && [pair.a, pair.b].includes(one.id) && [pair.a, pair.b].includes(main) && (pair.a === main ? pair.there.ok : pair.back.ok));
         if (reached('cable')) {
             flows.push({ from: one.id, to: main, cable: [reached('cable').a, reached('cable').b] });
@@ -1592,7 +1715,7 @@ const presentPools = async (userId) => {
         const computer = byId.get(id);
         const state = computer?.state || null;
         const reach = reaches.get(id);
-        const fresh = reach && state?.lending && state.addresses.includes(reach.address) && reach.main === main?.id ? reach : null;
+        const fresh = reach && state?.lending && (reach.via?.length > 0 || state.addresses.includes(reach.address)) && reach.main === main?.id ? reach : null;
         const otherBuild = computer?.role === 'lend' && state?.build && main?.state?.build && state.build !== main.state.build;
         return {
             role: computer?.role || 'off',
@@ -1600,6 +1723,10 @@ const presentPools = async (userId) => {
             progress: state?.progress ?? null,
             lending: Boolean(state?.lending),
             reachable: fresh ? fresh.reachable : null,
+            // The computers its traffic passes through on the way to the primary one, nearest the primary first.
+            through: fresh?.via?.length ? fresh.via : [],
+            // What the primary computer reaches it over: a cable, the home network by cable, or Wi-Fi.
+            over: fresh?.reachable ? reachedOver(fresh.address, byId.get(fresh.via?.[0] || id)?.hardware?.network) : null,
             detail: otherBuild ? 'Its desktop app pools a different way from the primary computer. Update the Mollama desktop app on both.' : fresh?.reachable === false ? fresh.detail : state?.detail || null,
             known: Boolean(state),
             problems: connectionProblems(computer?.hardware?.network, computer?.hardware?.platform)
@@ -1704,7 +1831,7 @@ const poolParts = async (userId) => {
     if (!main) return null;
     const lenders = computers.filter((one) => one.role === 'lend' && one.state?.lending && reaches.get(one.id)?.reachable === true && reaches.get(one.id)?.main === main.id)
         .map((one) => ({ ...one, group: groupOf(groups, one.id, main.id) }))
-        .filter((one) => one.group && one.state.build === main.state?.build && one.state.addresses.includes(reaches.get(one.id).address));
+        .filter((one) => (one.group || reaches.get(one.id).via?.length) && one.state.build === main.state?.build && (reaches.get(one.id).via?.length > 0 || one.state.addresses.includes(reaches.get(one.id).address)));
     if (lenders.length === 0) return null;
     const mainHardware = effectiveHardware(await Device.findById(main.id));
     const lenderHardware = await Promise.all(lenders.map(async (one) => effectiveHardware(await Device.findById(one.id))));
@@ -1715,7 +1842,7 @@ const poolParts = async (userId) => {
         lenders,
         devices: [...lenderHardware, ...(mainHardware.gpuMemoryMb > 0 ? [mainHardware] : [])],
         computers: [{ name: main.name, hardware: mainHardware }, ...lenders.map((one, at) => ({ name: one.name, hardware: lenderHardware[at] }))],
-        helpers: lenders.map((one) => hostPort(reaches.get(one.id).address, one.state.port)),
+        helpers: lenders.map((one) => hostPort(reaches.get(one.id).address, reaches.get(one.id).port || one.state.port)),
         split,
         name: [main, ...lenders].map((one) => one.name).join(' + '),
         hardware: {
@@ -1837,9 +1964,11 @@ const recheckPools = (userId) => {
     const timer = setTimeout(async () => {
         rechecks.delete(key);
         try {
+            // The checks first, since the routes follow from them; then each computer is told its part; then the probes.
+            await checkLinks(key);
             await syncPools(key);
             const own = (await ownDevices(key)).filter((device) => deviceGateway.isOnline(device.id));
-            await Promise.all([...own.map((device) => checkReach(device.id).catch(() => undefined)), checkLinks(key)]);
+            await Promise.all(own.map((device) => checkReach(device.id).catch(() => undefined)));
             getNotificationService().sendToUser(key, { type: 'pools:changed', data: {} });
         } catch (error) {
             logger.warn('[Pool] The connections could not be checked again', { userId: key, reason: error.message });
@@ -1863,8 +1992,9 @@ export const checkPools = asyncHandler(async (req, res) => {
             // A computer that does not answer keeps the details it last gave.
         }
     }));
+    await checkLinks(req.user.id).catch((error) => logger.warn('[Pool] The connections could not be checked', { reason: error.message }));
     await syncPools(req.user.id);
-    await Promise.all([...own.map((device) => checkReach(device.id).catch(() => undefined)), checkLinks(req.user.id).catch((error) => logger.warn('[Pool] The connections could not be checked', { reason: error.message }))]);
+    await Promise.all(own.map((device) => checkReach(device.id).catch(() => undefined)));
     res.status(200).json({ success: true, checkedAt: new Date(), ...await presentPools(req.user.id) });
 });
 
