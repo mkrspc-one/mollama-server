@@ -78,6 +78,7 @@ const searchScore = (model, words, loose = false) => {
 // model's parameter count, so the size of its usual download (Q4_K_M, about 0.6 bytes a parameter) is estimated and the
 // same fit check is made; the exact sizes come when a model is opened (`listHubFiles`).
 const CATALOGUE_LIMIT = 200;
+const FIT_RANK = { gpu: 0, cpu: 1, mixed: 2, too_large: 3 };
 const HUB_PAGE = 100;
 const hubPages = new Map();
 const hubPage = async (address) => {
@@ -191,12 +192,16 @@ const liveCatalogue = async (query, hardware, { picks = true, downloadable = fal
     const size = Number(query?.size) || CATALOGUE_PAGE;
     // How the list under the recommendations is ordered; the recommendations themselves always come first.
     const ORDERS = {
+        // Best fit: fully on the graphics card, then the processor alone, then with help from system memory, then too
+        // large; the most downloaded first within each.
+        fit: (a, b) => (FIT_RANK[a.fit?.verdict] ?? 9) - (FIT_RANK[b.fit?.verdict] ?? 9) || (b.pulls || 0) - (a.pulls || 0),
         largest: (a, b) => (b.sizeMb || 0) - (a.sizeMb || 0),
         smallest: (a, b) => (a.sizeMb || 0) - (b.sizeMb || 0),
         popular: (a, b) => (b.pulls || 0) - (a.pulls || 0),
         name: (a, b) => String(a.tag).localeCompare(String(b.tag))
     };
-    const chosenOrder = ORDERS[query?.sort] || null;
+    // A computer's list is in best-fit order unless another is chosen; the public list leads with its picks instead.
+    const chosenOrder = ORDERS[query?.sort || (downloadable ? 'fit' : '')] || null;
     const popular = new Set([...models].sort((a, b) => b.pulls - a.pulls).slice(0, POPULAR_MODELS).map((model) => model.name));
     const sized = models.filter((model) => sizes.every((size) => model.sizes.some((own) => own.toLowerCase() === size)));
     const scores = new Map();
