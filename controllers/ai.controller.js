@@ -1439,6 +1439,8 @@ const checkReach = async (deviceId) => {
     const order = [...new Set([...checked.filter((address) => state.addresses.includes(address)), ...state.addresses])];
     let answer = null;
     let probedAt = order[0];
+    // Every address tried and what came back, so a failure says where it stopped instead of only the last answer.
+    const attempts = [];
     for (const address of order) {
         try {
             answer = await deviceGateway.probe(main.id, address, state.port);
@@ -1447,11 +1449,13 @@ const checkReach = async (deviceId) => {
             break;
         }
         probedAt = address;
+        attempts.push({ address, reachable: answer?.reachable === true, detail: String(answer?.detail || '').slice(0, 300) || null });
         if (answer?.reachable === true) break;
     }
     reaches.set(String(deviceId), {
         main: main.id,
         address: probedAt,
+        attempts,
         reachable: answer ? answer.reachable === true : null,
         detail: answer ? String(answer.detail || '').slice(0, 600) || null : 'The primary computer could not check it: update its desktop app.'
     });
@@ -1645,7 +1649,14 @@ export const poolScene = ({ computers = [], networks = [], checks = null, main =
                             ? [`Update the Mollama desktop app to 1.0.25 or later on ${one.name}, ${name(through)} and ${name(main)}, so ${name(through)} passes its memory along.`, `Or join ${one.name} and ${name(main)} with a cable of their own.`]
                             : [`Join ${one.name} and ${name(main)} with a cable, or put both on the same Wi-Fi (a Private one on Windows).`]
                     });
-                } else add({ computer: one.id }, { level: 'error', title: 'Primary cannot reach it', text: one.detail || `${name(main)}, the primary computer, cannot reach it.` });
+                } else {
+                    // Each address the primary computer tried, by what it is, and what came back; a Mac not allowed onto the
+                    // local network is the cause whichever address said so.
+                    const kind = (address) => (address.includes(':') ? 'cable port address' : privateKind(address) === 'cable' ? 'cable' : 'home network');
+                    const tried = (one.tried || []).map((attempt) => `${attempt.address} (${kind(attempt.address)}): ${attempt.reachable ? 'answered' : attempt.detail || 'no answer'}`);
+                    const blocked = (one.tried || []).find((attempt) => /not allowed to reach computers on your network/i.test(attempt.detail || ''));
+                    add({ computer: one.id }, { level: 'error', title: 'Primary cannot reach it', text: blocked ? `${name(main)} is not allowed onto your local network yet, so it cannot reach ${one.name}.` : `${name(main)}, the primary computer, tried ${tried.length || 'its'} way${tried.length === 1 ? '' : 's'} to ${one.name} and none answered.`, steps: tried.length ? tried : [one.detail || 'Nothing answered.'] });
+                }
             }
         }
         // A cable whose checks found no computer at the other end: the likeliest cause is named, not guessed at.
@@ -1725,6 +1736,8 @@ const presentPools = async (userId) => {
             reachable: fresh ? fresh.reachable : null,
             // The computers its traffic passes through on the way to the primary one, nearest the primary first.
             through: fresh?.via?.length ? fresh.via : [],
+            // When the primary computer could not reach it: each address it tried and what came back.
+            tried: fresh?.reachable === false ? fresh.attempts || [] : [],
             // What the primary computer reaches it over: a cable, the home network by cable, or Wi-Fi.
             over: fresh?.reachable ? reachedOver(fresh.address, byId.get(fresh.via?.[0] || id)?.hardware?.network) : null,
             detail: otherBuild ? 'Its desktop app pools a different way from the primary computer. Update the Mollama desktop app on both.' : fresh?.reachable === false ? fresh.detail : state?.detail || null,
