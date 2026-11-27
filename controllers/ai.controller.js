@@ -1333,7 +1333,7 @@ const checkReach = async (deviceId) => {
         main: main.id,
         address: state.address,
         reachable: answer ? answer.reachable === true : null,
-        detail: answer ? String(answer.detail || '').slice(0, 200) || null : 'The primary computer could not check it: update its desktop app.'
+        detail: answer ? String(answer.detail || '').slice(0, 600) || null : 'The primary computer could not check it: update its desktop app.'
     });
     return undefined;
 };
@@ -1429,8 +1429,26 @@ export const linkSummary = (record, known, mainId = null) => {
     return { at: record.at, pairs };
 };
 // What the Pooling drawing shows, worked out here so it is tested: the direct cables the checks found, each home
-// network as a router with the computers on it, every warning with where it sits and what fixes it, and the links
-// memory is lent over. The page only draws it.
+// network as a router with the computers on it, every warning with where it sits, and the links memory is lent over.
+// A warning is a note: a short title, one plain sentence, and the steps that fix it, shown only when it is clicked.
+// Every link and note has a level the page colours by: works (success), warning (something to fix, the pool can still
+// run) and error (the pool cannot run as set until it is fixed). The page only draws it.
+const WAYS_NAMED = { cable: 'the cable', wifi: 'Wi-Fi', wired: 'your home network' };
+const CHECK_NOTES = {
+    update: ['Needs an update', 'Update the Mollama desktop app on both computers to check this connection.'],
+    noport: ['Could not check', 'The computer could not open a check port on that network. Press Check again.'],
+    silent: ['No answer', 'Nothing answered within 3 seconds.', ['Check that the cable is plugged in at both ends, or that both computers are on the same Wi-Fi.', 'If a firewall is on, allow Mollama: on Windows in Windows Security, Firewall, Allow an app; on a Mac in System Settings, Network, Firewall, Options.']],
+    ECONNREFUSED: ['Check port closed', 'Its check port had already closed. Press Check again.'],
+    EHOSTUNREACH: ['Not found', 'It could not be found on this network.', ['Check the cable, or that both computers are on the same Wi-Fi.', 'On a Mac, turn on Mollama in System Settings, Privacy & Security, Local Network, then quit and reopen Mollama.']],
+    ENETUNREACH: ['No way there', 'There is no way onto that network from here.', ['Check the cable.']],
+    EADDRNOTAVAIL: ['Address gone', 'This computer has no address on that network any more.', ['Check the cable, then press Check again.']]
+};
+const REASON_NOTES = {
+    update: 'Needs an update',
+    public: 'Public network',
+    nonetwork: 'No network',
+    alone: 'Not joined'
+};
 export const poolScene = ({ computers = [], networks = [], checks = null, main = null }) => {
     const byId = new Map(computers.map((one) => [one.id, one]));
     const name = (id) => byId.get(id)?.name || 'that computer';
@@ -1440,6 +1458,8 @@ export const poolScene = ({ computers = [], networks = [], checks = null, main =
     const cables = pairs.filter((pair) => pair.via === 'cable' && works(pair)).map((pair) => ({
         a: pair.a,
         b: pair.b,
+        // Blocked here means only the way away from the primary computer works.
+        state: pair.verdict === 'blocked' ? 'error' : 'works',
         plug: [pair.a, pair.b].every((id) => (byId.get(id).cables || []).includes('thunderbolt')) ? 'thunderbolt' : 'ethernet'
     }));
     const homes = new Map();
@@ -1451,50 +1471,73 @@ export const poolScene = ({ computers = [], networks = [], checks = null, main =
         }
     }
     const issues = new Map();
-    const add = (on, text, fix = null) => {
+    const add = (on, note, fix = null) => {
         const key = JSON.stringify(on);
-        const had = issues.get(key) || { on, texts: [], fix: null };
-        if (!had.texts.includes(text)) had.texts.push(text);
+        const had = issues.get(key) || { on, level: 'warning', notes: [], fix: null };
+        if (!had.notes.some((one) => one.title === note.title && one.text === note.text)) had.notes.push({ steps: [], level: 'warning', ...note });
+        if (note.level === 'error') had.level = 'error';
         had.fix = had.fix || fix;
         issues.set(key, had);
     };
     const cabledTo = (id) => [...new Set(networks.filter((network) => network.via === 'cable' && network.computers.some((entry) => entry.id === id)).flatMap((network) => network.computers.map((entry) => entry.id)))].filter((other) => other !== id);
     const blame = (ids) => ids.find((id) => twoCables.has(id));
+    // Whether the primary computer reached this one on any way the last check tried.
+    const mainReaches = (id) => pairs.some((pair) => [pair.a, pair.b].includes(id) && [pair.a, pair.b].includes(main) && (pair.a === main ? pair.there.ok : pair.back.ok));
+    const fromCheck = (why) => {
+        const [title, text, steps = []] = CHECK_NOTES[why] || ['No answer', 'Nothing answered.'];
+        return { title, text, steps };
+    };
     for (const one of computers) {
         // A Public network is drawn all the same, with its warning on its own line and the steps to make it Private.
         for (const home of (one.homes || []).filter((entry) => entry.public)) {
-            add({ line: [`home:${home.id}`, one.id] }, `Windows marks this ${home.wired ? 'network' : 'Wi-Fi'} as Public on ${one.name}, so Mollama does not pool over it. Click the mark to see how to make it Private, on a network you trust.`, { kind: 'private', name: one.name, networks: home.name ? [home.name] : one.publicNetworks || [] });
+            add({ line: [`home:${home.id}`, one.id] }, { level: 'error', title: `Public ${home.wired ? 'network' : 'Wi-Fi'}`, text: `Windows treats this ${home.wired ? 'network' : 'Wi-Fi'} as public on ${one.name}, so Mollama does not pool over it.` }, { kind: 'private', name: one.name, networks: home.name ? [home.name] : one.publicNetworks || [] });
         }
         const publicLine = one.reason === 'public' && (one.homes || []).some((home) => home.public);
-        if (one.reason && !['alone', 'offline', 'paused'].includes(one.reason) && !publicLine) add({ computer: one.id }, one.message, one.reason === 'public' ? { kind: 'private', name: one.name, networks: one.publicNetworks || [] } : null);
-        for (const problem of one.problems || []) if (problem.level === 'problem') add({ computer: one.id }, problem.message);
+        if (one.reason && REASON_NOTES[one.reason] && one.reason !== 'alone' && !publicLine) add({ computer: one.id }, { title: REASON_NOTES[one.reason], text: one.message }, one.reason === 'public' ? { kind: 'private', name: one.name, networks: one.publicNetworks || [] } : null);
+        for (const problem of one.problems || []) if (problem.level === 'problem') add({ computer: one.id }, { title: problem.title, text: problem.text, steps: problem.steps || [] });
         if (one.role !== 'off' && one.online && !one.reason) {
-            if (!one.known) add({ computer: one.id }, 'Its desktop app cannot pool yet: update the Mollama desktop app on it.');
-            else if (['declined', 'failed', 'unsupported'].includes(one.setup) || (one.detail && !one.lending && one.role === 'lend')) add({ computer: one.id }, one.detail || 'Pooling could not be set up on it.');
-            else if (one.role === 'lend' && main && one.reachable === false) add({ computer: one.id }, one.detail || `${name(main)}, the primary computer, cannot reach it.`);
+            if (!one.known) add({ computer: one.id }, { title: 'Needs an update', text: 'Its desktop app cannot pool yet. Update the Mollama desktop app on it.' });
+            else if (['declined', 'failed', 'unsupported'].includes(one.setup)) add({ computer: one.id }, { level: 'error', title: 'Pooling not set up', text: one.detail || 'Pooling could not be set up on it.' });
+            else if (one.role === 'lend' && main && one.reachable === false) {
+                // The primary computer must reach a secondary one directly. When the check found no way between them, that
+                // is said plainly, with what they share through another computer, instead of guessing at a firewall.
+                const through = [...byId.keys()].find((id) => id !== one.id && id !== main && cables.some((c) => [c.a, c.b].includes(id) && [c.a, c.b].includes(one.id)) && cables.some((c) => [c.a, c.b].includes(id) && [c.a, c.b].includes(main)));
+                if (checks && !mainReaches(one.id)) {
+                    add({ computer: one.id }, {
+                        level: 'error',
+                        title: 'No connection of its own',
+                        text: through ? `${one.name} reaches ${name(main)} only through ${name(through)}, and a secondary computer needs its own connection to the primary one.` : `${name(main)}, the primary computer, has no way to reach ${one.name}.`,
+                        steps: [`Join ${one.name} and ${name(main)} with a cable, or put both on the same Wi-Fi (a Private one on Windows).`, `Or make ${through ? name(through) : 'another computer'} the primary computer, if it reaches every computer you want to pool.`]
+                    });
+                } else add({ computer: one.id }, { level: 'error', title: 'Primary cannot reach it', text: one.detail || `${name(main)}, the primary computer, cannot reach it.` });
+            }
         }
         // A cable whose checks found no computer at the other end: the likeliest cause is named, not guessed at.
         const across = cabledTo(one.id);
         if (checks && one.online && across.length > 0 && !cables.some((cable) => cable.a === one.id || cable.b === one.id)) {
             const culprit = blame([one.id, ...across]);
             add({ computer: one.id }, culprit
-                ? `None of your computers answered over its cable, because ${name(culprit)} has two bare cables and uses only one of them (see the mark on ${name(culprit)}).`
-                : 'None of your computers answered over its cable. Check that the cable is plugged in at both ends and that the computer at the other end is on, then press Check again.');
+                ? { title: 'No answer over its cable', text: `${name(culprit)} has two bare cables and uses only one of them, so nothing answers over this one.` }
+                : { title: 'No answer over its cable', text: 'None of your computers answered over its cable.', steps: ['Check that the cable is plugged in at both ends and that the computer at the other end is on.', 'Then press Check again.'] });
         }
     }
     for (const pair of pairs) {
         if (pair.verdict !== 'blocked' || (pair.via === 'cable' && !works(pair))) continue;
-        const way = pair.via === 'cable' ? 'the cable' : pair.via === 'wifi' ? 'Wi-Fi' : 'your home network';
         const culprit = blame([pair.a, pair.b]);
-        const why = culprit ? `${name(culprit)} has two bare cables and sends over only one of them (see its mark).` : (pair.there.ok ? pair.back.why : pair.there.why) || '';
+        const why = fromCheck(pair.there.ok ? pair.back.why : pair.there.why);
         const text = pair.from
-            ? `${name(main)}, the primary computer, cannot reach ${name(pair.from)} over ${way}; only the other way works. ${why}`
-            : `${name(pair.a)} and ${name(pair.b)} cannot reach each other over ${way}. ${why}`;
-        if (pair.via === 'cable') add({ cable: [pair.a, pair.b] }, text.trim());
+            ? `${name(main)}, the primary computer, cannot reach ${name(pair.from)} over ${WAYS_NAMED[pair.via]}; only the other way works.`
+            : `${name(pair.a)} and ${name(pair.b)} cannot reach each other over ${WAYS_NAMED[pair.via]}.`;
+        // The primary computer not reaching a computer it pools with stops the pool; two others not reaching each other does not.
+        const level = [pair.a, pair.b].includes(main) ? 'error' : 'warning';
+        const note = culprit
+            ? { level, title: 'Two cables on one computer', text: `${text} ${name(culprit)} has two bare cables and sends over only one of them.` }
+            : { level, title: why.title, text: `${text} ${why.text}`, steps: why.steps };
+        if (pair.via === 'cable') add({ cable: [pair.a, pair.b] }, note);
         else {
             const home = [...homes.values()].find((entry) => entry.members.some((m) => m.id === pair.a) && entry.members.some((m) => m.id === pair.b));
             const target = pair.a === main ? pair.b : pair.a;
-            add(home ? { line: [home.id, target] } : { computer: target }, text.trim());
+            add(home ? { line: [home.id, target] } : { computer: target }, note);
         }
     }
     // Memory runs to the primary computer from each secondary one that lends and that the last check found it reaches:
@@ -1509,6 +1552,15 @@ export const poolScene = ({ computers = [], networks = [], checks = null, main =
         }
         const home = [...homes.values()].find((entry) => entry.members.some((m) => m.id === one.id && m.open) && entry.members.some((m) => m.id === main && m.open));
         if (home && (reached('wifi') || reached('wired') || one.reachable === true)) flows.push({ from: one.id, to: main, home: home.id });
+    }
+    // A line to a router: one that cannot be used (Public, or a failed check toward the primary computer) is an error, one
+    // that connects with something to fix a warning, one the checks found working a success, and one alone stays plain.
+    for (const home of homes.values()) {
+        for (const member of home.members) {
+            const line = issues.get(JSON.stringify({ line: [home.id, member.id] }));
+            const answered = pairs.some((pair) => pair.via !== 'cable' && [pair.a, pair.b].includes(member.id) && works(pair) && home.members.some((m) => m.id !== member.id && [pair.a, pair.b].includes(m.id)));
+            member.state = !member.open || line?.level === 'error' ? 'error' : line ? 'warning' : answered ? 'works' : 'plain';
+        }
     }
     return { cables, homes: [...homes.values()], issues: [...issues.values()], flows };
 };

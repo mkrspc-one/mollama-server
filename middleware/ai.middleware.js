@@ -964,6 +964,8 @@ export const POOL_REASONS = {
 // fix: a cable plugged in with no address, the internet going through a cable to another computer, a port with no signal
 // (only a note: most computers have a port nothing is plugged into). An app before 1.0.23 reads no adapters: nothing.
 const SELF_ASSIGNED = /^169\.254\./;
+// Each problem is a short title, one plain sentence and the steps that fix it (`message` holds them all, for logs).
+const problemOf = (kind, level, adapter, title, text, steps = []) => ({ kind, level, adapter, title, text, steps, message: [text, ...steps].join(' ') });
 export const connectionProblems = (network, platform) => {
     const adapters = Array.isArray(network?.adapters) ? network.adapters : [];
     const wifiUp = adapters.some((adapter) => adapter.kind === 'wifi' && adapter.addresses?.length > 0);
@@ -973,28 +975,32 @@ export const connectionProblems = (network, platform) => {
     const bare = adapters.filter((adapter) => adapter.kind !== 'wifi' && !/\(en\d+\)$/.test(adapter.name) && adapter.link && (adapter.addresses || []).some((address) => SELF_ASSIGNED.test(address)));
     if (bare.length >= 2) {
         const [first] = bare;
-        found.push({ kind: 'twocables', level: 'problem', adapter: first.name, message: `${bare.map((adapter) => adapter.name).join(' and ')} are both bare cables, which take their addresses from the same range, so this computer sends everything out of only one of them: only one cable works at a time. Give one of them addresses of its own, at both ends: ${platform === 'darwin'
-            ? `in System Settings, Network, ${first.name}, Details, TCP/IP, set Configure IPv4 to Manually, IP address 10.254.1.1 and subnet mask 255.255.255.0`
-            : platform === 'win32'
-                ? `in Settings, Network & internet, Ethernet, ${first.name}, next to IP assignment choose Edit, Manual, IPv4 on, IP address 10.254.1.1 and subnet mask 255.255.255.0`
-                : `in the network settings for ${first.name}, set IPv4 to Manual, address 10.254.1.1 and netmask 255.255.255.0`}; on the computer at the other end of that cable, the same with 10.254.1.2. Then press Check again.` });
+        found.push(problemOf('twocables', 'problem', first.name, 'Two cables on one computer', `${bare.map((adapter) => adapter.name).join(' and ')} take their addresses from the same range, so only one of them works at a time.`, [
+            platform === 'darwin'
+                ? `Give ${first.name} addresses of its own: in System Settings, Network, ${first.name}, Details, TCP/IP, set Configure IPv4 to Manually, IP address 10.254.1.1 and subnet mask 255.255.255.0.`
+                : platform === 'win32'
+                    ? `Give ${first.name} addresses of its own: in Settings, Network & internet, Ethernet, ${first.name}, next to IP assignment choose Edit, Manual, IPv4 on, IP address 10.254.1.1 and subnet mask 255.255.255.0.`
+                    : `Give ${first.name} addresses of its own: set IPv4 to Manual, address 10.254.1.1 and netmask 255.255.255.0.`,
+            'On the computer at the other end of that cable, do the same with 10.254.1.2.',
+            'Then press Check again.'
+        ]));
     }
     for (const adapter of adapters) {
         if (adapter.kind === 'wifi' || /\(en\d+\)$/.test(adapter.name)) continue;
         const addresses = adapter.addresses || [];
         if (adapter.link && addresses.length === 0) {
-            found.push({ kind: 'noaddress', level: 'problem', adapter: adapter.name, message: platform === 'darwin'
-                ? `${adapter.name} is plugged in but has no address, so nothing reaches this Mac over it. In System Settings, Network, ${adapter.name}, Details, TCP/IP, set Configure IPv4 to Using DHCP.`
+            found.push(problemOf('noaddress', 'problem', adapter.name, 'Cable has no address', `${adapter.name} is plugged in but has no address, so nothing reaches this computer over it.`, [platform === 'darwin'
+                ? `In System Settings, Network, ${adapter.name}, Details, TCP/IP, set Configure IPv4 to Using DHCP.`
                 : platform === 'win32'
-                    ? `${adapter.name} is plugged in but has no address yet. Windows gives itself one within a minute; if it does not, unplug the cable and plug it in again.`
-                    : `${adapter.name} is plugged in but has no address. Set it to get one automatically (DHCP) in the network settings.` });
+                    ? 'Windows gives itself one within a minute; if it does not, unplug the cable and plug it in again.'
+                    : 'Set it to get an address automatically (DHCP) in the network settings.']));
         }
         if (adapter.internet && addresses.length > 0 && addresses.every((address) => SELF_ASSIGNED.test(address)) && wifiUp) {
-            found.push({ kind: 'route', level: 'problem', adapter: adapter.name, message: platform === 'darwin'
-                ? `The internet goes through ${adapter.name}, a cable to another computer, so it does not reach this Mac. In System Settings, Network, choose the ⋯ button, Set Service Order, and drag Wi-Fi to the top.`
-                : `The internet goes through ${adapter.name}, a cable to another computer, so it does not reach this computer. Make Wi-Fi its first network for the internet.` });
+            found.push(problemOf('route', 'problem', adapter.name, 'Internet goes through a cable', `The internet goes through ${adapter.name}, a cable to another computer, so it does not reach this computer.`, [platform === 'darwin'
+                ? 'In System Settings, Network, choose the ⋯ button, Set Service Order, and drag Wi-Fi to the top.'
+                : 'Make Wi-Fi its first network for the internet.']));
         }
-        if (adapter.link === false) found.push({ kind: 'nosignal', level: 'note', adapter: adapter.name, message: `${adapter.name}: no cable signal. If a cable is plugged in, check both ends and the port's light, or try another cable.` });
+        if (adapter.link === false) found.push(problemOf('nosignal', 'note', adapter.name, 'No cable signal', `${adapter.name} has no cable signal.`, ['If a cable is plugged in, check both ends and the port\'s light, or try another cable.']));
     }
     return found;
 };
