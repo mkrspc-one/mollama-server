@@ -2182,6 +2182,16 @@ export const getDeviceCatalogue = asyncHandler(async (req, res) => {
 // A reply has no limit on how many tools it uses or how long it runs: only Stop ends it early. A model that runs out
 // of room is asked to go on from where it stopped.
 const CARRY_ON = 'You ran out of room in the middle of your reply. Go on from exactly where you stopped, without repeating anything you already wrote.';
+// A weaker model often ends a short reply by saying what it will do ("I will create a figure…", "Let me open both skills")
+// and stops there, having done none of it. Such a reply is sent back once.
+const DO_IT_NOW = 'Your reply ended by saying what you will do, without doing it. Do it now: call the function that does it (open_skill opens a skill), and do not describe the plan again.';
+const PROMISE = /\b(I will|I'll|I am going to|I'm going to|let me|I shall)\b/i;
+export const promisedOnly = (text) => {
+    const said = String(text ?? '');
+    if (said.length > 3000 || /```component\b/.test(said)) return false;
+    const tail = said.replace(/```[\s\S]*?(?:```|$)/g, ' ').trim().slice(-400);
+    return PROMISE.test(tail) && !/let me know|if you(?:'d| would) like|I'll be (?:happy|glad)/i.test(tail);
+};
 const SEARCH_CONTEXT = 16384;
 const SEARCH_TOOLS = [
     {
@@ -2778,11 +2788,19 @@ const companionsOf = (skill, others) => {
         ...(away.length > 0 ? [`In the library, not on: ${away.join(', ')}. When one would help, tell the user its name; they turn it on under Skills.`] : [])
     ].join('\n');
 };
+// A model often names a skill by part of its name ("hairline" for Hairline Create): taken when only one skill fits.
+export const nearSkill = (list, given) => {
+    const wanted = String(given ?? '').trim().toLowerCase();
+    if (!wanted) return null;
+    const exact = list.find((skill) => skill.id === wanted || skill.name.toLowerCase() === wanted);
+    if (exact) return exact;
+    const words = wanted.replace(/[_-]+/g, ' ').trim();
+    if (words.length < 3) return null;
+    const near = list.filter((skill) => skill.id.split('-').includes(wanted) || skill.name.toLowerCase().split(/\s+/).includes(words) || skill.name.toLowerCase().includes(words) || skill.id.endsWith(`-${wanted}`));
+    return near.length === 1 ? near[0] : null;
+};
 const openSkillTool = (listed, others = [], capacity = Infinity, light = false) => {
-    const find = (input) => {
-        const wanted = String(input?.skill ?? '').trim().toLowerCase();
-        return listed.find((skill) => skill.name.toLowerCase() === wanted || skill.id === wanted);
-    };
+    const find = (input) => nearSkill(listed, input?.skill);
     return {
         fn: 'open_skill',
         label: SKILL_STEP,
@@ -3009,10 +3027,7 @@ const doingOf = (name, tools = []) => {
 const SKILL_FILE_STEP = 'Skill file';
 const SKILL_FILE_ROOM = 12000;
 const skillFileTool = (withFiles) => {
-    const find = (input) => {
-        const wanted = String(input?.skill ?? '').trim().toLowerCase();
-        return withFiles.find((skill) => skill.id === wanted || skill.name.toLowerCase() === wanted) || (withFiles.length === 1 ? withFiles[0] : null);
-    };
+    const find = (input) => nearSkill(withFiles, input?.skill) || (withFiles.length === 1 ? withFiles[0] : null);
     return {
         fn: 'open_skill_file',
         label: SKILL_FILE_STEP,
@@ -5673,6 +5688,11 @@ const shortenPages = (text) => String(text).replace(/```component\n(<(Frame|Mode
     if (block.length <= LONG_PAGE) return block;
     const title = (opening.match(/\b(?:title|fileName)="([^"]*)"/) || [])[1] || 'a page';
     return `[Shown here: "${title}", a ${tag === 'Frame' ? 'page' : '3D model'} of ${block.length.toLocaleString('en-GB')} characters, not repeated.]`;
+}).replace(/```html?\n\s*(?:<!doctype html|<html\b)[\s\S]*?(?:```|$)/gi, (block) => {
+    // A whole page written out as code is shown as the page too (PageBlock in the chat), and goes back the same way.
+    if (block.length <= LONG_PAGE) return block;
+    const title = (block.match(/<title[^>]*>([^<]{1,80})<\/title>/i) || [])[1]?.trim() || 'a page';
+    return `[Shown here: "${title}", a page of ${block.length.toLocaleString('en-GB')} characters written in the reply, not repeated.]`;
 });
 // Rolling memory: once a chat uses more than ROLL_PERCENT of its context, its older messages are folded into a memory
 // after a reply, by the chat's own model, in the background. The last KEEP_MESSAGES are always sent word for word.
@@ -6133,6 +6153,7 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
         // What a function wants to remember from one call to the next within this reply.
         const kept = new Map();
         let corrected = false;
+        let promised = false;
         let correcting = false;
         let firstTry = null;
         let reasked = false;
@@ -6494,6 +6515,13 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
                     reply.content += firstTry;
                     write({ type: 'note', text: '' });
                     write({ type: 'token', text: firstTry });
+                }
+                if (calls.length === 0 && !gone && !promised && functions.length > 0 && promisedOnly(said)) {
+                    promised = true;
+                    correcting = true;
+                    messages.push({ role: 'assistant', content: said }, { role: 'user', content: DO_IT_NOW });
+                    write({ type: 'note', text: 'The model said what it would do. Asking it to do it…' });
+                    continue;
                 }
                 if (calls.length === 0 || gone) break;
 
