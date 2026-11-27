@@ -1257,7 +1257,9 @@ const addressIn = (group, id) => group?.computers.find((entry) => entry.id === i
 const orderFor = (computer, main, groups) => {
     if (computer.role !== 'lend') return { role: computer.role };
     const group = main ? groupOf(groups, computer.id, main.id) : null;
-    return { role: 'lend', bind: addressIn(group, computer.id), allow: group ? [addressIn(group, main.id)] : [] };
+    // Every address the main computer has there is let in: with two bare cables it has one on each, and only one of them
+    // is the cable to this computer.
+    return { role: 'lend', bind: addressIn(group, computer.id), allow: group ? group.computers.find((entry) => entry.id === main.id)?.addresses || [addressIn(group, main.id)] : [] };
 };
 const settledOn = (state, order) => {
     if (!state) return order.role === 'off';
@@ -1330,10 +1332,47 @@ const presentPools = async (userId) => {
         };
     };
     return {
-        groups: groups.map((group) => ({ ...group, computers: group.computers.map((one) => ({ ...one, ...part(one.id) })) })),
+        groups: joinedGroups(groups).map((group) => ({ ...group, computers: group.computers.map((one) => ({ ...one, ...part(one.id) })) })),
         left: left.map((one) => ({ ...one, role: byId.get(one.id)?.role || 'off' })),
         main: main?.id || null
     };
+};
+// What the page shows: the computers that can reach each other one way or another (two Macs on a cable and on Wi-Fi,
+// or a chain of cables) as one pool, each computer once, with the ways they are joined. A main computer lends to every
+// computer it shares one of those ways with.
+const joinedGroups = (groups) => {
+    const sets = [];
+    for (const group of groups) {
+        const ids = new Set(group.computers.map((one) => one.id));
+        const touching = sets.filter((set) => set.some((other) => other.computers.some((one) => ids.has(one.id))));
+        const set = [group, ...touching.flat()];
+        for (const old of touching) sets.splice(sets.indexOf(old), 1);
+        sets.push(set);
+    }
+    return sets.map((set) => {
+        const computers = [];
+        for (const group of set) {
+            for (const one of group.computers) {
+                const way = group.via === 'cable' ? 'cable' : one.wired ? 'wired' : 'wifi';
+                const had = computers.find((other) => other.id === one.id);
+                if (had) had.ways = [...new Set([...had.ways, way])];
+                else computers.push({ ...one, ways: [way] });
+            }
+        }
+        const order = ['cable', 'wired', 'wifi'];
+        const ways = [...new Set(set.map((group) => (group.via === 'cable' ? 'cable' : group.wired ? 'wired' : 'wifi')))].sort((a, b) => order.indexOf(a) - order.indexOf(b));
+        return {
+            network: set.map((group) => group.network).join(', '),
+            via: ways.includes('cable') ? 'cable' : 'home',
+            wired: ways.every((way) => way !== 'wifi'),
+            ways,
+            computers,
+            combined: {
+                gpuMemoryMb: computers.reduce((sum, one) => sum + one.gpuMemoryMb, 0),
+                memoryMb: computers.reduce((sum, one) => sum + one.memoryMb, 0)
+            }
+        };
+    }).sort((a, b) => b.computers.length - a.computers.length);
 };
 
 // A pooled model: the person's main computer runs it with the lending computers' memory. The pool is a record of its

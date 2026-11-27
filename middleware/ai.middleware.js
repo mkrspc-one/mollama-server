@@ -979,7 +979,15 @@ export const poolGroups = (computers) => {
                 if (!subnet || !computer.publicAddress) continue;
                 const key = `${computer.publicAddress}|${subnet}`;
                 if (!groups.has(key)) groups.set(key, { network: subnet, via: privateKind(entry.address), computers: [] });
-                groups.get(key).computers.push({ id: computer.id, name: computer.name, address: entry.address, wired: Boolean(entry.wired), gpuMemoryMb: computer.hardware.gpuMemoryMb || 0, memoryMb: computer.hardware.memoryMb || 0 });
+                // Every bare cable is 169.254.0.0/16, so a computer with two cables has two addresses in one group: it is
+                // listed once, with both.
+                const had = groups.get(key).computers.find((one) => one.id === computer.id);
+                if (had) {
+                    had.addresses.push(entry.address);
+                    had.wired = had.wired || Boolean(entry.wired);
+                    continue;
+                }
+                groups.get(key).computers.push({ id: computer.id, name: computer.name, address: entry.address, addresses: [entry.address], wired: Boolean(entry.wired), gpuMemoryMb: computer.hardware.gpuMemoryMb || 0, memoryMb: computer.hardware.memoryMb || 0 });
             }
         }
     }
