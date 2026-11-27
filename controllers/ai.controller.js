@@ -1258,7 +1258,7 @@ const reachedOver = (address, network) => {
     return (network?.addresses || []).find((entry) => entry.address === address)?.wired ? 'wired' : 'wifi';
 };
 // An address a lending computer's gate may listen on: a home or cable IPv4 address, or a cable port's own IPv6 one.
-const gateAddress = (address) => /^(10|192\.168|169\.254|172\.(1[6-9]|2\d|3[01]))\.\d+\.\d+\.\d+$/.test(address) || /^fe80:[0-9a-f:]+$/.test(address);
+export const gateAddress = (address) => (/^\d{1,3}(\.\d{1,3}){3}$/.test(address) && privateKind(address) !== null) || /^fe80:[0-9a-f:]+$/.test(address);
 // How a lender's address is written for llama.cpp and the probe: an IPv6 one in brackets.
 const hostPort = (address, port) => (address.includes(':') ? `[${address}]:${port}` : `${address}:${port}`);
 const poolStateOf = (deviceId) => {
@@ -2695,11 +2695,14 @@ const CARRY_ON = 'You ran out of room in the middle of your reply. Go on from ex
 // A weaker model often ends a short reply by saying what it will do ("I will create a figure…", "Let me open both skills")
 // and stops there, having done none of it. Such a reply is sent back once.
 const DO_IT_NOW = 'Your reply ended by saying what you will do, without doing it. Do it now: call the function that does it (open_skill opens a skill), and do not describe the plan again.';
-const PROMISE = /\b(I will|I'll|I am going to|I'm going to|let me|I shall)\b/i;
+// A reply that only promises work: a promise naming real work (draw, build, search, run…) near its end, with no question
+// back to the person. A greeting ("I'll be glad to help, what would you like?") is no promise, so it is never sent back.
+const PROMISE = /\b(?:I will|I'll|I am going to|I'm going to|let me|I shall)\s+(?:now\s+|first\s+|quickly\s+)?(?:open|create|make|draw|build|write|generate|render|search|look\s+up|find|run|use|call|show|put\s+together|prepare|calculate|compute|check|fetch|read|start|design|sketch|plot|chart|code|draft|compose)\b/i;
 export const promisedOnly = (text) => {
     const said = String(text ?? '');
     if (said.length > 3000 || /```component\b/.test(said)) return false;
     const tail = said.replace(/```[\s\S]*?(?:```|$)/g, ' ').trim().slice(-400);
+    if (/\?\s*$/.test(tail)) return false;
     return PROMISE.test(tail) && !/let me know|if you(?:'d| would) like|I'll be (?:happy|glad)/i.test(tail);
 };
 const SEARCH_CONTEXT = 16384;
