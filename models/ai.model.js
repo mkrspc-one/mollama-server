@@ -27,6 +27,7 @@ const hardwareSchema = new mongoose.Schema({
     gpus: { type: [gpuSchema], default: [] },
     gpuMemoryMb: Number,
     cards: { type: [cardSchema], default: undefined },
+    form: { type: String, enum: ['laptop', 'desktop', 'mini', 'allinone', 'tablet'], default: undefined },
     diskFreeMb: Number,
     diskTotalMb: Number,
     modelsPath: String,
@@ -116,6 +117,7 @@ export const deviceSchemas = {
         hardware: Joi.object({
             hostname: Joi.string().max(120),
             platform: Joi.string().max(40),
+            form: Joi.string().valid('laptop', 'desktop', 'mini', 'allinone', 'tablet'),
             cpu: Joi.string().max(200).allow(null, ''),
             cpuThreads: Joi.number().integer().min(1).max(4096).allow(null),
             memoryMb: Joi.number().integer().min(0).max(16777216).allow(null),

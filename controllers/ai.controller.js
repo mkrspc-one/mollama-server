@@ -13,7 +13,7 @@ import { hasRight, RIGHTS } from '../config/rights.js';
 import { SERVICE, Device, Setting, PersonalModel, Download, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, chatSchemas, ToolServer, Provider, Skill, Training, Rental } from '../models/ai.model.js';
 import {
     OllamaError, mapOllamaError, UNREADABLE_CALL, memoryNeededMb, createOllamaClient, libraryModels, libraryEntries, loadLibrarySizes, librarySizes, friendlyName, cloudTitle, computerName, detectHardware, appleGpus, readDisk, rankCatalogue, fitModel, fitNotes, fitPool, freeHardware, poolShareMb, poolSplit, GPU_HEADROOM_MB, RAM_RESERVE_MB,
-    GenerationQueue, estimateTokens, extractText, createFilesClient, imageTypeOf, MAX_IMAGE_BYTES, MAX_CHAT_IMAGE_BYTES, runInSandbox, takeFromSandbox, letSandboxGo, sandboxReady, poolGroups, connectionProblems, MAX_PROGRAM_SECONDS, MAX_ATTACHMENT_BYTES, fetchRemote, MAX_REMOTE_BYTES,
+    GenerationQueue, estimateTokens, extractText, createFilesClient, imageTypeOf, MAX_IMAGE_BYTES, MAX_CHAT_IMAGE_BYTES, runInSandbox, takeFromSandbox, letSandboxGo, sandboxReady, poolGroups, connectionProblems, privateKind, MAX_PROGRAM_SECONDS, MAX_ATTACHMENT_BYTES, fetchRemote, MAX_REMOTE_BYTES,
     searchReady, searchWeb, readPage, deviceGateway,
     CLOUD_PROVIDERS, PROVIDER_HEALTH, createCloudClient, ollamaOnlineNames, runsOnline,
     TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, toolKeyNeeded, listedTool, seal, unseal, accountKeeper, withToolServer, finishToolSignIn, readTools, toolFault, ToolSignInError,
@@ -1008,8 +1008,19 @@ const effectiveHardware = (device) => {
         cpuThreads: detected.cpuThreads || null,
         diskFreeMb: detected.diskFreeMb ?? null,
         diskTotalMb: detected.diskTotalMb ?? null,
-        platform: detected.platform || null
+        platform: detected.platform || null,
+        form: formOf(detected, gpuMemoryMb)
     };
+};
+
+// What kind of computer it is, for the Pooling drawing: what its desktop app read (1.0.24 on), else a guess from its
+// system and graphics: a Mac is most often a laptop, and a PC with a graphics card of its own most often a tower.
+const FORMS = ['laptop', 'desktop', 'mini', 'allinone', 'tablet'];
+const formOf = (hardware, gpuMemoryMb) => {
+    if (FORMS.includes(hardware?.form)) return hardware.form;
+    if (hardware?.platform === 'darwin') return 'laptop';
+    const ownCard = (hardware?.gpus || []).some((gpu) => !/built-in graphics$/.test(gpu.name || '') && (gpu.memoryMb || 0) >= 4096);
+    return ownCard && gpuMemoryMb >= 4096 ? 'desktop' : 'laptop';
 };
 
 // Models that only make embeddings cannot hold a chat, so they are counted apart: a computer with only those is not ready to chat.
@@ -1365,27 +1376,43 @@ const CHECK_WHY = {
     noport: 'It could not open a check port on that network.',
     silent: 'Nothing answered: a firewall is probably blocking Mollama. On Windows, allow Mollama in Windows Security, Firewall, Allow an app; on a Mac, in System Settings, Network, Firewall, Options.',
     ECONNREFUSED: 'Its check port was closed. Press Check again.',
-    EHOSTUNREACH: 'It could not be found on this network. Check the cable, or that both are on the same Wi-Fi. On a Mac, also turn on Mollama in System Settings, Privacy & Security, Local Network.',
+    EHOSTUNREACH: 'It could not be found on this network. Check the cable, or that both are on the same Wi-Fi. On a Mac, turn on Mollama in System Settings, Privacy & Security, Local Network, then quit and reopen Mollama; if it is on already, turn it off and on again.',
     ENETUNREACH: 'There is no way onto that network from here. Check the cable.',
     EADDRNOTAVAIL: 'This computer has no address on that network any more. Check the cable.'
 };
-export const linkSummary = (record, names) => {
+// One entry per pair of computers and way they are joined, from the last checks. A way works if any of the computer's
+// addresses there answered. Only the primary computer connects out, so one way from it is all a pool needs. Two
+// computers with bare cables that never reach each other have no cable between them (every bare cable is the same
+// 169.254 network), so they are left out, as is a computer no longer on the account.
+export const linkSummary = (record, known, mainId = null) => {
     if (!record) return null;
-    const best = new Map();
+    const ways = new Map();
     for (const result of record.results) {
+        if (!known.has(result.from) || !known.has(result.to)) continue;
         const key = `${result.from}|${result.to}|${result.via}`;
-        const had = best.get(key);
-        if (!had || (result.ok && (!had.ok || (result.ms ?? Infinity) < (had.ms ?? Infinity))) || (had.ok === false && result.ok === null)) best.set(key, result);
+        const had = ways.get(key) || { ok: false, ms: null, why: null, unknown: false };
+        if (result.ok) ways.set(key, { ...had, ok: true, ms: Math.min(had.ms ?? Infinity, result.ms ?? Infinity) });
+        else if (result.ok === null) ways.set(key, { ...had, unknown: true, why: had.why || CHECK_WHY.update });
+        else ways.set(key, { ...had, why: had.why || CHECK_WHY[result.why] || 'Nothing answered.' });
     }
+    const tidy = (one) => ({ ok: one.ok, ms: one.ok && Number.isFinite(one.ms) ? one.ms : null, why: one.ok ? null : one.why });
     const pairs = [];
-    for (const one of best.values()) {
-        if (pairs.some((pair) => pair.b === one.from && pair.a === one.to && pair.via === one.via)) continue;
-        const back = best.get(`${one.to}|${one.from}|${one.via}`) || null;
-        const said = (result) => (result ? { ok: result.ok, ms: result.ms ?? null, why: result.ok ? null : CHECK_WHY[result.why] || `It could not be reached (${result.why}).` } : null);
-        pairs.push({ a: one.from, b: one.to, aName: names.get(one.from) || 'A computer', bName: names.get(one.to) || 'A computer', via: one.via, there: said(one), back: said(back) });
+    for (const [key, there] of ways) {
+        const [a, b, via] = key.split('|');
+        const back = ways.get(`${b}|${a}|${via}`);
+        if (back && a > b) continue;
+        const other = back || { ok: false, ms: null, why: CHECK_WHY.update, unknown: true };
+        let verdict = 'blocked';
+        let from = null;
+        if (there.ok && other.ok) verdict = 'works';
+        else if (there.ok || other.ok) {
+            from = there.ok ? a : b;
+            verdict = from === mainId ? 'enough' : [a, b].includes(mainId) ? 'blocked' : 'oneway';
+        } else if (there.unknown || other.unknown) verdict = 'unknown';
+        else if (via === 'cable') continue;
+        pairs.push({ a, b, via, verdict, from, there: tidy(there), back: tidy(other) });
     }
-    const ORDER = ['cable', 'wired', 'wifi'];
-    return { at: record.at, pairs: pairs.sort((x, y) => ORDER.indexOf(x.via) - ORDER.indexOf(y.via)) };
+    return { at: record.at, pairs };
 };
 
 const presentPools = async (userId) => {
@@ -1410,49 +1437,38 @@ const presentPools = async (userId) => {
             problems: connectionProblems(computer?.hardware?.network, computer?.hardware?.platform)
         };
     };
+    const leftOut = new Map(left.map((one) => [one.id, one]));
     return {
-        groups: joinedGroups(groups).map((group) => ({ ...group, computers: group.computers.map((one) => ({ ...one, ...part(one.id) })) })),
-        left: left.map((one) => ({ ...one, role: byId.get(one.id)?.role || 'off', problems: connectionProblems(byId.get(one.id)?.hardware?.network, byId.get(one.id)?.hardware?.platform) })),
         main: main?.id || null,
-        checks: linkSummary(linkChecks.get(String(userId)), new Map(computers.map((one) => [one.id, one.name])))
+        computers: computers.map((one) => {
+            const hardware = one.hardware || {};
+            const out = leftOut.get(one.id);
+            return {
+                id: one.id,
+                name: one.name,
+                online: one.online,
+                form: hardware.form || formOf(hardware, hardware.gpuMemoryMb || 0),
+                platform: hardware.platform || null,
+                gpuMemoryMb: hardware.gpuMemoryMb || 0,
+                memoryMb: hardware.memoryMb || 0,
+                cards: hardware.cards || [],
+                // What its bare cables are (thunderbolt, ethernet), so the drawing shows the right plugs.
+                cables: [...new Set((hardware.network?.adapters || []).filter((adapter) => adapter.link && (adapter.addresses || []).some((address) => privateKind(address) === 'cable')).map((adapter) => adapter.kind))],
+                reason: out?.reason || null,
+                message: out?.message || null,
+                publicNetworks: out?.publicNetworks || [],
+                ...part(one.id)
+            };
+        }),
+        networks: groups.map((group) => ({
+            network: group.network,
+            via: group.via,
+            wired: group.wired,
+            combined: group.combined,
+            computers: group.computers.map(({ id, address, addresses, wired }) => ({ id, address, addresses, wired }))
+        })),
+        checks: linkSummary(linkChecks.get(String(userId)), new Set(computers.map((one) => one.id)), main?.id || null)
     };
-};
-// What the page shows: the computers that can reach each other one way or another (two Macs on a cable and on Wi-Fi,
-// or a chain of cables) as one pool, each computer once, with the ways they are joined. A main computer lends to every
-// computer it shares one of those ways with.
-const joinedGroups = (groups) => {
-    const sets = [];
-    for (const group of groups) {
-        const ids = new Set(group.computers.map((one) => one.id));
-        const touching = sets.filter((set) => set.some((other) => other.computers.some((one) => ids.has(one.id))));
-        const set = [group, ...touching.flat()];
-        for (const old of touching) sets.splice(sets.indexOf(old), 1);
-        sets.push(set);
-    }
-    return sets.map((set) => {
-        const computers = [];
-        for (const group of set) {
-            for (const one of group.computers) {
-                const way = group.via === 'cable' ? 'cable' : one.wired ? 'wired' : 'wifi';
-                const had = computers.find((other) => other.id === one.id);
-                if (had) had.ways = [...new Set([...had.ways, way])];
-                else computers.push({ ...one, ways: [way] });
-            }
-        }
-        const order = ['cable', 'wired', 'wifi'];
-        const ways = [...new Set(set.map((group) => (group.via === 'cable' ? 'cable' : group.wired ? 'wired' : 'wifi')))].sort((a, b) => order.indexOf(a) - order.indexOf(b));
-        return {
-            network: set.map((group) => group.network).join(', '),
-            via: ways.includes('cable') ? 'cable' : 'home',
-            wired: ways.every((way) => way !== 'wifi'),
-            ways,
-            computers,
-            combined: {
-                gpuMemoryMb: computers.reduce((sum, one) => sum + one.gpuMemoryMb, 0),
-                memoryMb: computers.reduce((sum, one) => sum + one.memoryMb, 0)
-            }
-        };
-    }).sort((a, b) => b.computers.length - a.computers.length);
 };
 
 // A pooled model: the person's main computer runs it with the lending computers' memory. The pool is a record of its
@@ -1660,7 +1676,8 @@ export const setPoolRole = asyncHandler(async (req, res) => {
     if (device.rental && role !== 'off') {
         return res.status(400).json({ success: false, code: 'RENTED_NOT_POOLED', message: 'A rented computer cannot be part of a pool.' });
     }
-    if (role === 'main') await Device.updateMany({ service: SERVICE, kind: 'companion', registeredBy: req.user.id, poolRole: 'main', _id: { $ne: device._id } }, { poolRole: 'off' });
+    // One primary computer at a time: the one it replaces lends its memory instead, so choosing another swaps them.
+    if (role === 'main') await Device.updateMany({ service: SERVICE, kind: 'companion', registeredBy: req.user.id, poolRole: 'main', _id: { $ne: device._id } }, { poolRole: 'lend' });
     device.poolRole = role;
     await device.save();
     await syncPools(req.user.id);
