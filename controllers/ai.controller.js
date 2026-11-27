@@ -1767,8 +1767,21 @@ const presentPools = async (userId) => {
         })),
         checks: linkSummary(linkChecks.get(String(userId)), new Set(computers.map((one) => one.id)), main?.id || null)
     };
+    // A rented computer stands in the drawing too, apart and dimmed, so nobody wonders where it went. It is never in a
+    // group, a check or an order: it is in a data centre, reachable only over the internet, and opens no door.
+    const rented = (await ownDevices(userId)).filter((device) => device.rental).map((device) => {
+        const hardware = effectiveHardware(device) || {};
+        return {
+            id: device.id, name: shownName(device), online: isOnline(device), form: 'server', platform: hardware.platform || null,
+            gpuMemoryMb: hardware.gpuMemoryMb || 0, memoryMb: hardware.memoryMb || 0, cards: hardware.cards || [], cables: [], homes: [],
+            reason: 'rented', message: RENTED_NOTE, publicNetworks: [], role: 'off', setup: null, progress: null, lending: false,
+            reachable: null, through: [], over: null, detail: null, known: true, problems: []
+        };
+    });
+    view.computers = [...view.computers, ...rented];
     return { ...view, scene: poolScene(view) };
 };
+const RENTED_NOTE = 'A rented computer runs models on its own and cannot pool with your computers: it is in a data centre, reachable only over the internet, which would make a pooled model very slow.';
 
 // A pooled model: the person's main computer runs it with the lending computers' memory. The pool is a record of its
 // own, so a chat can choose it like a computer; who is in it is worked out each time from the computers' parts.
