@@ -165,7 +165,7 @@ class Server {
         }
         const testMoney = !/^(sk|rk)_live_/.test(process.env.STRIPE_SECRET_KEY || '');
         if (rentalProvider && testMoney && process.env.ADMIN_ONLY !== 'true' && process.env.NODE_ENV !== 'test') {
-            logger.warn('Rented computers stay off: billing is in test mode and ADMIN_ONLY is not on, so anyone could rent a real machine with test credit');
+            logger.info('Billing is in test mode: rented computers are open only to the roles with the RENT_COMPUTERS right, and stay off if ordinary users are given it without ADMIN_ONLY');
         }
     }
 

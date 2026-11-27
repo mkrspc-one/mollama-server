@@ -9,7 +9,7 @@ import express from 'express';
 import mongoose from 'mongoose';
 import logger from '../utils/app.logger.js';
 import { asyncHandler, getNotificationService } from '../middleware/app.middleware.js';
-import { hasRight, RIGHTS } from '../config/rights.js';
+import { hasRight, RIGHTS, ROLES } from '../config/rights.js';
 import { SERVICE, Device, Setting, PersonalModel, Download, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, chatSchemas, ToolServer, Provider, Skill, Training, Rental } from '../models/ai.model.js';
 import {
     OllamaError, mapOllamaError, UNREADABLE_CALL, memoryNeededMb, createOllamaClient, libraryModels, libraryEntries, loadLibrarySizes, librarySizes, friendlyName, cloudTitle, computerName, detectHardware, appleGpus, readDisk, rankCatalogue, fitModel, fitNotes, fitPool, freeHardware, poolShareMb, poolSplit, GPU_HEADROOM_MB, RAM_RESERVE_MB,
@@ -8785,9 +8785,12 @@ const holdsOf = (rental) => {
 };
 const cardName = (card) => `${card.count > 1 ? `${card.count} x ` : ''}${card.gpu}`;
 
-// Test credit is not real money, but a rental spends real money at Hyperstack. With billing in test mode, renting
-// is on only where ADMIN_ONLY keeps everyone but admins and owners out (and in the test suite).
-export const rentalsSafeHere = () => moneyIsReal() || process.env.ADMIN_ONLY === 'true' || process.env.NODE_ENV === 'test';
+// Who may rent is App Base's rights: RENT_COMPUTERS, held by owners and admins only for now (the owner's word,
+// 2026-11-27, until pricing is settled in Stage 5H). Test credit is not real money, but a rental spends real money at
+// the provider, so with billing in test mode renting is on only where strangers cannot rent: the role new accounts get
+// lacks the right, ADMIN_ONLY keeps everyone but admins and owners out, or it is the test suite.
+export const rentalsSafeHere = () => moneyIsReal() || !hasRight([ROLES.USER], RIGHTS.RENT_COMPUTERS) || process.env.ADMIN_ONLY === 'true' || process.env.NODE_ENV === 'test';
+const rentsHere = (req) => hasRight(req.user.roles, RIGHTS.RENT_COMPUTERS);
 export const rentalsOn = () => billingOn() && rentalProviders().length > 0 && rentalsSafeHere();
 export const rentalPrice = (cost) => Math.ceil(cost * (1 + RENTAL_RULES.markup));
 
@@ -8882,7 +8885,7 @@ const stillOwed = (rentals) => rentals.reduce((sum, rental) => {
 }, 0);
 
 export const listRentalCards = asyncHandler(async (req, res) => {
-    if (!rentalsOn()) return res.status(200).json({ success: true, on: false });
+    if (!rentalsOn() || !rentsHere(req)) return res.status(200).json({ success: true, on: false });
     try {
         const [{ offers, failures }, totals] = await Promise.all([rentalOffers(), balanceOf(req.user.id)]);
         if (failures.length) logger.warn('[Rental] A provider could not be read', { failures });
@@ -8908,7 +8911,7 @@ export const listRentalCards = asyncHandler(async (req, res) => {
 });
 
 export const listRentals = asyncHandler(async (req, res) => {
-    if (!rentalsOn()) return res.status(200).json({ success: true, on: false, rentals: [] });
+    if (!rentalsOn() || !rentsHere(req)) return res.status(200).json({ success: true, on: false, rentals: [] });
     const [open, ended] = await Promise.all([
         Rental.find({ service: SERVICE, user: req.user.id, state: { $ne: 'ended' } }).sort({ createdAt: -1 }),
         Rental.find({ service: SERVICE, user: req.user.id, state: 'ended' }).sort({ createdAt: -1 }).limit(10)
@@ -8917,7 +8920,7 @@ export const listRentals = asyncHandler(async (req, res) => {
 });
 
 export const startRental = asyncHandler(async (req, res) => {
-    if (!rentalsOn()) return refuseRental(res, 404, 'RENTALS_OFF', 'Renting is not set up');
+    if (!rentalsOn() || !rentsHere(req)) return refuseRental(res, 404, 'RENTALS_OFF', 'Renting is not set up');
     const user = req.user.id;
     const open = { service: SERVICE, user, state: { $ne: 'ended' } };
     if (await Rental.countDocuments(open) >= RENTAL_RULES.atOnce) return refuseRental(res, 409, 'ALREADY_RENTING', atMostRentals());
@@ -9099,7 +9102,7 @@ const beginRentalEnd = async (rental, reason, detail = null) => {
 // More time for an open rental. When its spending limit would not cover the longer time, the difference is set aside
 // as a hold of its own; Mollama's balance at the provider must cover the extra time, as at the start.
 export const extendRental = asyncHandler(async (req, res) => {
-    if (!rentalsOn()) return refuseRental(res, 404, 'RENTALS_OFF', 'Renting is not set up');
+    if (!rentalsOn() || !rentsHere(req)) return refuseRental(res, 404, 'RENTALS_OFF', 'Renting is not set up');
     const rental = await Rental.findOne({ _id: req.params.id, service: SERVICE, user: req.user.id });
     if (!rental) return refuseRental(res, 404, 'NO_SUCH_RENTAL', 'Rental not found');
     if (!['starting', 'running'].includes(rental.state)) return refuseRental(res, 409, 'RENTAL_ENDING', 'This rental has ended or is ending, so it cannot be extended.');
@@ -9258,7 +9261,7 @@ export const compareRentals = async (day = new Date(Date.now() - 24 * 60 * MINUT
     return result;
 };
 export const getRentalComparison = asyncHandler(async (req, res) => {
-    if (!rentalsOn()) return refuseRental(res, 404, 'RENTALS_OFF', 'Renting is not set up');
+    if (!rentalsOn() || !rentsHere(req)) return refuseRental(res, 404, 'RENTALS_OFF', 'Renting is not set up');
     return res.status(200).json({ success: true, ...await compareRentals(req.query.day) });
 });
 
