@@ -937,8 +937,10 @@ const ipv4 = (text) => {
 };
 export const privateKind = (address) => {
     const [a, b] = ipv4(address) || [];
+    // 10.254.x.x is Mollama's own range for a direct cable given addresses by hand (what a computer with two bare
+    // cables is told to do), so each such cable is a network of its own and is drawn as a cable, not a router.
+    if ((a === 169 && b === 254) || (a === 10 && b === 254)) return 'cable';
     if (a === 10 || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168)) return 'home';
-    if (a === 169 && b === 254) return 'cable';
     return null;
 };
 export const subnetOf = (address, prefix) => {
@@ -966,6 +968,17 @@ export const connectionProblems = (network, platform) => {
     const adapters = Array.isArray(network?.adapters) ? network.adapters : [];
     const wifiUp = adapters.some((adapter) => adapter.kind === 'wifi' && adapter.addresses?.length > 0);
     const found = [];
+    // Two bare cables both give themselves an address in 169.254, one range, so the computer sends everything for that
+    // range out of only one of them: whichever cable it picks works, and the other does not, from either end.
+    const bare = adapters.filter((adapter) => adapter.kind !== 'wifi' && !/\(en\d+\)$/.test(adapter.name) && adapter.link && (adapter.addresses || []).some((address) => SELF_ASSIGNED.test(address)));
+    if (bare.length >= 2) {
+        const [first] = bare;
+        found.push({ kind: 'twocables', level: 'problem', adapter: first.name, message: `${bare.map((adapter) => adapter.name).join(' and ')} are both bare cables, which take their addresses from the same range, so this computer sends everything out of only one of them: only one cable works at a time. Give one of them addresses of its own, at both ends: ${platform === 'darwin'
+            ? `in System Settings, Network, ${first.name}, Details, TCP/IP, set Configure IPv4 to Manually, IP address 10.254.1.1 and subnet mask 255.255.255.0`
+            : platform === 'win32'
+                ? `in Settings, Network & internet, Ethernet, ${first.name}, next to IP assignment choose Edit, Manual, IPv4 on, IP address 10.254.1.1 and subnet mask 255.255.255.0`
+                : `in the network settings for ${first.name}, set IPv4 to Manual, address 10.254.1.1 and netmask 255.255.255.0`}; on the computer at the other end of that cable, the same with 10.254.1.2. Then press Check again.` });
+    }
     for (const adapter of adapters) {
         if (adapter.kind === 'wifi' || /\(en\d+\)$/.test(adapter.name)) continue;
         const addresses = adapter.addresses || [];

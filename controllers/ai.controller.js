@@ -13,7 +13,7 @@ import { hasRight, RIGHTS } from '../config/rights.js';
 import { SERVICE, Device, Setting, PersonalModel, Download, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, chatSchemas, ToolServer, Provider, Skill, Training, Rental } from '../models/ai.model.js';
 import {
     OllamaError, mapOllamaError, UNREADABLE_CALL, memoryNeededMb, createOllamaClient, libraryModels, libraryEntries, loadLibrarySizes, librarySizes, friendlyName, cloudTitle, computerName, detectHardware, appleGpus, readDisk, rankCatalogue, fitModel, fitNotes, fitPool, freeHardware, poolShareMb, poolSplit, GPU_HEADROOM_MB, RAM_RESERVE_MB,
-    GenerationQueue, estimateTokens, extractText, createFilesClient, imageTypeOf, MAX_IMAGE_BYTES, MAX_CHAT_IMAGE_BYTES, runInSandbox, takeFromSandbox, letSandboxGo, sandboxReady, poolGroups, connectionProblems, privateKind, MAX_PROGRAM_SECONDS, MAX_ATTACHMENT_BYTES, fetchRemote, MAX_REMOTE_BYTES,
+    GenerationQueue, estimateTokens, extractText, createFilesClient, imageTypeOf, MAX_IMAGE_BYTES, MAX_CHAT_IMAGE_BYTES, runInSandbox, takeFromSandbox, letSandboxGo, sandboxReady, poolGroups, connectionProblems, privateKind, subnetOf, MAX_PROGRAM_SECONDS, MAX_ATTACHMENT_BYTES, fetchRemote, MAX_REMOTE_BYTES,
     searchReady, searchWeb, readPage, deviceGateway,
     CLOUD_PROVIDERS, PROVIDER_HEALTH, createCloudClient, ollamaOnlineNames, runsOnline,
     TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, toolKeyNeeded, listedTool, seal, unseal, accountKeeper, withToolServer, finishToolSignIn, readTools, toolFault, ToolSignInError,
@@ -1013,6 +1013,20 @@ const effectiveHardware = (device) => {
     };
 };
 
+const homesOf = (computer) => {
+    const seen = new Map();
+    for (const entry of computer.hardware?.network?.addresses || []) {
+        if (privateKind(entry.address) !== 'home' || !computer.publicAddress) continue;
+        const subnet = subnetOf(entry.address, entry.prefix);
+        if (!subnet) continue;
+        const id = crypto.createHash('sha256').update(`${computer.publicAddress}|${subnet}`).digest('hex').slice(0, 12);
+        const had = seen.get(id);
+        const open = entry.category !== 'public';
+        // A Public one also says its name on that computer, which the steps to make it Private need.
+        seen.set(id, { id, wired: Boolean(had?.wired || entry.wired), public: Boolean(had?.public || !open), ...(!open && entry.interface ? { name: String(entry.interface).slice(0, 60) } : had?.name ? { name: had.name } : {}) });
+    }
+    return [...seen.values()];
+};
 // What kind of computer it is, for the Pooling drawing: what its desktop app read (1.0.24 on), else a guess from its
 // system and graphics: a Mac is most often a laptop, and a PC with a graphics card of its own most often a tower.
 const FORMS = ['laptop', 'desktop', 'mini', 'allinone', 'tablet'];
@@ -1374,7 +1388,7 @@ const checkLinks = async (userId) => {
 const CHECK_WHY = {
     update: 'Update the Mollama desktop app on both computers to check this connection.',
     noport: 'It could not open a check port on that network.',
-    silent: 'Nothing answered: a firewall is probably blocking Mollama. On Windows, allow Mollama in Windows Security, Firewall, Allow an app; on a Mac, in System Settings, Network, Firewall, Options.',
+    silent: 'Nothing answered within 3 seconds. A firewall on that computer is the usual cause (on Windows, allow Mollama in Windows Security, Firewall, Allow an app; on a Mac, System Settings, Network, Firewall, Options); a loose cable is the other.',
     ECONNREFUSED: 'Its check port was closed. Press Check again.',
     EHOSTUNREACH: 'It could not be found on this network. Check the cable, or that both are on the same Wi-Fi. On a Mac, turn on Mollama in System Settings, Privacy & Security, Local Network, then quit and reopen Mollama; if it is on already, turn it off and on again.',
     ENETUNREACH: 'There is no way onto that network from here. Check the cable.',
@@ -1414,6 +1428,90 @@ export const linkSummary = (record, known, mainId = null) => {
     }
     return { at: record.at, pairs };
 };
+// What the Pooling drawing shows, worked out here so it is tested: the direct cables the checks found, each home
+// network as a router with the computers on it, every warning with where it sits and what fixes it, and the links
+// memory is lent over. The page only draws it.
+export const poolScene = ({ computers = [], networks = [], checks = null, main = null }) => {
+    const byId = new Map(computers.map((one) => [one.id, one]));
+    const name = (id) => byId.get(id)?.name || 'that computer';
+    const pairs = (checks?.pairs || []).filter((pair) => byId.has(pair.a) && byId.has(pair.b));
+    const twoCables = new Set(computers.filter((one) => (one.problems || []).some((problem) => problem.kind === 'twocables')).map((one) => one.id));
+    const works = (pair) => pair.there.ok || pair.back.ok;
+    const cables = pairs.filter((pair) => pair.via === 'cable' && works(pair)).map((pair) => ({
+        a: pair.a,
+        b: pair.b,
+        plug: [pair.a, pair.b].every((id) => (byId.get(id).cables || []).includes('thunderbolt')) ? 'thunderbolt' : 'ethernet'
+    }));
+    const homes = new Map();
+    for (const one of computers) {
+        for (const home of one.homes || []) {
+            const id = `home:${home.id}`;
+            if (!homes.has(id)) homes.set(id, { id, members: [] });
+            homes.get(id).members.push({ id: one.id, way: home.wired ? 'wired' : 'wifi', open: !home.public });
+        }
+    }
+    const issues = new Map();
+    const add = (on, text, fix = null) => {
+        const key = JSON.stringify(on);
+        const had = issues.get(key) || { on, texts: [], fix: null };
+        if (!had.texts.includes(text)) had.texts.push(text);
+        had.fix = had.fix || fix;
+        issues.set(key, had);
+    };
+    const cabledTo = (id) => [...new Set(networks.filter((network) => network.via === 'cable' && network.computers.some((entry) => entry.id === id)).flatMap((network) => network.computers.map((entry) => entry.id)))].filter((other) => other !== id);
+    const blame = (ids) => ids.find((id) => twoCables.has(id));
+    for (const one of computers) {
+        // A Public network is drawn all the same, with its warning on its own line and the steps to make it Private.
+        for (const home of (one.homes || []).filter((entry) => entry.public)) {
+            add({ line: [`home:${home.id}`, one.id] }, `Windows marks this ${home.wired ? 'network' : 'Wi-Fi'} as Public on ${one.name}, so Mollama does not pool over it. Click the mark to see how to make it Private, on a network you trust.`, { kind: 'private', name: one.name, networks: home.name ? [home.name] : one.publicNetworks || [] });
+        }
+        const publicLine = one.reason === 'public' && (one.homes || []).some((home) => home.public);
+        if (one.reason && !['alone', 'offline', 'paused'].includes(one.reason) && !publicLine) add({ computer: one.id }, one.message, one.reason === 'public' ? { kind: 'private', name: one.name, networks: one.publicNetworks || [] } : null);
+        for (const problem of one.problems || []) if (problem.level === 'problem') add({ computer: one.id }, problem.message);
+        if (one.role !== 'off' && one.online && !one.reason) {
+            if (!one.known) add({ computer: one.id }, 'Its desktop app cannot pool yet: update the Mollama desktop app on it.');
+            else if (['declined', 'failed', 'unsupported'].includes(one.setup) || (one.detail && !one.lending && one.role === 'lend')) add({ computer: one.id }, one.detail || 'Pooling could not be set up on it.');
+            else if (one.role === 'lend' && main && one.reachable === false) add({ computer: one.id }, one.detail || `${name(main)}, the primary computer, cannot reach it.`);
+        }
+        // A cable whose checks found no computer at the other end: the likeliest cause is named, not guessed at.
+        const across = cabledTo(one.id);
+        if (checks && one.online && across.length > 0 && !cables.some((cable) => cable.a === one.id || cable.b === one.id)) {
+            const culprit = blame([one.id, ...across]);
+            add({ computer: one.id }, culprit
+                ? `None of your computers answered over its cable, because ${name(culprit)} has two bare cables and uses only one of them (see the mark on ${name(culprit)}).`
+                : 'None of your computers answered over its cable. Check that the cable is plugged in at both ends and that the computer at the other end is on, then press Check again.');
+        }
+    }
+    for (const pair of pairs) {
+        if (pair.verdict !== 'blocked' || (pair.via === 'cable' && !works(pair))) continue;
+        const way = pair.via === 'cable' ? 'the cable' : pair.via === 'wifi' ? 'Wi-Fi' : 'your home network';
+        const culprit = blame([pair.a, pair.b]);
+        const why = culprit ? `${name(culprit)} has two bare cables and sends over only one of them (see its mark).` : (pair.there.ok ? pair.back.why : pair.there.why) || '';
+        const text = pair.from
+            ? `${name(main)}, the primary computer, cannot reach ${name(pair.from)} over ${way}; only the other way works. ${why}`
+            : `${name(pair.a)} and ${name(pair.b)} cannot reach each other over ${way}. ${why}`;
+        if (pair.via === 'cable') add({ cable: [pair.a, pair.b] }, text.trim());
+        else {
+            const home = [...homes.values()].find((entry) => entry.members.some((m) => m.id === pair.a) && entry.members.some((m) => m.id === pair.b));
+            const target = pair.a === main ? pair.b : pair.a;
+            add(home ? { line: [home.id, target] } : { computer: target }, text.trim());
+        }
+    }
+    // Memory runs to the primary computer from each secondary one that lends and that the last check found it reaches:
+    // over their cable when it works, else through the home network they share.
+    const flows = [];
+    for (const one of computers) {
+        if (!main || one.id === main || one.role !== 'lend' || !one.lending || one.reachable === false) continue;
+        const reached = (via) => pairs.find((pair) => pair.via === via && [pair.a, pair.b].includes(one.id) && [pair.a, pair.b].includes(main) && (pair.a === main ? pair.there.ok : pair.back.ok));
+        if (reached('cable')) {
+            flows.push({ from: one.id, to: main, cable: [reached('cable').a, reached('cable').b] });
+            continue;
+        }
+        const home = [...homes.values()].find((entry) => entry.members.some((m) => m.id === one.id && m.open) && entry.members.some((m) => m.id === main && m.open));
+        if (home && (reached('wifi') || reached('wired') || one.reachable === true)) flows.push({ from: one.id, to: main, home: home.id });
+    }
+    return { cables, homes: [...homes.values()], issues: [...issues.values()], flows };
+};
 
 const presentPools = async (userId) => {
     const computers = await poolComputers(userId);
@@ -1438,7 +1536,7 @@ const presentPools = async (userId) => {
         };
     };
     const leftOut = new Map(left.map((one) => [one.id, one]));
-    return {
+    const view = {
         main: main?.id || null,
         computers: computers.map((one) => {
             const hardware = one.hardware || {};
@@ -1454,6 +1552,9 @@ const presentPools = async (userId) => {
                 cards: hardware.cards || [],
                 // What its bare cables are (thunderbolt, ethernet), so the drawing shows the right plugs.
                 cables: [...new Set((hardware.network?.adapters || []).filter((adapter) => adapter.link && (adapter.addresses || []).some((address) => privateKind(address) === 'cable')).map((adapter) => adapter.kind))],
+                // Every home network it is on, even one it cannot pool on (a Public one), so the drawing shows its Wi-Fi. A
+                // network is named by a short code of its house and subnet: two houses with the same subnet stay apart.
+                homes: one.online ? homesOf(one) : [],
                 reason: out?.reason || null,
                 message: out?.message || null,
                 publicNetworks: out?.publicNetworks || [],
@@ -1469,6 +1570,7 @@ const presentPools = async (userId) => {
         })),
         checks: linkSummary(linkChecks.get(String(userId)), new Set(computers.map((one) => one.id)), main?.id || null)
     };
+    return { ...view, scene: poolScene(view) };
 };
 
 // A pooled model: the person's main computer runs it with the lending computers' memory. The pool is a record of its
@@ -1727,6 +1829,8 @@ deviceGateway.on('online', async (deviceId, hello, replaced) => {
         // An app that does not answer keeps the details it last gave.
     }
     await syncPoolsOf(deviceId);
+    // Told again once its details are in, so a page that read it on connecting reads its network too.
+    announceDevice(true)(deviceId);
 });
 deviceGateway.on('offline', announceDevice(false));
 // Why each link closed, so a computer that keeps dropping can be explained.
