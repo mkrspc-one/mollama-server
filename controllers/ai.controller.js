@@ -1250,6 +1250,10 @@ const setPaused = (paused) => asyncHandler(async (req, res) => {
 // says who pools with whom: a lending computer's gate is told the main computer's address and admits nothing else.
 const POOL_SETUP = ['none', 'asking', 'downloading', 'ready', 'declined', 'failed', 'unsupported'];
 const reaches = new Map();
+// An address a lending computer's gate may listen on: a home or cable IPv4 address, or a cable port's own IPv6 one.
+const gateAddress = (address) => /^(10|192\.168|169\.254|172\.(1[6-9]|2\d|3[01]))\.\d+\.\d+\.\d+$/.test(address) || /^fe80:[0-9a-f:]+$/.test(address);
+// How a lender's address is written for llama.cpp and the probe: an IPv6 one in brackets.
+const hostPort = (address, port) => (address.includes(':') ? `[${address}]:${port}` : `${address}:${port}`);
 const poolStateOf = (deviceId) => {
     const state = deviceGateway.poolState(deviceId);
     if (!state || typeof state !== 'object') return null;
@@ -1259,9 +1263,11 @@ const poolStateOf = (deviceId) => {
         setup: POOL_SETUP.includes(state.setup) ? state.setup : 'none',
         progress: Number.isFinite(state.progress) ? Math.max(0, Math.min(1, state.progress)) : null,
         lending: state.lending === true,
-        address: typeof state.address === 'string' ? state.address.slice(0, 40) : null,
+        address: typeof state.address === 'string' ? state.address.slice(0, 45) : null,
+        addresses: (Array.isArray(state.addresses) ? state.addresses : typeof state.address === 'string' ? [state.address] : []).map((one) => String(one).toLowerCase().slice(0, 45)).filter(gateAddress).slice(0, 8),
+        many: Array.isArray(state.addresses),
         port: Number.isInteger(state.port) ? state.port : null,
-        allow: Array.isArray(state.allow) ? state.allow.map(String).slice(0, 8) : [],
+        allow: Array.isArray(state.allow) ? state.allow.map((one) => String(one).toLowerCase()).slice(0, 16) : [],
         running: typeof state.running === 'string' ? state.running.slice(0, 200) : null,
         starting: typeof state.starting === 'string' ? state.starting.slice(0, 200) : null,
         detail: typeof state.detail === 'string' ? state.detail.slice(0, 300) : null
@@ -1284,10 +1290,12 @@ const addressIn = (group, id) => group?.computers.find((entry) => entry.id === i
 // to agree, is not told again.
 const orderFor = (computer, main, groups) => {
     if (computer.role !== 'lend') return { role: computer.role };
-    const group = main ? groupOf(groups, computer.id, main.id) : null;
-    // Every address the main computer has there is let in: with two bare cables it has one on each, and only one of them
-    // is the cable to this computer.
-    return { role: 'lend', bind: addressIn(group, computer.id), allow: group ? group.computers.find((entry) => entry.id === main.id)?.addresses || [addressIn(group, main.id)] : [] };
+    const shared = main ? groups.filter((group) => group.computers.some((entry) => entry.id === computer.id) && group.computers.some((entry) => entry.id === main.id)) : [];
+    const of = (id) => [...new Set(shared.flatMap((group) => group.computers.filter((entry) => entry.id === id).flatMap((entry) => entry.addresses || [entry.address])))].filter(Boolean);
+    const binds = of(computer.id);
+    // Every address the main computer has there is let in: with two cables it has one on each, and only one of them is
+    // the cable to this computer.
+    return { role: 'lend', bind: binds.find((address) => !address.includes(':')) || null, binds, allow: main ? of(main.id) : [] };
 };
 const settledOn = (state, order) => {
     if (!state) return order.role === 'off';
@@ -1295,7 +1303,9 @@ const settledOn = (state, order) => {
     if (['asking', 'downloading', 'declined', 'failed', 'unsupported'].includes(state.setup)) return true;
     if (order.role !== 'lend') return true;
     if (order.allow.length === 0) return !state.lending;
-    return state.lending && state.address === order.bind && state.allow.join() === order.allow.join();
+    const same = (a, b) => [...a].sort().join() === [...b].sort().join();
+    // An app before 1.0.24 opens only the one gate it was told of, by `bind`.
+    return state.lending && same(state.addresses, state.many ? order.binds : [order.bind]) && same(state.allow, order.allow);
 };
 export const syncPools = async (userId) => {
     const computers = await poolComputers(userId);
@@ -1320,18 +1330,26 @@ const syncPoolsOf = async (deviceId) => {
 const checkReach = async (deviceId) => {
     const lender = await Device.findOne({ _id: deviceId, service: SERVICE, kind: 'companion' });
     const state = poolStateOf(deviceId);
-    if (!lender?.registeredBy || !state?.lending || !state.address) return reaches.delete(String(deviceId));
+    if (!lender?.registeredBy || !state?.lending || state.addresses.length === 0) return reaches.delete(String(deviceId));
     const main = (await ownDevices(lender.registeredBy)).find((one) => one.poolRole === 'main' && deviceGateway.isOnline(one.id));
     if (!main) return reaches.delete(String(deviceId));
+    const checked = (linkChecks.get(String(lender.registeredBy))?.results || []).filter((result) => result.from === main.id && result.to === String(deviceId) && result.ok).sort((a, b) => (a.ms ?? Infinity) - (b.ms ?? Infinity)).map((result) => String(result.address || '').toLowerCase());
+    const order = [...new Set([...checked.filter((address) => state.addresses.includes(address)), ...state.addresses])];
     let answer = null;
-    try {
-        answer = await deviceGateway.probe(main.id, state.address, state.port);
-    } catch {
-        answer = null;
+    let reachedBy = order[0];
+    for (const address of order) {
+        try {
+            answer = await deviceGateway.probe(main.id, address, state.port);
+        } catch {
+            answer = null;
+            break;
+        }
+        reachedBy = address;
+        if (answer?.reachable === true) break;
     }
     reaches.set(String(deviceId), {
         main: main.id,
-        address: state.address,
+        address: reachedBy,
         reachable: answer ? answer.reachable === true : null,
         detail: answer ? String(answer.detail || '').slice(0, 600) || null : 'The primary computer could not check it: update its desktop app.'
     });
@@ -1389,7 +1407,7 @@ const CHECK_WHY = {
     update: 'Update the Mollama desktop app on both computers to check this connection.',
     noport: 'It could not open a check port on that network.',
     silent: 'Nothing answered within 3 seconds. A firewall on that computer is the usual cause (on Windows, allow Mollama in Windows Security, Firewall, Allow an app; on a Mac, System Settings, Network, Firewall, Options); a loose cable is the other.',
-    ECONNREFUSED: 'Its check port was closed. Press Check again.',
+    ECONNREFUSED: 'Its check port had already closed. It is checked again when anything changes.',
     EHOSTUNREACH: 'It could not be found on this network. Check the cable, or that both are on the same Wi-Fi. On a Mac, turn on Mollama in System Settings, Privacy & Security, Local Network, then quit and reopen Mollama; if it is on already, turn it off and on again.',
     ENETUNREACH: 'There is no way onto that network from here. Check the cable.',
     EADDRNOTAVAIL: 'This computer has no address on that network any more. Check the cable.'
@@ -1436,12 +1454,12 @@ export const linkSummary = (record, known, mainId = null) => {
 const WAYS_NAMED = { cable: 'the cable', wifi: 'Wi-Fi', wired: 'your home network' };
 const CHECK_NOTES = {
     update: ['Needs an update', 'Update the Mollama desktop app on both computers to check this connection.'],
-    noport: ['Could not check', 'The computer could not open a check port on that network. Press Check again.'],
+    noport: ['Could not check', 'The computer could not open a check port on that network. It is checked again when anything changes.'],
     silent: ['No answer', 'Nothing answered within 3 seconds.', ['Check that the cable is plugged in at both ends, or that both computers are on the same Wi-Fi.', 'If a firewall is on, allow Mollama: on Windows in Windows Security, Firewall, Allow an app; on a Mac in System Settings, Network, Firewall, Options.']],
-    ECONNREFUSED: ['Check port closed', 'Its check port had already closed. Press Check again.'],
+    ECONNREFUSED: ['Check port closed', 'Its check port had already closed. It is checked again when anything changes.'],
     EHOSTUNREACH: ['Not found', 'It could not be found on this network.', ['Check the cable, or that both computers are on the same Wi-Fi.', 'On a Mac, turn on Mollama in System Settings, Privacy & Security, Local Network, then quit and reopen Mollama.']],
     ENETUNREACH: ['No way there', 'There is no way onto that network from here.', ['Check the cable.']],
-    EADDRNOTAVAIL: ['Address gone', 'This computer has no address on that network any more.', ['Check the cable, then press Check again.']]
+    EADDRNOTAVAIL: ['Address gone', 'This computer has no address on that network any more.', ['Check the cable.']]
 };
 const REASON_NOTES = {
     update: 'Needs an update',
@@ -1518,7 +1536,7 @@ export const poolScene = ({ computers = [], networks = [], checks = null, main =
             const culprit = blame([one.id, ...across]);
             add({ computer: one.id }, culprit
                 ? { title: 'No answer over its cable', text: `${name(culprit)} has two bare cables and uses only one of them, so nothing answers over this one.` }
-                : { title: 'No answer over its cable', text: 'None of your computers answered over its cable.', steps: ['Check that the cable is plugged in at both ends and that the computer at the other end is on.', 'Then press Check again.'] });
+                : { title: 'No answer over its cable', text: 'None of your computers answered over its cable.', steps: ['Check that the cable is plugged in at both ends and that the computer at the other end is on.'] });
         }
     }
     for (const pair of pairs) {
@@ -1574,7 +1592,7 @@ const presentPools = async (userId) => {
         const computer = byId.get(id);
         const state = computer?.state || null;
         const reach = reaches.get(id);
-        const fresh = reach && state?.lending && reach.address === state.address && reach.main === main?.id ? reach : null;
+        const fresh = reach && state?.lending && state.addresses.includes(reach.address) && reach.main === main?.id ? reach : null;
         const otherBuild = computer?.role === 'lend' && state?.build && main?.state?.build && state.build !== main.state.build;
         return {
             role: computer?.role || 'off',
@@ -1686,7 +1704,7 @@ const poolParts = async (userId) => {
     if (!main) return null;
     const lenders = computers.filter((one) => one.role === 'lend' && one.state?.lending && reaches.get(one.id)?.reachable === true && reaches.get(one.id)?.main === main.id)
         .map((one) => ({ ...one, group: groupOf(groups, one.id, main.id) }))
-        .filter((one) => one.group && one.state.build === main.state?.build);
+        .filter((one) => one.group && one.state.build === main.state?.build && one.state.addresses.includes(reaches.get(one.id).address));
     if (lenders.length === 0) return null;
     const mainHardware = effectiveHardware(await Device.findById(main.id));
     const lenderHardware = await Promise.all(lenders.map(async (one) => effectiveHardware(await Device.findById(one.id))));
@@ -1697,7 +1715,7 @@ const poolParts = async (userId) => {
         lenders,
         devices: [...lenderHardware, ...(mainHardware.gpuMemoryMb > 0 ? [mainHardware] : [])],
         computers: [{ name: main.name, hardware: mainHardware }, ...lenders.map((one, at) => ({ name: one.name, hardware: lenderHardware[at] }))],
-        helpers: lenders.map((one) => `${one.state.address}:${one.state.port}`),
+        helpers: lenders.map((one) => hostPort(reaches.get(one.id).address, one.state.port)),
         split,
         name: [main, ...lenders].map((one) => one.name).join(' + '),
         hardware: {
@@ -1806,6 +1824,35 @@ export const listPools = asyncHandler(async (req, res) => {
 
 // A network check on demand: every connected computer is read again (a laptop may have changed network or cable),
 // each one is told its part again, and every lending computer is checked again by the one that runs the model.
+// Pooling checks itself: when one of a person's computers comes online, goes offline, reports another network or
+// changes its part, the checks between their computers run again a few seconds later (changes close together make one
+// run) and their pages are told, so the drawing follows the cables with no button. Off in the suite unless a test asks.
+let poolRecheckMs = process.env.NODE_ENV === 'test' ? 0 : 3000;
+export const setPoolRecheck = (ms) => { poolRecheckMs = ms; };
+const rechecks = new Map();
+const recheckPools = (userId) => {
+    if (!userId || !poolRecheckMs) return;
+    const key = String(userId);
+    clearTimeout(rechecks.get(key));
+    const timer = setTimeout(async () => {
+        rechecks.delete(key);
+        try {
+            await syncPools(key);
+            const own = (await ownDevices(key)).filter((device) => deviceGateway.isOnline(device.id));
+            await Promise.all([...own.map((device) => checkReach(device.id).catch(() => undefined)), checkLinks(key)]);
+            getNotificationService().sendToUser(key, { type: 'pools:changed', data: {} });
+        } catch (error) {
+            logger.warn('[Pool] The connections could not be checked again', { userId: key, reason: error.message });
+        }
+    }, poolRecheckMs);
+    timer.unref?.();
+    rechecks.set(key, timer);
+};
+const recheckPoolsOf = async (deviceId) => {
+    const device = await Device.findOne({ _id: deviceId, service: SERVICE, kind: 'companion' }).select('registeredBy').catch(() => null);
+    recheckPools(device?.registeredBy);
+};
+
 export const checkPools = asyncHandler(async (req, res) => {
     const own = (await ownDevices(req.user.id)).filter((device) => deviceGateway.isOnline(device.id));
     await Promise.all(own.map(async (device) => {
@@ -1837,6 +1884,7 @@ export const setPoolRole = asyncHandler(async (req, res) => {
     await syncPools(req.user.id);
     getNotificationService().sendToUser(String(req.user.id), { type: 'device:changed', data: { deviceId: device.id, online: deviceGateway.isOnline(device.id) } });
     logger.info('[Pool] Pooling part changed', { deviceId: device.id, userId: req.user.id, role });
+    recheckPools(req.user.id);
     res.status(200).json({ success: true, ...await presentPools(req.user.id) });
 });
 
@@ -1883,8 +1931,10 @@ deviceGateway.on('online', async (deviceId, hello, replaced) => {
     await syncPoolsOf(deviceId);
     // Told again once its details are in, so a page that read it on connecting reads its network too.
     announceDevice(true)(deviceId);
+    await recheckPoolsOf(deviceId);
 });
 deviceGateway.on('offline', announceDevice(false));
+deviceGateway.on('offline', (deviceId) => { recheckPoolsOf(deviceId); });
 // Why each link closed, so a computer that keeps dropping can be explained.
 deviceGateway.on('closed', (deviceId, about) => logger.info('[Device] A link closed', { deviceId: String(deviceId), ...about, keep: true }));
 // A computer whose link drops usually returns in seconds and keeps its part in a pool for two minutes (its desktop app
@@ -1906,12 +1956,17 @@ deviceGateway.on('network', async (deviceId, network) => {
         clean.adapters = network.adapters.filter((entry) => entry && typeof entry.name === 'string').slice(0, 12).map((entry) => ({
             name: entry.name.slice(0, 60), kind: ['wifi', 'ethernet', 'thunderbolt'].includes(entry.kind) ? entry.kind : 'ethernet', link: Boolean(entry.link),
             addresses: (Array.isArray(entry.addresses) ? entry.addresses : []).filter((address) => typeof address === 'string' && /^\d+\.\d+\.\d+\.\d+$/.test(address)).slice(0, 4),
-            internet: Boolean(entry.internet), ...(['public', 'private', 'domain'].includes(entry.category) ? { category: entry.category } : {})
+            local6: Boolean(entry.local6), internet: Boolean(entry.internet), ...(['public', 'private', 'domain'].includes(entry.category) ? { category: entry.category } : {})
         }));
+    }
+    if (Array.isArray(network.links)) {
+        clean.links = network.links.filter((entry) => entry && /^fe80:[0-9a-f:]+$/i.test(String(entry.address)) && String(entry.address).length <= 45).slice(0, 8)
+            .map((entry) => ({ address: String(entry.address).toLowerCase(), interface: String(entry.interface || '').slice(0, 60) }));
     }
     await Device.updateOne({ _id: deviceId, service: SERVICE, kind: 'companion' }, { $set: { 'hardware.network': clean } }).catch(() => {});
     await syncPoolsOf(deviceId);
     announceDevice(true)(deviceId);
+    await recheckPoolsOf(deviceId);
 });
 // Whatever a computer says about its part in a pool, and what its main computer found, is shown to its person at once.
 deviceGateway.on('pool', async (deviceId, state) => {

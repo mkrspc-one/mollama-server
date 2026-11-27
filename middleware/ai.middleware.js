@@ -461,7 +461,7 @@ export class DeviceGateway extends EventEmitter {
                 return;
             }
             if (message.type === 'network') {
-                if (message.data && Array.isArray(message.data.addresses)) this.emit('network', deviceId, { addresses: message.data.addresses.slice(0, 16), ...(Array.isArray(message.data.adapters) ? { adapters: message.data.adapters.slice(0, 12) } : {}) });
+                if (message.data && Array.isArray(message.data.addresses)) this.emit('network', deviceId, { addresses: message.data.addresses.slice(0, 16), ...(Array.isArray(message.data.adapters) ? { adapters: message.data.adapters.slice(0, 12) } : {}), ...(Array.isArray(message.data.links) ? { links: message.data.links.slice(0, 8) } : {}) });
                 return;
             }
             if (message.type === 'pool-state') {
@@ -973,7 +973,9 @@ export const connectionProblems = (network, platform) => {
     // Two bare cables both give themselves an address in 169.254, one range, so the computer sends everything for that
     // range out of only one of them: whichever cable it picks works, and the other does not, from either end.
     const bare = adapters.filter((adapter) => adapter.kind !== 'wifi' && !/\(en\d+\)$/.test(adapter.name) && adapter.link && (adapter.addresses || []).some((address) => SELF_ASSIGNED.test(address)));
-    if (bare.length >= 2) {
+    // From desktop app 1.0.24 pooling goes over each cable port's own IPv6 address, so two cables both work.
+    const portAddresses = Array.isArray(network?.links) && network.links.length > 0;
+    if (bare.length >= 2 && !portAddresses) {
         const [first] = bare;
         found.push(problemOf('twocables', 'problem', first.name, 'Two cables on one computer', `${bare.map((adapter) => adapter.name).join(' and ')} take their addresses from the same range, so only one of them works at a time.`, [
             platform === 'darwin'
@@ -981,14 +983,13 @@ export const connectionProblems = (network, platform) => {
                 : platform === 'win32'
                     ? `Give ${first.name} addresses of its own: in Settings, Network & internet, Ethernet, ${first.name}, next to IP assignment choose Edit, Manual, IPv4 on, IP address 10.254.1.1 and subnet mask 255.255.255.0.`
                     : `Give ${first.name} addresses of its own: set IPv4 to Manual, address 10.254.1.1 and netmask 255.255.255.0.`,
-            'On the computer at the other end of that cable, do the same with 10.254.1.2.',
-            'Then press Check again.'
+            'On the computer at the other end of that cable, do the same with 10.254.1.2.'
         ]));
     }
     for (const adapter of adapters) {
         if (adapter.kind === 'wifi' || /\(en\d+\)$/.test(adapter.name)) continue;
         const addresses = adapter.addresses || [];
-        if (adapter.link && addresses.length === 0) {
+        if (adapter.link && addresses.length === 0 && !(portAddresses && adapter.local6)) {
             found.push(problemOf('noaddress', 'problem', adapter.name, 'Cable has no address', `${adapter.name} is plugged in but has no address, so nothing reaches this computer over it.`, [platform === 'darwin'
                 ? `In System Settings, Network, ${adapter.name}, Details, TCP/IP, set Configure IPv4 to Using DHCP.`
                 : platform === 'win32'
@@ -1036,6 +1037,14 @@ export const poolGroups = (computers) => {
                 groups.get(key).computers.push({ id: computer.id, name: computer.name, address: entry.address, addresses: [entry.address], wired: Boolean(entry.wired), gpuMemoryMb: computer.hardware.gpuMemoryMb || 0, memoryMb: computer.hardware.memoryMb || 0 });
             }
         }
+    }
+    for (const computer of computers) {
+        const links = (computer.hardware?.network?.links || []).map((link) => String(link.address || '').toLowerCase()).filter((address) => /^fe80:[0-9a-f:]+$/.test(address));
+        if (!computer.online || computer.paused || links.length === 0 || !computer.publicAddress) continue;
+        const key = `${computer.publicAddress}|fe80`;
+        if (!groups.has(key)) groups.set(key, { network: 'fe80::/64', via: 'cable', computers: [] });
+        groups.get(key).computers.push({ id: computer.id, name: computer.name, address: links[0], addresses: links, wired: true, gpuMemoryMb: computer.hardware.gpuMemoryMb || 0, memoryMb: computer.hardware.memoryMb || 0 });
+        reasons.delete(computer.id);
     }
     const shared = [...groups.values()].filter((group) => group.computers.length >= 2)
         .map((group) => ({

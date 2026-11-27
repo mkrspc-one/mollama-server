@@ -13,7 +13,9 @@ const networkSchema = new mongoose.Schema({
     addresses: { type: [new mongoose.Schema({ address: String, prefix: Number, interface: String, wired: Boolean, category: String }, { _id: false })], default: [] },
     // Each network adapter as the desktop app (1.0.23 on) reads it: its kind, whether it has a link, its addresses,
     // whether the internet goes through it, and on Windows its network's category.
-    adapters: { type: [new mongoose.Schema({ name: String, kind: String, link: Boolean, addresses: [String], internet: Boolean, category: String }, { _id: false })], default: undefined }
+    adapters: { type: [new mongoose.Schema({ name: String, kind: String, link: Boolean, addresses: [String], local6: Boolean, internet: Boolean, category: String }, { _id: false })], default: undefined },
+    // Each cable port's own IPv6 address (fe80::), from desktop app 1.0.24: pooling uses these, so two cables both work.
+    links: { type: [new mongoose.Schema({ address: String, interface: String }, { _id: false })], default: undefined }
 }, { _id: false });
 // Every graphics card the computer has, and whether Ollama can use it (why not, when it cannot).
 const cardSchema = new mongoose.Schema({ name: String, memoryMb: Number, shared: Boolean, usable: Boolean, why: String }, { _id: false });
@@ -149,8 +151,13 @@ export const deviceSchemas = {
                     kind: Joi.string().valid('wifi', 'ethernet', 'thunderbolt'),
                     link: Joi.boolean(),
                     addresses: Joi.array().max(4).items(Joi.string().ip({ version: ['ipv4'], cidr: 'forbidden' })),
+                    local6: Joi.boolean(),
                     internet: Joi.boolean(),
                     category: Joi.string().valid('public', 'private', 'domain')
+                })),
+                links: Joi.array().max(8).items(Joi.object({
+                    address: Joi.string().pattern(/^fe80:[0-9a-f:]+$/i).max(45).required(),
+                    interface: Joi.string().max(60).allow('')
                 }))
             }),
             detectedAt: Joi.date()
