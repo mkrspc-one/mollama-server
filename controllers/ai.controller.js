@@ -1605,6 +1605,52 @@ export const poolScene = ({ computers = [], networks = [], checks = null, main =
     };
     const cabledTo = (id) => [...new Set(networks.filter((network) => network.via === 'cable' && network.computers.some((entry) => entry.id === id)).flatMap((network) => network.computers.map((entry) => entry.id)))].filter((other) => other !== id);
     const blame = (ids) => ids.find((id) => twoCables.has(id));
+    // When one computer reaches another but not the other way round, the cause is nearly always on one side: a Mac that
+    // cannot reach out is macOS holding back Mollama's local connections (its Local Network permission, often lost when
+    // Mollama updates, since the app is not yet signed), and a Windows computer that cannot be reached is its firewall.
+    const oneWayCause = (from, to) => {
+        const sender = byId.get(from);
+        const receiver = byId.get(to);
+        if (sender?.platform === 'darwin') {
+            return {
+                title: `${sender.name} is not allowed to reach your computers`,
+                text: `${receiver?.name || 'The other computer'} can reach ${sender.name}, but ${sender.name} cannot reach it: macOS is holding back Mollama's connections to your local network. This usually happens right after Mollama updates.`,
+                steps: [
+                    `On ${sender.name}, open System Settings, Privacy & Security, Local Network, and turn Mollama (or Mollama Staging) off and on again.`,
+                    'Quit Mollama fully (from the menu bar or with Cmd+Q) and open it again.',
+                    `If it still cannot reach it, restart ${sender.name}.`
+                ]
+            };
+        }
+        if (receiver?.platform === 'win32') {
+            return {
+                title: `${receiver.name}'s firewall is blocking Mollama`,
+                text: `${receiver.name} can reach ${sender?.name || 'the other computer'}, but nothing gets in to ${receiver.name}: Windows' firewall is most likely turning it away.`,
+                steps: [
+                    `On ${receiver.name}, open Windows Security, Firewall & network protection, Allow an app through firewall.`,
+                    'Choose Change settings, find Mollama (or Mollama Staging) and tick both Private and Public. If it is not listed, quit and reopen Mollama and allow it when Windows asks.',
+                    'The drawing checks again by itself.'
+                ]
+            };
+        }
+        return null;
+    };
+    // A cable with no answer either way, with a Mac on it: most often macOS holding back Mollama's local connections there
+    // (lost when Mollama updates), and only then the cable itself.
+    const macOnCable = (id, across) => {
+        const mac = [id, ...across].map((one) => byId.get(one)).find((one) => one?.platform === 'darwin' && one.online);
+        if (!mac) return null;
+        return {
+            title: mac.id === id ? `${mac.name} may be held back by macOS` : `No answer over its cable, perhaps from ${mac.name}`,
+            text: `Nothing got through ${mac.id === id ? 'its cable' : `the cable, and ${mac.name} is on it`}, either way. On a Mac that is most often macOS holding back Mollama's connections to your local network, which happens right after Mollama updates.`,
+            steps: [
+                `On ${mac.name}, open System Settings, Privacy & Security, Local Network, and turn Mollama (or Mollama Staging) off and on again.`,
+                'Quit Mollama fully (from the menu bar or with Cmd+Q) and open it again.',
+                'Unplug the cable at both ends and plug it back in: the computers then give themselves fresh addresses on it.',
+                `If nothing changes, restart ${mac.name}.`
+            ]
+        };
+    };
     // Whether the primary computer reached this one on any way the last check tried.
     const mainReaches = (id) => pairs.some((pair) => [pair.a, pair.b].includes(id) && [pair.a, pair.b].includes(main) && (pair.a === main ? pair.there.ok : pair.back.ok));
     const fromCheck = (why) => {
@@ -1636,6 +1682,12 @@ export const poolScene = ({ computers = [], networks = [], checks = null, main =
                     text: `${name(main)} reaches ${one.name} over Wi-Fi, which is slower and less steady than a cable, so replies come more slowly.`,
                     steps: [`For a faster pool, join ${one.name} and ${name(main)} with a cable. Mollama uses it by itself once it is there.`]
                 });
+            } else if (one.role === 'lend' && main && one.reachable === false && pairs.some((pair) => [pair.a, pair.b].includes(one.id) && [pair.a, pair.b].includes(main) && (pair.a === one.id ? pair.there.ok : pair.back.ok)) && oneWayCause(main, one.id)) {
+                // It reached the primary computer in the checks, which cannot reach it back: the cause is on one side, named.
+                const kind = (address) => (address.includes(':') ? 'cable port address' : privateKind(address) === 'cable' ? 'cable' : 'home network');
+                const tried = (one.tried || []).map((attempt) => `${attempt.address} (${kind(attempt.address)}): ${attempt.reachable ? 'answered' : attempt.detail || 'no answer'}`);
+                const cause = oneWayCause(main, one.id);
+                add({ computer: one.id }, { level: 'error', ...cause, steps: [...cause.steps, ...(tried.length ? [`What ${name(main)} tried: ${tried.join('; ')}`] : [])] });
             } else if (one.role === 'lend' && main && one.reachable === false) {
                 // The primary computer must reach a secondary one directly. When the check found no way between them, that
                 // is said plainly, with what they share through another computer, instead of guessing at a firewall.
@@ -1665,13 +1717,15 @@ export const poolScene = ({ computers = [], networks = [], checks = null, main =
             const culprit = blame([one.id, ...across]);
             add({ computer: one.id }, culprit
                 ? { title: 'No answer over its cable', text: `${name(culprit)} has two bare cables and uses only one of them, so nothing answers over this one.` }
-                : { title: 'No answer over its cable', text: 'None of your computers answered over its cable.', steps: ['Check that the cable is plugged in at both ends and that the computer at the other end is on.'] });
+                : macOnCable(one.id, across) || { title: 'No answer over its cable', text: 'None of your computers answered over its cable.', steps: ['Unplug the cable at both ends and plug it back in: the computers then give themselves fresh addresses on it.', 'Check that the computer at the other end is on, with Mollama open.'] });
         }
     }
     for (const pair of pairs) {
         if (pair.verdict !== 'blocked' || (pair.via === 'cable' && !works(pair))) continue;
         const culprit = blame([pair.a, pair.b]);
         const why = fromCheck(pair.there.ok ? pair.back.why : pair.there.why);
+        // Only one way works: the computer that could not reach out, and the one it could not reach.
+        const cause = pair.from ? oneWayCause(pair.from === pair.a ? pair.b : pair.a, pair.from) : null;
         const text = pair.from
             ? `${name(main)}, the primary computer, cannot reach ${name(pair.from)} over ${WAYS_NAMED[pair.via]}; only the other way works.`
             : `${name(pair.a)} and ${name(pair.b)} cannot reach each other over ${WAYS_NAMED[pair.via]}.`;
@@ -1679,7 +1733,7 @@ export const poolScene = ({ computers = [], networks = [], checks = null, main =
         const level = [pair.a, pair.b].includes(main) ? 'error' : 'warning';
         const note = culprit
             ? { level, title: 'Two cables on one computer', text: `${text} ${name(culprit)} has two bare cables and sends over only one of them.` }
-            : { level, title: why.title, text: `${text} ${why.text}`, steps: why.steps };
+            : cause ? { level, ...cause } : { level, title: why.title, text: `${text} ${why.text}`, steps: why.steps };
         if (pair.via === 'cable') add({ cable: [pair.a, pair.b] }, note);
         else {
             const home = [...homes.values()].find((entry) => entry.members.some((m) => m.id === pair.a) && entry.members.some((m) => m.id === pair.b));
