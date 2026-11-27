@@ -9,18 +9,19 @@ import express from 'express';
 import mongoose from 'mongoose';
 import logger from '../utils/app.logger.js';
 import { asyncHandler, getNotificationService } from '../middleware/app.middleware.js';
-import { hasRight, RIGHTS, ROLES } from '../config/rights.js';
+import { hasRight, RIGHTS, ROLES, RIGHT_ASSIGNMENT } from '../config/rights.js';
+import User from '../models/user.model.js';
 import { SERVICE, Device, Setting, PersonalModel, Download, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, chatSchemas, ToolServer, Provider, Skill, Training, Rental } from '../models/ai.model.js';
 import {
     OllamaError, mapOllamaError, UNREADABLE_CALL, memoryNeededMb, createOllamaClient, libraryModels, libraryEntries, loadLibrarySizes, librarySizes, friendlyName, cloudTitle, computerName, detectHardware, appleGpus, readDisk, rankCatalogue, fitModel, fitNotes, fitPool, freeHardware, poolShareMb, poolSplit, GPU_HEADROOM_MB, RAM_RESERVE_MB,
     GenerationQueue, estimateTokens, extractText, createFilesClient, imageTypeOf, MAX_IMAGE_BYTES, MAX_CHAT_IMAGE_BYTES, runInSandbox, takeFromSandbox, letSandboxGo, sandboxReady, poolGroups, connectionProblems, privateKind, subnetOf, MAX_PROGRAM_SECONDS, MAX_ATTACHMENT_BYTES, fetchRemote, MAX_REMOTE_BYTES,
     searchReady, searchWeb, readPage, deviceGateway,
-    CLOUD_PROVIDERS, PROVIDER_HEALTH, createCloudClient, ollamaOnlineNames, runsOnline,
+    CLOUD_PROVIDERS, CLOUD_SERVICE, PROVIDER_HEALTH, createCloudClient, ollamaOnlineNames, runsOnline,
     TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, toolKeyNeeded, listedTool, seal, unseal, accountKeeper, withToolServer, finishToolSignIn, readTools, toolFault, ToolSignInError,
     hyperstack, hyperstackReady, machinePrefix, machineScript, HyperstackError, skippedCards, otherCards,
     ProviderError, rentalProviders, providerOf, containerScript
 } from '../middleware/ai.middleware.js';
-import { billingOn, balanceOf, setAside, settle, money, BillingError, moneyIsReal } from './billing.controller.js';
+import { billingOn, balanceOf, setAside, settle, charge, money, BillingError, moneyIsReal } from './billing.controller.js';
 
 const MB = 1024 * 1024;
 // Models seen in the live list from ollama.com, remembered so installed models can show their description and size.
@@ -72,9 +73,103 @@ const searchScore = (model, words, loose = false) => {
 
 // The whole library, searched and ordered on the server and handed out a page at a time.
 // Recommendations come only from the most downloaded models, so an obscure model is never the suggestion.
-// With picks off the list is only the list: nothing in it is marked or moved to the front.
-const liveCatalogue = async (query, hardware, { picks = true } = {}) => {
+// Hugging Face's GGUF models in the shape of the library's entries, for a computer's list: its most downloaded, or what
+// the words searched find there, read a hundred at a time (`cursor` paging) until enough are held. Its search gives each
+// model's parameter count, so the size of its usual download (Q4_K_M, about 0.6 bytes a parameter) is estimated and the
+// same fit check is made; the exact sizes come when a model is opened (`listHubFiles`).
+const CATALOGUE_LIMIT = 200;
+const HUB_PAGE = 100;
+const hubPages = new Map();
+const hubPage = async (address) => {
+    const held = hubPages.get(address);
+    if (held && Date.now() - held.at < 10 * 60 * 1000) return held.page;
+    // The suite never reaches the real Hugging Face: a test that wants its models stands in for it.
+    if (!trainFetch && process.env.NODE_ENV === 'test') return { models: [], next: null };
+    const reply = await (trainFetch || fetch)(address, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(15000) });
+    if (!reply.ok) throw Object.assign(new Error(`Hugging Face answered ${reply.status}`), { status: reply.status });
+    const models = await reply.json();
+    const next = String(reply.headers?.get?.('link') || '').match(/<([^>]+)>;\s*rel="next"/)?.[1] || null;
+    const page = { models: Array.isArray(models) ? models : [], next };
+    hubPages.set(address, { page, at: Date.now() });
+    if (hubPages.size > 100) hubPages.delete(hubPages.keys().next().value);
+    return page;
+};
+export const hubEntry = (model) => {
+    const total = Number(model?.gguf?.total);
+    if (!model?.id || model.gated || model.private || !(total > 0)) return null;
+    const parameters = Math.round(total / 1e8) / 10;
+    const name = String(model.id).split('/').pop().replace(/[-_.]?gguf$/i, '');
+    const words = String(model.id).toLowerCase();
+    return {
+        tag: `hf.co/${model.id}`,
+        name,
+        source: 'huggingface',
+        description: `${name} from ${String(model.id).split('/')[0]}, in several download sizes.`,
+        goodFor: ['chat', ...(/coder|code/.test(words) ? ['code'] : []), ...(/r1|reason|think/.test(words) ? ['reasoning'] : [])],
+        capabilities: [...(model.pipeline_tag === 'image-text-to-text' ? ['vision'] : []), ...(/think|r1/.test(words) ? ['thinking'] : [])],
+        parameters,
+        sizeMb: Math.round((total * 0.6) / MB),
+        sizeEstimated: true,
+        contextLength: Number(model.gguf.context_length) || null,
+        moe: /a\d+(\.\d+)?b|moe|mixtral/.test(words),
+        pulls: Number(model.downloads) || 0,
+        likes: Number(model.likes) || 0,
+        updated: model.lastModified ? new Date(model.lastModified).toLocaleDateString('en-US', { month: 'long', day: 'numeric', year: 'numeric' }) : null,
+        sizes: [],
+        cloudOnly: false
+    };
+};
+// One model's family across both places: its name without its size, maker, format or tuning words (qwen3.8:27b and
+// unsloth/Qwen3.8-27B-GGUF are both qwen38). Two entries are the same model when their families match and their sizes
+// are within an eighth of each other, since the library rounds a size (14b) that Hugging Face counts (14.7B).
+export const modelFamily = (name) => String(name).toLowerCase().split('/').pop().split(':')[0]
+    .replace(/[-_.](gguf|instruct|chat|it|hf|imatrix|ud)\b/g, '')
+    .replace(/[-_.]a\d+(\.\d+)?b\b/g, '')
+    .replace(/[-_.]?\d+(\.\d+)?x?\d*(\.\d+)?b\b/g, '')
+    .replace(/[^a-z0-9]/g, '');
+const sameSize = (a, b) => a > 0 && b > 0 && Math.abs(a - b) <= Math.max(a, b) / 8;
+// Merges Hugging Face's entries into the library's: a model in both keeps the library's entry and gains its most
+// downloaded Hugging Face copy (`hub`); one only on Hugging Face stays once, by its most downloaded copy.
+const mergeSources = (library, hub) => {
+    const byFamily = new Map();
+    const keep = (entry) => {
+        const family = modelFamily(entry.tag);
+        if (!family || !(entry.parameters > 0)) return;
+        if (!byFamily.has(family)) byFamily.set(family, []);
+        byFamily.get(family).push(entry);
+    };
+    library.filter((entry) => !entry.cloudOnly).forEach(keep);
+    const alone = [];
+    for (const entry of hub) {
+        const same = (byFamily.get(modelFamily(entry.tag)) || []).find((one) => sameSize(one.parameters, entry.parameters));
+        if (same?.source === 'huggingface') continue;
+        if (same) {
+            if (!same.hub) same.hub = entry.tag.replace(/^hf\.co\//, '');
+            continue;
+        }
+        const own = { ...entry, hub: entry.tag.replace(/^hf\.co\//, '') };
+        keep(own);
+        alone.push(own);
+    }
+    return [...library, ...alone];
+};
+const hubCatalogue = async (words, want) => {
+    const search = new URLSearchParams({ ...(words ? { search: words } : {}), filter: 'gguf', sort: 'downloads', direction: '-1', limit: String(HUB_PAGE) });
+    let address = `https://huggingface.co/api/models?${search}&expand[]=gguf&expand[]=downloads&expand[]=likes&expand[]=lastModified&expand[]=pipeline_tag`;
+    const entries = [];
+    for (let read = 0; address && entries.length < want && read < 10; read += 1) {
+        const { models, next } = await hubPage(address);
+        entries.push(...models.map(hubEntry).filter(Boolean));
+        address = next;
+    }
+    return { entries, more: Boolean(address) };
+};
+
+// With picks off the list is only the list: nothing in it is marked or moved to the front. A computer's list
+// (`downloadable`) holds only what can be downloaded, from Ollama's library and Hugging Face alike, at most `limit`.
+const liveCatalogue = async (query, hardware, { picks = true, downloadable = false } = {}) => {
     const models = await libraryModels();
+    const limit = downloadable ? Number(query?.limit) || CATALOGUE_LIMIT : Infinity;
     const words = String(query?.q || '').toLowerCase().split(/[\s:]+/).filter(Boolean);
     // A word such as 7b asks for that size of a model, unless it is part of a model's name.
     const sizes = words.filter((word) => SIZE_WORD.test(word) && !models.some((model) => squash(model.name).includes(squash(word))));
@@ -116,12 +211,23 @@ const liveCatalogue = async (query, hardware, { picks = true } = {}) => {
     if (near) matching = score(true);
     const scoreOf = (entry) => scores.get(entry.tag.split(':')[0]) || 0;
     await loadLibrarySizes(matching.filter((model) => popular.has(model.name)).map((model) => model.name));
+    const hub = downloadable
+        ? await hubCatalogue(words.join(' '), limit).catch((error) => {
+            logger.warn('[Hugging Face] The list could not be read', { reason: error.message });
+            return { entries: [], more: false, down: true };
+        })
+        : { entries: [], more: false };
+    const hubShown = hub.entries
+        .filter((entry) => sizes.length === 0 || sizes.includes(`${Math.round(entry.parameters)}b`))
+        .filter((entry) => !purpose || entry.goodFor.includes(purpose))
+        .filter((entry) => can.every((ability) => entry.capabilities.includes(ability)));
 
     const order = () => {
-        const entries = libraryEntries(matching)
+        const entries = mergeSources(libraryEntries(matching)
+            .filter((entry) => !downloadable || !entry.cloudOnly)
             .filter((entry) => sizes.length === 0 || entry.cloudOnly || sizes.includes(entry.tag.split(':')[1]?.toLowerCase()))
             .filter((entry) => !purpose || entry.goodFor.includes(purpose))
-            .filter((entry) => can.every((ability) => entry.capabilities.includes(ability)));
+            .filter((entry) => can.every((ability) => entry.capabilities.includes(ability))), hubShown);
         const isPopular = (entry) => !entry.cloudOnly && popular.has(entry.tag.split(':')[0]);
         const all = hardware
             ? [...rankCatalogue(entries.filter(isPopular), hardware), ...entries.filter((entry) => !isPopular(entry)).map((entry) => ({ ...entry, fit: entry.cloudOnly ? CLOUD_FIT : fitModel(entry, hardware), pick: null }))]
@@ -152,12 +258,12 @@ const liveCatalogue = async (query, hardware, { picks = true } = {}) => {
         ];
     };
     // The recommended models lead the first page and are not counted in the number shown per page.
-    const unpicked = (all) => all.filter((entry) => !entry.pick);
+    const unpicked = (all) => all.filter((entry) => !entry.pick).slice(0, limit);
     const shown = (all) => (sampled ? sample(all) : everything ? all
         : [...(page === 1 ? all.filter((entry) => entry.pick) : []), ...unpicked(all).slice((page - 1) * size, page * size)]);
 
     // The page about to be shown gets its exact sizes, then the order is worked out again with them.
-    await loadLibrarySizes(shown(order()).map((entry) => entry.tag.split(':')[0]));
+    await loadLibrarySizes(shown(order()).filter((entry) => entry.source !== 'huggingface').map((entry) => entry.tag.split(':')[0]));
     const all = order();
     const entries = shown(all);
     const online = await ollamaOnlineNames();
@@ -174,6 +280,7 @@ const liveCatalogue = async (query, hardware, { picks = true } = {}) => {
         size,
         paged: unpicked(all).length,
         more: !everything && !sampled && page * size < unpicked(all).length,
+        ...(downloadable ? { limit, further: all.filter((entry) => !entry.pick).length > limit || hub.more, hubDown: Boolean(hub.down) } : {}),
         local: all.filter((entry) => !entry.cloudOnly),
         total: all.length,
         library: models.length,
@@ -260,10 +367,127 @@ const currentLane = () => {
     return target.kind === 'companion' ? target.id : ['cloud', 'pool'].includes(target.kind) ? `${target.kind}:${target.id}` : target.kind;
 };
 
+// Cloud: open models Mollama runs online with its own key (Hyperstack AI Studio, never named to people) and charges
+// from the person's credit at its price plus CLOUD_RULES.markup. Owners and admins only for now (USE_CLOUD_MODELS),
+// on under the same money rules as rentals. Every request is metered by the client itself, so a reply, its tool steps
+// and the chat's memory are all charged, and a request is refused once the credit left is below `least`.
+export const CLOUD_RULES = { markup: 0.30, least: 25, listMs: 10 * 60 * 1000 };
+export const cloudOn = () => billingOn() && Boolean(process.env.HYPERSTACK_API_KEY)
+    && (moneyIsReal() || !hasRight([ROLES.USER], RIGHTS.USE_CLOUD_MODELS) || process.env.ADMIN_ONLY === 'true' || process.env.NODE_ENV === 'test');
+let cloudList = { at: 0, models: [] };
+export const forgetCloudList = () => { cloudList = { at: 0, models: [] }; };
+const cloudModels = async () => {
+    if (Date.now() - cloudList.at < CLOUD_RULES.listMs && cloudList.models.length) return cloudList.models;
+    const { models } = await createCloudClient(CLOUD_SERVICE, process.env.HYPERSTACK_API_KEY).list();
+    cloudList = { at: Date.now(), models: models.slice(0, 500).map((model) => ({ name: model.name, title: model.cloud?.title || null, contextLength: model.cloud?.contextLength || null, vision: Boolean(model.cloud?.vision), tools: model.cloud?.tools !== false, costIn: model.cloud?.costIn ?? null, costOut: model.cloud?.costOut ?? null })) };
+    return cloudList.models;
+};
+// The price a person pays per million tokens, in dollars.
+const cloudPrice = (cost) => (Number.isFinite(cost) ? Math.ceil(cost * (1 + CLOUD_RULES.markup) * 1000) / 1000 : null);
+// The person's Cloud entry among their online services, made or refreshed when they may use it and taken away when not.
+const syncCloud = async (req) => {
+    const owner = req.user.id;
+    if (!cloudOn() || !hasRight(req.user.roles, RIGHTS.USE_CLOUD_MODELS)) {
+        await Provider.deleteOne({ service: SERVICE, owner, kind: CLOUD_SERVICE.id });
+        return null;
+    }
+    let models = null;
+    let health = 'healthy';
+    try {
+        models = await cloudModels();
+        if (!models.length) health = 'empty';
+    } catch (error) {
+        health = PROVIDER_FAULTS[mapOllamaError(error).code] || 'unreachable';
+        logger.warn('[Cloud] The model list could not be read', { reason: error.message });
+    }
+    return Provider.findOneAndUpdate(
+        { service: SERVICE, owner, kind: CLOUD_SERVICE.id },
+        { $set: { name: CLOUD_SERVICE.name, health, checkedAt: new Date(), ...(models ? { models } : {}) }, $setOnInsert: { owner, kind: CLOUD_SERVICE.id } },
+        { upsert: true, new: true }
+    );
+};
+// Charges what a request used. The ledger takes whole cents, so what is under a cent waits on the person's Cloud entry.
+const cloudSpend = async (provider, model, sent, wrote) => {
+    const facts = provider.models.find((one) => one.name === model) || {};
+    const cents = ((sent * (cloudPrice(facts.costIn) || 0)) + (wrote * (cloudPrice(facts.costOut) || 0))) / 1e6 * 100;
+    if (!(cents > 0)) return;
+    const updated = await Provider.findOneAndUpdate({ _id: provider._id }, { $inc: { owed: cents } }, { new: true });
+    const whole = Math.floor(updated?.owed || 0);
+    if (whole < 1) return;
+    let taken = whole;
+    try {
+        await charge(provider.owner, whole, { about: `Cloud: ${facts.title || model}` });
+    } catch (error) {
+        if (!(error instanceof BillingError) || error.code !== 'NOT_ENOUGH_CREDIT') throw error;
+        taken = Math.max(0, Math.floor(error.extra?.balance ?? (await balanceOf(provider.owner)).balance));
+        if (taken > 0) await charge(provider.owner, taken, { about: `Cloud: ${facts.title || model}` });
+    }
+    if (taken > 0) await Provider.updateOne({ _id: provider._id }, { $inc: { owed: -taken } });
+};
+// A Cloud client that refuses a request while the credit left is too low and charges each one when it ends. A reply
+// stopped before the service counted it is charged from what was sent and written.
+const meteredCloud = (client, provider) => ({
+    ...client,
+    chat: async (request, signal) => {
+        const { balance } = await balanceOf(provider.owner);
+        if (balance - Math.ceil(provider.owed || 0) < CLOUD_RULES.least) throw new OllamaError('CLOUD_NO_CREDIT');
+        const guessSent = () => Math.ceil(JSON.stringify(request.messages || []).length / 4);
+        const answer = await client.chat(request, signal);
+        if (!request.stream) {
+            await cloudSpend(provider, request.model, answer.prompt_eval_count || guessSent(), answer.eval_count || 0).catch((error) => logger.error('[Cloud] A request could not be charged', { reason: error.message }));
+            return answer;
+        }
+        async function* counted() {
+            let sent = 0;
+            let wrote = 0;
+            let written = 0;
+            try {
+                for await (const part of answer) {
+                    written += (part.message?.content?.length || 0) + (part.message?.thinking?.length || 0) + (part.message?.tool_draft?.length || 0);
+                    if (part.done) {
+                        sent = part.prompt_eval_count || 0;
+                        wrote = part.eval_count || 0;
+                    }
+                    yield part;
+                }
+            } finally {
+                await cloudSpend(provider, request.model, sent || guessSent(), wrote || Math.ceil(written / 4)).catch((error) => logger.error('[Cloud] A request could not be charged', { reason: error.message }));
+            }
+        }
+        const parts = counted();
+        parts.abort = answer.abort;
+        return parts;
+    }
+});
+// The Cloud model closest to one of Ollama's cloud models, by the family name both carry (kimi-k2.5 and
+// moonshotai/Kimi-K2.5), for the chats that used Ollama's cloud models before Cloud took their place.
+export const cloudMatch = (name, models) => {
+    const squash = (text) => String(text).toLowerCase().replace(/[^a-z0-9]/g, '');
+    const family = squash(String(name).split(':')[0].replace(/-cloud$/i, ''));
+    if (family.length < 3) return null;
+    let best = null;
+    let score = 0;
+    for (const model of models) {
+        const own = squash(String(model.name).split('/').pop());
+        let same = 0;
+        while (same < Math.min(own.length, family.length) && own[same] === family[same]) same += 1;
+        if (same >= Math.min(4, family.length) && same > score) {
+            best = model;
+            score = same;
+        }
+    }
+    return best;
+};
+
 const getOllama = async () => {
     const target = currentTarget();
     if (target.kind === 'cloud') {
         const provider = await Provider.findOne({ _id: target.id, service: SERVICE }).select('+sealed');
+        if (provider?.kind === CLOUD_SERVICE.id) {
+            const allowed = cloudOn() && await User.exists({ _id: provider.owner, roles: { $in: Object.keys(RIGHT_ASSIGNMENT).filter((role) => hasRight([role], RIGHTS.USE_CLOUD_MODELS)) } });
+            if (!allowed) return createOllamaClient(DEVICE_HOST, () => Promise.reject(new OllamaError('CLOUD_OFF')));
+            return meteredCloud(createCloudClient(CLOUD_SERVICE, process.env.HYPERSTACK_API_KEY, provider.models), provider);
+        }
         const entry = CLOUD_PROVIDERS.find((one) => one.id === provider?.kind);
         const key = provider ? unseal(provider.sealed)?.key : null;
         if (!entry || !key) return createOllamaClient(DEVICE_HOST, () => Promise.reject(new OllamaError('KEY_REFUSED')));
@@ -642,7 +866,16 @@ class DownloadManager extends EventEmitter {
 
     async enqueue({ model, userId, sizeHintMb = null }) {
         if (sizeHintMb) {
-            const freeMb = await this.freeMb();
+            let freeMb = await this.freeMb();
+            // Downloads still to come on the same computer will take their share of the disk too.
+            if (freeMb !== null) {
+                const waiting = await Download.find({ service: SERVICE, device: currentTarget().id, status: { $in: OPEN_STATES }, model: { $ne: model } });
+                for (const job of waiting) {
+                    const [family, tag = 'latest'] = job.model.split(':');
+                    const totalMb = job.totalBytes ? job.totalBytes / MB : (await librarySizes(family).catch(() => new Map())).get(tag) || 0;
+                    freeMb -= Math.max(0, totalMb - (job.completedBytes || 0) / MB);
+                }
+            }
             if (freeMb !== null && sizeHintMb > freeMb) {
                 const error = new OllamaError('DISK_FULL');
                 error.neededMb = sizeHintMb;
@@ -1126,7 +1359,7 @@ export const listDevices = asyncHandler(async (req, res) => {
         devices: [
             ...await Promise.all(devices.map(async (device) => presentDevice(device, await ollamaOf(device)))),
             ...(req.query?.with === 'online' ? [await presentPool(req.user.id)].filter(Boolean) : []),
-            ...(req.query?.with === 'online' ? (await Provider.find({ service: SERVICE, owner: req.user.id }).sort({ name: 1 })).map(presentOnlineDevice) : [])
+            ...(req.query?.with === 'online' ? (await shownProviders(req)).map(presentOnlineDevice) : [])
         ],
         current: ['companion', 'cloud', 'pool'].includes(target.kind) ? target.id : local?.id ?? null,
         permissions: { manage: canManage(req) }
@@ -2557,7 +2790,7 @@ export const startDownload = asyncHandler(async (req, res) => {
         const job = await downloads.enqueue({
             model: req.body.name,
             userId: req.user.id,
-            sizeHintMb: known?.sizeMb || (await librarySizes(String(req.body.name).split(':')[0])).get(String(req.body.name).split(':')[1] || 'latest') || null
+            sizeHintMb: known?.sizeMb || (/^hf\.co\//i.test(req.body.name) ? await hubSizeMb(req.body.name) : (await librarySizes(String(req.body.name).split(':')[0])).get(String(req.body.name).split(':')[1] || 'latest')) || null
         });
         res.status(202).json({ success: true, download: job });
     } catch (error) {
@@ -2717,7 +2950,7 @@ export const getDeviceCatalogue = asyncHandler(async (req, res) => {
     const hardware = effectiveHardware(device);
     let live;
     try {
-        live = await liveCatalogue(req.query, hardware, { picks: false });
+        live = await liveCatalogue(req.query, hardware, { picks: false, downloadable: true });
     } catch (error) {
         return sendOllamaError(res, error);
     }
@@ -2733,6 +2966,9 @@ export const getDeviceCatalogue = asyncHandler(async (req, res) => {
         paged: live.paged,
         more: live.more,
         total: live.total,
+        limit: live.limit,
+        further: live.further,
+        hubDown: live.hubDown,
         library: live.library,
         fitting: live.fitting,
         hardware,
@@ -6459,7 +6695,18 @@ export const listChats = asyncHandler(async (req, res) => {
 // A chat runs on the computer it was given; without one it follows the request, and remembers a linked computer.
 const chatTarget = async (req, chat) => {
     const device = chat.device ? await allowedDevice(req, chat.device) : null;
-    if (!device && chat.device && await Provider.exists({ _id: chat.device, service: SERVICE, owner: req.user.id })) return { kind: 'cloud', id: String(chat.device) };
+    const provider = !device && chat.device ? await Provider.findOne({ _id: chat.device, service: SERVICE, owner: req.user.id }) : null;
+    // A chat on one of Ollama's cloud models moves to the closest Cloud model, which took their place.
+    if (provider?.kind === 'ollama') {
+        const cloud = await syncCloud(req);
+        if (cloud) {
+            const match = cloudMatch(chat.model, cloud.models);
+            chat.device = cloud._id;
+            if (match) chat.model = match.name;
+            return { kind: 'cloud', id: String(cloud._id) };
+        }
+    }
+    if (provider) return { kind: 'cloud', id: String(chat.device) };
     return device ? targetOf(device) : currentTarget();
 };
 
@@ -7958,6 +8205,8 @@ const presentProvider = (provider) => ({
     name: provider.name,
     modelCount: provider.models.length,
     models: provider.models.slice(0, 300).map((model) => model.name),
+    // Cloud's models with what each costs the person, in dollars per million tokens.
+    ...(provider.kind === CLOUD_SERVICE.id ? { cloud: true, priced: provider.models.slice(0, 300).map((model) => ({ name: model.name, title: model.title, contextLength: model.contextLength, vision: model.vision, tools: model.tools !== false, input: cloudPrice(model.costIn), output: cloudPrice(model.costOut) })) } : {}),
     health: { state: provider.health, label: PROVIDER_HEALTH[provider.health].label, needs: PROVIDER_HEALTH[provider.health].needs, checkedAt: provider.checkedAt }
 });
 // How a connected provider appears among the computers a chat can use.
@@ -7971,12 +8220,13 @@ const PROVIDER_FAULTS = { KEY_REFUSED: 'refused', OUT_OF_CREDIT: 'credit', PROVI
 
 // Reads the provider's list of models with the person's key, which also proves the key works.
 const checkProvider = async (provider) => {
+    if (provider.kind === CLOUD_SERVICE.id) return provider;
     const entry = CLOUD_PROVIDERS.find((one) => one.id === provider.kind);
     try {
         const client = createCloudClient(entry, unseal(provider.sealed)?.key);
         await client.prove();
         const { models } = await client.list();
-        provider.models = models.slice(0, 500).map((model) => ({ name: model.name, title: model.cloud?.title || null, contextLength: model.cloud?.contextLength || null, vision: Boolean(model.cloud?.vision), maxOutput: model.cloud?.maxOutput || null }));
+        provider.models = models.slice(0, 500).map((model) => ({ name: model.name, title: model.cloud?.title || null, contextLength: model.cloud?.contextLength || null, vision: Boolean(model.cloud?.vision), maxOutput: model.cloud?.maxOutput || null, ...(typeof model.cloud?.tools === 'boolean' ? { tools: model.cloud.tools } : {}) }));
         provider.health = provider.models.length > 0 ? 'healthy' : 'empty';
     } catch (error) {
         provider.health = PROVIDER_FAULTS[mapOllamaError(error).code] || 'unreachable';
@@ -7992,8 +8242,16 @@ const findProvider = async (req, res) => {
     return provider;
 };
 
+// The online services a person sees: Cloud when they may use it, and those whose kind Mollama still offers (Ollama's
+// own entry stays stored only so its chats can be moved to Cloud).
+const shownProviders = async (req) => {
+    await syncCloud(req);
+    const known = new Set([CLOUD_SERVICE.id, ...CLOUD_PROVIDERS.map((one) => one.id)]);
+    return (await Provider.find({ service: SERVICE, owner: req.user.id }).sort({ name: 1 })).filter((provider) => known.has(provider.kind));
+};
+
 export const listProviders = asyncHandler(async (req, res) => {
-    const providers = await Provider.find({ service: SERVICE, owner: req.user.id }).sort({ name: 1 });
+    const providers = await shownProviders(req);
     res.status(200).json({
         success: true,
         providers: providers.map(presentProvider),
@@ -8277,6 +8535,83 @@ export const trainBase = async (given) => {
     if (trainFacts.size > 200) trainFacts.delete(trainFacts.keys().next().value);
     return facts;
 };
+// Hugging Face's GGUF models, which Ollama downloads as hf.co/<maker>/<name>:<quant>. A fixed public address that
+// takes no key; only the words searched or the model's name are sent. Answers are kept ten minutes.
+const hubHeld = new Map();
+const hubAsk = async (address) => {
+    const held = hubHeld.get(address);
+    if (held && Date.now() - held.at < 10 * 60 * 1000) return held.data;
+    const reply = await (trainFetch || fetch)(address, { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(12000) });
+    if (!reply.ok) throw Object.assign(new Error(`Hugging Face answered ${reply.status}`), { status: reply.status });
+    const data = await reply.json();
+    hubHeld.set(address, { data, at: Date.now() });
+    if (hubHeld.size > 300) hubHeld.delete(hubHeld.keys().next().value);
+    return data;
+};
+const HUB_QUANT = /(?:^|[-_.])(I?Q\d+(?:_[A-Z0-9]+)*|F16|BF16|F32)\.gguf$/i;
+const hubParameters = (name) => Number(String(name).match(/(\d+(?:\.\d+)?)\s*B(?![a-z])/i)?.[1]) || null;
+// The single-file GGUF downloads of a model, one per quantisation; split files and vision projectors are left out.
+export const hubQuants = (files = []) => {
+    const seen = new Set();
+    return files
+        .filter((file) => /\.gguf$/i.test(file.rfilename) && !/-\d{5}-of-\d{5}\.gguf$/i.test(file.rfilename) && !/mmproj/i.test(file.rfilename))
+        .map((file) => ({ file: file.rfilename, quant: file.rfilename.match(HUB_QUANT)?.[1]?.toUpperCase() || null, sizeMb: Math.round((file.size || file.lfs?.size || 0) / MB) }))
+        .filter((file) => file.quant && file.sizeMb > 0 && !seen.has(file.quant) && seen.add(file.quant))
+        .sort((a, b) => a.sizeMb - b.sizeMb);
+};
+const hubFacts = async (repo) => {
+    const facts = await hubAsk(`https://huggingface.co/api/models/${repo}?blobs=true`);
+    const parameters = facts.gguf?.total ? Math.round(facts.gguf.total / 1e8) / 10 : hubParameters(repo);
+    return { facts, parameters, quants: hubQuants(facts.siblings) };
+};
+// The size of a model named hf.co/<maker>/<name>:<quant>, or null when it cannot be read.
+const hubSizeMb = async (name) => {
+    const [, repo, quant] = String(name).match(/^hf\.co\/([\w.-]+\/[\w.-]+)(?::([\w.-]+))?$/i) || [];
+    if (!repo) return null;
+    try {
+        const { quants } = await hubFacts(repo);
+        return (quant ? quants.find((one) => one.quant === quant.toUpperCase()) : quants.find((one) => one.quant === 'Q4_K_M'))?.sizeMb || null;
+    } catch {
+        return null;
+    }
+};
+
+export const searchHub = asyncHandler(async (req, res) => {
+    const words = String(req.query.q || '').trim();
+    if (words.length < 3) return res.status(200).json({ success: true, models: [] });
+    try {
+        const list = await hubAsk(`https://huggingface.co/api/models?search=${encodeURIComponent(words)}&filter=gguf&sort=downloads&direction=-1&limit=20`);
+        const models = (Array.isArray(list) ? list : []).filter((model) => !model.gated && !model.private && model.id)
+            .map((model) => ({ repo: model.id, downloads: model.downloads || 0, likes: model.likes || 0, updated: model.lastModified || model.createdAt || null, parameters: hubParameters(model.id) }));
+        res.status(200).json({ success: true, models });
+    } catch (error) {
+        logger.warn('[Hugging Face] A search failed', { reason: error.message });
+        res.status(502).json({ success: false, code: 'HUB_DOWN', message: 'Hugging Face could not be reached. Try again in a moment.' });
+    }
+});
+
+export const listHubFiles = asyncHandler(async (req, res) => {
+    const repo = String(req.query.repo || '').trim();
+    const device = req.query.device ? await allowedDevice(req, req.query.device) : null;
+    if (req.query.device && !device) return res.status(404).json({ success: false, message: 'Device not found' });
+    const hardware = device ? effectiveHardware(device) : null;
+    try {
+        const { facts, parameters, quants } = await hubFacts(repo);
+        if (facts.gated) return res.status(403).json({ success: false, code: 'HUB_GATED', message: `${facts.id} can be downloaded only after agreeing to its makers' terms on Hugging Face, which Mollama cannot do for you yet.` });
+        res.status(200).json({
+            success: true,
+            repo: facts.id,
+            parameters,
+            licence: typeof facts.cardData?.license === 'string' ? facts.cardData.license : null,
+            quants: quants.map((one) => ({ ...one, name: `hf.co/${facts.id}:${one.quant}`, ...(hardware ? { fit: fitModel({ sizeMb: one.sizeMb, parameters: parameters || 0 }, hardware) } : {}) }))
+        });
+    } catch (error) {
+        if (error.status === 404 || error.status === 401) return res.status(404).json({ success: false, code: 'HUB_NOT_FOUND', message: `There is no model called ${repo} on Hugging Face.` });
+        logger.warn('[Hugging Face] A model could not be read', { repo, reason: error.message });
+        res.status(502).json({ success: false, code: 'HUB_DOWN', message: 'Hugging Face could not be reached. Try again in a moment.' });
+    }
+});
+
 // Soup's own estimate of the graphics memory a run takes at its peak (`estimate_peak_vram_gb`, soup-cli 0.78.0), read
 // off at six model sizes, in its GB: what a run takes before a lesson is read (`still`), what every 1,000 tokens read
 // in one step add (`token`, or `saved` when memory is traded for time), and what a larger adapter (`rank`, for 192
@@ -8754,6 +9089,8 @@ deviceGateway.on('offline', (deviceId) => trainKits.delete(String(deviceId)));
 // knows the machine. The same pass runs from watch.js on a schedule of its own, for when this server is down.
 // All money is in cents. Suggested values, for the owner to confirm.
 // ---------------------------------------------------------------------------------------------
+// The share of a rented machine's disk the models chosen when renting may take; the rest is kept for the system and Ollama.
+const RENTAL_DISK_SHARE = 0.85;
 export const RENTAL_RULES = {
     markup: 0.30,
     limit: 1000,
@@ -8814,6 +9151,7 @@ const presentRental = (rental) => {
         limit: rental.limit,
         minutes: rental.minutes,
         idleMinutes: rental.idleMinutes,
+        models: rental.models || [],
         // How many hours it can still be extended by, at most 12 at a time.
         moreHours: Math.max(0, Math.min(12, Math.floor((RENTAL_RULES.longestHours * 60 - rental.minutes) / 60))),
         spent,
@@ -8949,6 +9287,17 @@ export const startRental = asyncHandler(async (req, res) => {
     const hours = Math.min(req.body.hours || RENTAL_RULES.hours, RENTAL_RULES.mostHours);
     const limit = req.body.limit || RENTAL_RULES.limit;
     if (limit < price) return refuseRental(res, 400, 'LIMIT_TOO_SMALL', `The spending limit must cover one hour: at least ${money(price)}.`, { least: price });
+    // Models to download as soon as it is ready must fit its disk, with room kept for the system and Ollama.
+    const models = req.body.models || [];
+    if (models.length && first.card.diskGb) {
+        const sizes = await Promise.all(models.map(async (name) => {
+            const [family, tag = 'latest'] = name.split(':');
+            return (await findModel(name))?.sizeMb || (await librarySizes(family).catch(() => new Map())).get(tag) || 0;
+        }));
+        const room = Math.floor(first.card.diskGb * 1024 * RENTAL_DISK_SHARE);
+        const total = sizes.reduce((sum, size) => sum + size, 0);
+        if (total > room) return refuseRental(res, 400, 'MODELS_TOO_LARGE', `Those models take about ${Math.ceil(total / 1024)} GB and this card's disk has room for about ${Math.floor(room / 1024)} GB. Choose fewer or smaller ones.`, { totalMb: total, roomMb: room });
+    }
     const { balance } = await balanceOf(user);
     if (balance < limit) return refuseRental(res, 402, 'NOT_ENOUGH_CREDIT', `You have ${money(balance)} of credit and this sets aside ${money(limit)}. Add credit first.`, { balance, limit });
 
@@ -8982,7 +9331,7 @@ export const startRental = asyncHandler(async (req, res) => {
     let rental = null;
     for (let slot = 0; slot < RENTAL_RULES.atOnce && !rental; slot += 1) {
         rental = await Rental.create({
-            _id: id, user, slot, price, cost: card.cost, limit, minutes: hours * 60, idleMinutes: RENTAL_RULES.idleMinutes, provider: candidates[0].provider.id,
+            _id: id, user, slot, price, cost: card.cost, limit, minutes: hours * 60, idleMinutes: RENTAL_RULES.idleMinutes, provider: candidates[0].provider.id, models,
             card: { key: card.key, flavor: card.flavor, gpu: card.gpu, count: card.count, memoryMb: card.memoryMb, region: card.region || '' },
             machine: { name: `${machinePrefix()}${id}` }
         }).catch((error) => {
@@ -9163,7 +9512,20 @@ const markRentalLinked = async (rental) => {
     rental.readyAt = rental.readyAt || rental.linkedAt;
     rental.state = 'running';
     await rental.save();
-    tellRenter(rental, 'rental:ready', 'success', 'It is ready. Download a model onto it from the Models page, then choose it in a chat.');
+    const models = rental.models || [];
+    tellRenter(rental, 'rental:ready', 'success', models.length
+        ? `It is ready, and ${models.length === 1 ? models[0] : `${models.length} models`} ${models.length === 1 ? 'is' : 'are'} downloading onto it. Choose it in a chat once ${models.length === 1 ? 'that is' : 'one is'} done.`
+        : 'It is ready. Download a model onto it from the Models page, then choose it in a chat.');
+    for (const name of models) {
+        try {
+            const [family, tag = 'latest'] = name.split(':');
+            const sizeHintMb = (await findModel(name))?.sizeMb || (await librarySizes(family).catch(() => new Map())).get(tag) || null;
+            await deviceScope.run({ kind: 'companion', id: String(rental.device) }, () => downloads.enqueue({ model: name, userId: String(rental.user), sizeHintMb }));
+        } catch (error) {
+            logger.warn('[Rental] A chosen model could not be queued', { rental: rental.id, model: name, reason: error.message });
+            tellRenter(rental, 'rental:download', 'warning', `${name} could not be downloaded onto it: ${error.detail || error.message}`);
+        }
+    }
 };
 deviceGateway.on('online', async (deviceId) => {
     try {
@@ -9193,7 +9555,7 @@ const watchRental = async (rental, { alone }) => {
         return false;
     }
 
-    const busy = (!alone && repliesOn(rental.device).length > 0) || Boolean(await Download.exists({ service: SERVICE, device: rental.device, status: 'downloading' }));
+    const busy = (!alone && repliesOn(rental.device).length > 0) || Boolean(await Download.exists({ service: SERVICE, device: rental.device, status: { $in: ['downloading', 'queued'] } }));
     if (busy) rental.activeAt = new Date();
     const left = {
         limit: (rental.limit - rentalSpent(rental)) / rental.price * 60,

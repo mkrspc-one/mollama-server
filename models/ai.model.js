@@ -238,11 +238,15 @@ export const modelSchemas = {
         action: Joi.string().valid('pause', 'cancel').required()
     }),
 
+    hubSearch: Joi.object({ q: Joi.string().trim().max(80).allow('') }),
+    hubFiles: Joi.object({ repo: Joi.string().trim().pattern(/^[\w.-]{1,96}\/[\w.-]{1,96}$/).required(), device: Joi.objectId() }),
     catalogueQuery: Joi.object({
         memoryMb: megabytes,
         gpuMemoryMb: megabytes,
         q: Joi.string().trim().max(60).allow(''),
         page: Joi.number().integer().min(1).max(500),
+        // How many models a computer's list holds before more are asked for: 200 at first, 200 more each time.
+        limit: Joi.number().integer().min(200).max(2000),
         size: Joi.number().valid(4, 8, 12, 24, 48),
         sort: Joi.string().valid('fit', 'largest', 'smallest', 'popular', 'name'),
         purpose: Joi.string().valid('chat', 'writing', 'code', 'reasoning'),
@@ -429,7 +433,9 @@ const providerSchema = new mongoose.Schema({
     kind: { type: String, required: true },
     name: { type: String, required: true },
     sealed: { type: String, default: null, select: false },
-    models: { type: [new mongoose.Schema({ name: String, title: String, contextLength: Number, vision: Boolean, maxOutput: Number }, { _id: false })], default: [] },
+    models: { type: [new mongoose.Schema({ name: String, title: String, contextLength: Number, vision: Boolean, maxOutput: Number, tools: Boolean, costIn: Number, costOut: Number }, { _id: false })], default: [] },
+    // Cloud only: what has been used but not yet charged, in cents (the ledger takes whole cents).
+    owed: { type: Number, default: 0 },
     health: { type: String, enum: PROVIDER_HEALTH_STATES, default: 'unchecked' },
     checkedAt: { type: Date, default: null }
 }, { timestamps: true });
@@ -625,6 +631,8 @@ const rentalSchema = new mongoose.Schema({
     deleteTries: { type: Number, default: 0 },
     // Which of its person's places an open rental takes; taken away when it ends.
     slot: { type: Number },
+    // Models chosen when renting, downloaded onto it as soon as it links.
+    models: { type: [String], default: [] },
     // More time bought while it ran: each extension that needed more credit set it aside as a hold of its own.
     extended: { type: [{ _id: false, hours: Number, hold: String, amount: Number, at: Date }], default: [] }
 }, { timestamps: true });
@@ -637,7 +645,9 @@ export const rentalSchemas = {
         hours: Joi.number().integer().min(1).max(24),
         limit: Joi.number().integer().min(1).max(100000),
         // The price an hour the person saw, in cents: never charged more without being shown it first.
-        price: Joi.number().integer().min(0).max(1000000)
+        price: Joi.number().integer().min(0).max(1000000),
+        // Models to download onto it as soon as it is ready, by their Ollama names (name or name:tag).
+        models: Joi.array().items(Joi.string().trim().max(120).pattern(/^[a-z0-9][a-z0-9._\/-]*(:[a-z0-9][a-z0-9._-]*)?$/i)).max(8).unique()
     }),
     compare: Joi.object({ day: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/) }),
     extend: Joi.object({ hours: Joi.number().integer().min(1).max(12).required() })

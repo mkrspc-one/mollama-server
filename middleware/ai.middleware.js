@@ -215,6 +215,16 @@ const ERROR_TABLE = {
         message: 'The online service did not accept your key.',
         action: 'Replace the key on the Models page, under Online.'
     },
+    CLOUD_NO_CREDIT: {
+        status: 402,
+        message: 'Your Mollama credit is used up, so Cloud models cannot answer.',
+        action: 'Add credit on the Billing page, or pick a model on one of your computers.'
+    },
+    CLOUD_OFF: {
+        status: 403,
+        message: 'Cloud models are not available to you.',
+        action: 'Pick a model on one of your computers.'
+    },
     OUT_OF_CREDIT: {
         status: 402,
         message: 'Your account with this online service is out of credit or over its limit.',
@@ -2295,8 +2305,10 @@ export const TOOL_LOCAL_CATALOGUE = [
 // sent nothing beyond the conversation, because they refuse sampling settings or extra fields.
 const keySteps = (maker, where) => [`Open the key page and sign up or sign in to ${maker}.`, where, 'Copy the key and paste it into the Key box here. Most services show it only once.'];
 const online = (id, name, base, does, page, cost, where, extra = {}) => ({ id, name, base, does, type: 'openai', key: { page, cost, steps: keySteps(name, where) }, ...extra });
+// Cloud: open models Mollama runs online and charges from credit, with Mollama's own key (Hyperstack AI Studio, never
+// named to people). It took the place of Ollama's cloud models on 2026-11-27, on the owner's word.
+export const CLOUD_SERVICE = { id: 'cloud', name: 'Cloud', base: 'https://console.hyperstack.cloud/ai/api/v1', type: 'openai', header: 'api_key', list: '/base_models?inference=true' };
 export const CLOUD_PROVIDERS = [
-    online('ollama', 'Ollama', 'https://ollama.com', 'The large open models in Ollama\'s library, such as Kimi, GLM and DeepSeek, run on Ollama\'s computers', 'https://ollama.com/settings/keys', 'Pay for what you use, at Ollama\'s prices. There is no free allowance.', 'Under Keys, add an API key.', { type: 'ollama', proof: { path: '/api/me', method: 'POST' } }),
     online('anthropic', 'Anthropic', 'https://api.anthropic.com', 'The Claude models', 'https://platform.claude.com/settings/keys', 'Paid by use. Separate from a Claude subscription.', 'Under API keys, create a key.', { type: 'anthropic' }),
     online('openai', 'OpenAI', 'https://api.openai.com/v1', 'The GPT models', 'https://platform.openai.com/api-keys', 'Paid by use. Separate from a ChatGPT subscription.', 'Under API keys, create a new secret key.'),
     online('google', 'Google', 'https://generativelanguage.googleapis.com/v1beta/openai', 'The Gemini models', 'https://aistudio.google.com/apikey', 'Has a free allowance; paid beyond it.', 'Choose Create API key.'),
@@ -2340,7 +2352,7 @@ const CLOUD_CONTEXT = 128000;
 const askCloud = async (entry, key, path, init = {}) => {
     let response;
     try {
-        response = await (entry.fetch || cloudFetch)(`${entry.base}${path}`, { ...init, headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json', ...(init.headers || {}) } });
+        response = await (entry.fetch || cloudFetch)(`${entry.base}${path}`, { ...init, headers: { ...(entry.header ? { [entry.header]: key } : { Authorization: `Bearer ${key}` }), 'Content-Type': 'application/json', ...(init.headers || {}) } });
     } catch (error) {
         if (error?.name === 'AbortError' || error instanceof OllamaError) throw error;
         throw new OllamaError('PROVIDER_DOWN', error?.message);
@@ -2554,7 +2566,7 @@ async function* claudeParts(stream, started) {
 export const createCloudClient = (entry, key, known = []) => {
     const factsOf = (name) => known.find((model) => model.name === name) || null;
     const shown = (name) => ({
-        capabilities: ['completion', 'tools', ...(factsOf(name)?.vision ? ['vision'] : [])],
+        capabilities: ['completion', ...(factsOf(name)?.tools === false ? [] : ['tools']), ...(factsOf(name)?.vision ? ['vision'] : [])],
         model_info: { 'cloud.context_length': factsOf(name)?.contextLength || CLOUD_CONTEXT }
     });
     const common = {
@@ -2641,19 +2653,25 @@ export const createCloudClient = (entry, key, known = []) => {
     return {
         ...common,
         list: async () => {
-            const body = await (await askCloud(entry, key, '/models', { signal: AbortSignal.timeout(20000) })).json();
+            const body = await (await askCloud(entry, key, entry.list || '/models', { signal: AbortSignal.timeout(20000) })).json();
             const listed = Array.isArray(body?.data) ? body.data : Array.isArray(body?.models) ? body.models : [];
+            const idOf = (model) => model?.id ?? model?.model_name;
             return {
-                models: listed.filter((model) => model?.id && !NOT_FOR_CHAT.test(model.id)).map((model) => ({
-                    name: String(model.id).replace(/^models\//, ''),
-                    size: 0,
-                    details: {},
-                    cloud: {
-                        title: [model.display_name, model.displayName, model.name].find((text) => typeof text === 'string' && text.trim() && text !== model.id) || null,
-                        contextLength: model.context_length || model.context_window || model.max_input_tokens || model.max_context_length || null,
-                        vision: Boolean(model.supports_image_in || model.capabilities?.vision || model.capabilities?.image_input || model.architecture?.input_modalities?.includes?.('image') || model.input_modalities?.includes?.('image'))
-                    }
-                }))
+                models: listed
+                    .filter((model) => typeof idOf(model) === 'string' && !NOT_FOR_CHAT.test(idOf(model)))
+                    .filter((model) => model.available_for_inference !== false && (!Array.isArray(model.output_modalities) || model.output_modalities.includes('text')))
+                    .map((model) => ({
+                        name: String(idOf(model)).replace(/^models\//, ''),
+                        size: 0,
+                        details: {},
+                        cloud: {
+                            title: [model.display_name, model.displayName, model.name].find((text) => typeof text === 'string' && text.trim() && text !== idOf(model)) || null,
+                            contextLength: model.context_length || model.context_window || model.max_input_tokens || model.max_context_length || model.supported_context_len || null,
+                            vision: Boolean(model.supports_image_in || model.capabilities?.vision || model.capabilities?.image_input || model.architecture?.input_modalities?.includes?.('image') || model.input_modalities?.includes?.('image')),
+                            ...(typeof model.tool_call_supported === 'boolean' ? { tools: model.tool_call_supported } : {}),
+                            ...(Number.isFinite(model.input_token_cost_per_m) ? { costIn: model.input_token_cost_per_m, costOut: Number(model.output_token_cost_per_m) || 0 } : {})
+                        }
+                    }))
             };
         },
         chat: async (request, signal) => {

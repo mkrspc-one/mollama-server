@@ -47,6 +47,8 @@ router.validRoutes = [
     '/api/v1/models/downloads/stream',
     '/api/v1/models/downloads/cancel',
     '/api/v1/catalogue',
+    '/api/v1/huggingface',
+    '/api/v1/huggingface/files',
     '/api/v1/devices/:id/catalogue',
     '/api/v1/devices/:id/recommended',
     '/api/v1/skills',
@@ -131,6 +133,8 @@ router.get('/models/downloads/stream', ...signedIn, aiController.streamDownloads
 router.post('/models/downloads/cancel', ...manager, validateRequest(modelSchemas.downloadAction), aiController.changeDownload);
 
 router.get('/catalogue', noCacheResponse(), validateRequest(modelSchemas.catalogueQuery, 'query'), aiController.getPublicCatalogue);
+router.get('/huggingface', ...signedIn, validateRequest(modelSchemas.hubSearch, 'query'), aiController.searchHub);
+router.get('/huggingface/files', ...signedIn, validateRequest(modelSchemas.hubFiles, 'query'), aiController.listHubFiles);
 router.get('/devices/:id/catalogue', ...signedIn, withDeviceId, validateRequest(modelSchemas.catalogueQuery, 'query'), aiController.getDeviceCatalogue);
 router.get('/devices/:id/recommended', ...signedIn, withDeviceId, aiController.getDeviceRecommended);
 
