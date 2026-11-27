@@ -1594,7 +1594,7 @@ deviceGateway.on('online', async (deviceId, hello, replaced) => {
 });
 deviceGateway.on('offline', announceDevice(false));
 // Why each link closed, so a computer that keeps dropping can be explained.
-deviceGateway.on('closed', (deviceId, about) => logger.info('[Device] A link closed', { deviceId: String(deviceId), ...about }));
+deviceGateway.on('closed', (deviceId, about) => logger.info('[Device] A link closed', { deviceId: String(deviceId), ...about, keep: true }));
 // A computer whose link drops usually returns in seconds and keeps its part in a pool for two minutes (its desktop app
 // does the same), so the others are only told it has gone if it is still away then.
 const POOL_GRACE_MS = process.env.NODE_ENV === 'test' ? 0 : 2 * 60 * 1000;
@@ -1870,6 +1870,13 @@ export const deleteModel = asyncHandler(async (req, res) => {
     const ollama = await getOllama();
     try {
         await endReplies(repliesOn(currentTarget()?.id, req.body.name), { wait: 3000 });
+        // A loaded model holds its file open, and its disk space is not freed until it lets go, so it is unloaded first
+        // and given a moment to leave. Only when loaded: asking to unload a model that is not loaded loads it.
+        const loaded = async () => ((await ollama.running().catch(() => null))?.models || []).some((model) => [model.name, model.model].includes(req.body.name) || model.name === `${req.body.name}:latest`);
+        if (await loaded()) {
+            await ollama.unload(req.body.name).catch(() => {});
+            for (let tries = 0; tries < 20 && await loaded(); tries++) await new Promise((done) => setTimeout(done, 500));
+        }
         await ollama.remove(req.body.name);
     } catch (error) {
         return sendOllamaError(res, error);
@@ -5187,6 +5194,18 @@ export const wordShape = (messages, tools, asked = '') => {
     else out.unshift({ role: 'system', content: functionWords(tools) });
     return out.map(({ returned, ...message }) => message);
 };
+// The same for a model that calls functions itself: given a skill page last, a weaker one copies the page out as its
+// reply. The request goes after the page in what is sent, never in what is kept.
+// The result messages that hold a page that was given (not a failed call), so the reminder never follows an error.
+export const pagesGiven = new WeakSet();
+export const guideReminder = (messages, asked) => {
+    let first = messages.length;
+    while (first > 0 && messages[first - 1].role === 'tool') first -= 1;
+    const results = messages.slice(first);
+    if (!asked || !results.some((message) => pagesGiven.has(message))) return messages;
+    const last = messages.at(-1);
+    return [...messages.slice(0, -1), { ...last, content: `${last.content}\n\n[The instructions above are for you to work by. The user did not write them, does not see them and does not want them written out or explained.]\nThe user's request, which you are still working on:\n${clip(asked, 2000)}\n\nDo the next step of it now: call the function that does it, or answer.` }];
+};
 // The calls a reply ends with, what was said before them, and a call cut off before its end. What a model writes after
 // a call is its own guess at what came back, and goes.
 export const readWordCalls = (text, tools, ranOut = false) => {
@@ -6223,7 +6242,10 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
                 if (inWords) {
                     request.messages = wordShape(messages, functions, String(prompt.filter((message) => message.role === 'user').at(-1)?.content ?? ''));
                     uncounted = Math.max(uncounted, estimateTokens(functionWords(functions)));
-                } else if (functions.length > 0) request.tools = functions;
+                } else if (functions.length > 0) {
+                    request.tools = functions;
+                    if (!facts.online) request.messages = guideReminder(messages, String(prompt.filter((message) => message.role === 'user').at(-1)?.content ?? ''));
+                }
 
                 room = Math.max(room, sizeFor(messages, thinkRoom + uncounted + (programming ? reserve : 0)));
                 const calls = [];
@@ -6539,6 +6561,7 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
                     const pictures = Array.isArray(outcome.images) && outcome.images.length > 0 ? outcome.images : null;
                     const seesPictures = facts.capabilities.includes('vision');
                     messages.push({ role: 'tool', tool_name: name, content: pictures && !seesPictures ? `${outcome.content}\n\nThis model cannot see pictures, so they were not sent.` : outcome.content, ...(pictures && seesPictures ? { images: pictures } : {}) });
+                    if (GUIDE_CALLS.has(name) && !outcome.failed) pagesGiven.add(messages.at(-1));
                     awayKeys.delete(same);
                     marks.push({ index: messages.length - 1, fn: mine ? mine.fn : name, given: given ?? input, key: same, round });
                     if (outcome.compress) {
@@ -8404,7 +8427,7 @@ export const startRental = asyncHandler(async (req, res) => {
         await beginRentalEnd(rental, 'failed', null);
         return refuseRental(res, 502, 'RENT_FAILED', 'The computer could not be started. Nothing was charged.', { rental: presentRental(rental) });
     }
-    logger.info('[Rental] Started', { rental: rental.id, user: String(user), provider: rental.provider, flavor: rental.card.flavor, price: rental.price, limit });
+    logger.info('[Rental] Started', { rental: rental.id, user: String(user), provider: rental.provider, flavor: rental.card.flavor, price: rental.price, limit, keep: true });
     getNotificationService().sendToUser(String(user), { type: 'device:changed', data: { deviceId: device.id, online: false } });
     return res.status(201).json({ success: true, rental: presentRental(rental) });
 });
@@ -8443,7 +8466,7 @@ const finishRental = async (rental) => {
     rental.slot = undefined;
     rental.endedAt = new Date();
     await rental.save();
-    logger.info('[Rental] Ended', { rental: rental.id, reason: rental.reason, spent: rental.spent });
+    logger.info('[Rental] Ended', { rental: rental.id, reason: rental.reason, spent: rental.spent, keep: true });
     tellRenter(rental, 'rental:ended', rental.reason === 'asked' ? 'info' : 'warning',
         `It has ended because ${RENTAL_ENDS[rental.reason]}. It cost ${money(rental.spent)}; ${money(rental.limit - rental.spent)} is back in your credit.`);
     return true;
@@ -8604,7 +8627,7 @@ export const watchRentals = async ({ alone = false } = {}) => {
         if (!alone && comparedDay !== yesterday) {
             comparedDay = yesterday;
             const compared = await compareRentals(yesterday).catch(() => null);
-            if (compared?.rentals) logger.info('[Rental] Compared with the providers\' bills', compared);
+            if (compared?.rentals) logger.info('[Rental] Compared with the providers\' bills', { ...compared, keep: true });
             if (compared?.rentals && !compared.matches) {
                 tellOwners('rental:mismatch', `The providers' bills for ${yesterday} do not match: ${money(compared.expected)} expected, ${money(compared.billed)} billed${compared.unknown ? `, ${compared.unknown} machine(s) not answered` : ''}.`);
             }

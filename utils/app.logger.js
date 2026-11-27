@@ -5,6 +5,7 @@
 
 import winston from 'winston';
 import figlet from 'figlet';
+import {AsyncLocalStorage} from 'node:async_hooks';
 
 const {format, transports, createLogger} = winston;
 
@@ -40,6 +41,57 @@ const getLogModel = () => {
     });
 
     return Log;
+};
+
+// Warnings and errors, and lines logged with `keep: true`, are saved: as notes on the record of the request they
+// happened in (`requestLog` follows a request through everything it starts, even after its response), or, outside
+// any request, as a record of their own that has a level and a message but no method. Both go with the records' 30 days.
+export const requestLog = new AsyncLocalStorage();
+const NOTES_MAX = 50;
+const NOTE_CHARS = 2000;
+const EVENTS_A_MINUTE = 120;
+// A timer a request started outlives it; what it logs this long after the response is a record of its own.
+const LATE_MS = 15 * 60 * 1000;
+const KEPT_LEVELS = new Set(['error', 'warn']);
+const NOT_DETAIL = new Set(['level', 'message', 'timestamp', 'service', 'environment', 'stack', 'keep', 'preformatted']);
+let events = {minute: 0, count: 0};
+
+const plain = (text) => String(text ?? '').replace(/\x1b\[[0-9;]*m/g, '').slice(0, NOTE_CHARS);
+
+const noteOf = (info) => {
+    const rest = Object.fromEntries(Object.entries(info).filter(([key]) => !NOT_DETAIL.has(key) && typeof key === 'string'));
+    let detail = '';
+    try {
+        detail = Object.keys(rest).length ? JSON.stringify(rest) : '';
+    } catch {
+        detail = '[could not be written out]';
+    }
+    if (info.stack) detail = `${detail}${detail ? '\n' : ''}${info.stack}`;
+    return {level: info.level, message: plain(info.message), at: new Date(), ...(detail ? {detail: plain(detail)} : {})};
+};
+
+const addNotes = (id, notes) => getLogModel()?.updateOne({_id: id}, {$push: {notes: {$each: notes, $slice: NOTES_MAX}}}).catch(() => {});
+
+const saveEvent = (note) => {
+    const minute = Math.floor(Date.now() / 60000);
+    if (events.minute !== minute) events = {minute, count: 0};
+    if (++events.count > EVENTS_A_MINUTE) return;
+    getLogModel()?.createLog({
+        timestamp: note.at, level: note.level, message: note.message, environment: process.env.NODE_ENV, service: 'ai-base-server',
+        ...(note.detail ? {meta: {detail: note.detail}} : {})
+    }).catch(() => {});
+};
+
+const keepNote = (info) => {
+    const keep = info.keep === true;
+    delete info.keep;
+    if (info.preformatted || !(keep || KEPT_LEVELS.has(info.level))) return info;
+    const note = noteOf(info);
+    const request = requestLog.getStore();
+    if (!request || (request.id && Date.now() - request.savedAt > LATE_MS)) saveEvent(note);
+    else if (request.id) addNotes(request.id, [note]);
+    else if (request.notes.length < NOTES_MAX) request.notes.push(note);
+    return info;
 };
 
 // Define colors for console output
@@ -354,6 +406,7 @@ const appLogger = createLogger({
         format.timestamp({format: 'YYYY-MM-DD HH:mm:ss'}),
         format.errors({stack: true}),
         format.splat(),
+        format(keepNote)(),
         format.json()
     ),
     transports: [
@@ -413,10 +466,18 @@ appLogger.http = async (message, metadata = {}) => {
                 if (metadata.method) {
                     logData.operationType = LogModel.determineOperationType(metadata.method);
                 }
+                const request = metadata.logStore;
+                const written = request ? request.notes.length : 0;
+                if (written) logData.notes = request.notes.slice(0, written);
 
                 const savedLog = await LogModel.createLog(logData);
                 if (savedLog && savedLog._id) {
                     objectIdStr = ` ${colors.bgYellow}${colors.bold}[${savedLog._id.toString()}]${colors.reset}`;
+                    if (request) {
+                        request.id = savedLog._id;
+                        request.savedAt = Date.now();
+                        if (request.notes.length > written) addNotes(savedLog._id, request.notes.slice(written));
+                    }
                 }
             }
         } catch (error) {

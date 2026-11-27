@@ -84,6 +84,15 @@ const logSchema = new mongoose.Schema({
         type: Number, sparse: true
     },
 
+    // A record of its own outside any request (no method), and the warnings and errors of a request
+    level: {
+        type: String, sparse: true
+    }, message: {
+        type: String, sparse: true
+    }, notes: {
+        type: [{_id: false, level: String, message: String, at: Date, detail: String}], default: undefined
+    },
+
     // Error-specific fields
     stack: {
         type: String, sparse: true

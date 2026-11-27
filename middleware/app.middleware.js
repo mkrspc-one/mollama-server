@@ -4,7 +4,7 @@ import hpp from 'hpp';
 import cors from 'cors';
 import express from 'express';
 import cookieParser from 'cookie-parser';
-import logger from '../utils/app.logger.js';
+import logger, {requestLog} from '../utils/app.logger.js';
 import jwt from 'jsonwebtoken';
 import WebSocket from 'ws';
 import redis from 'redis';
@@ -193,24 +193,14 @@ const createHttpLogger = () => {
         const LogModel = await getLogModel();
         requestHeaders['x-operation-type'] = LogModel.determineOperationType(req.method);
 
-        // Override res.json to capture response data
+        // Override res.json to capture response data; the log record keeps as much of it as fits (createLog)
         const originalJson = res.json;
         let responseBody = null;
         res.json = function (data) {
             responseBody = data;
-            // Summarize large responses
-            const responseStr = JSON.stringify(data);
-            if (responseStr.length > 10000) {
-                responseBody = {
-                    _summary: 'Response too large to log fully',
-                    _size: responseStr.length,
-                    _type: Array.isArray(data) ? 'array' : typeof data,
-                    _firstItems: Array.isArray(data) ? data.slice(0, 3) : undefined,
-                    _keys: typeof data === 'object' && data !== null ? Object.keys(data).slice(0, 10) : undefined
-                };
-            }
             return originalJson.call(this, data);
         };
+        const logStore = {notes: [], id: null};
 
         // Override res.end to capture final response
         const originalEnd = res.end;
@@ -251,7 +241,8 @@ const createHttpLogger = () => {
                 requestHeaders: Object.keys(requestHeaders).length > 0 ? requestHeaders : undefined,
                 responseHeaders: Object.keys(responseHeaders).length > 0 ? responseHeaders : undefined,
                 contentType: res.getHeader('content-type'),
-                contentLength: res.getHeader('content-length') ? parseInt(res.getHeader('content-length')) : undefined
+                contentLength: res.getHeader('content-length') ? parseInt(res.getHeader('content-length')) : undefined,
+                logStore
             };
 
             // Log the beautiful HTTP message with database ObjectId
@@ -292,7 +283,8 @@ const createHttpLogger = () => {
             originalEnd.apply(this, args);
         };
 
-        next();
+        // Everything this request leads to runs inside its log store, so its warnings land on its record.
+        requestLog.run(logStore, next);
     };
 };
 

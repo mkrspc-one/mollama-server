@@ -88,22 +88,63 @@ const askOllama = (message, signal) => new Promise((resolve, reject) => {
     request.end(body);
 });
 
+// Ollama clears pieces no model uses (left by a deleted model or a download cut off) only when it starts, and here
+// it starts once. So after each delete the folder is tidied the same way, unless a download is running.
+const tidyModels = async () => {
+    if (pulls.size) return;
+    const folder = modelsFolder();
+    const used = new Set();
+    // Any manifest that cannot be read stops the tidy, so no model's pieces are ever taken by mistake.
+    const readManifests = async (dir) => {
+        for (const entry of await fs.promises.readdir(dir, { withFileTypes: true })) {
+            const place = path.join(dir, entry.name);
+            if (entry.isDirectory()) await readManifests(place);
+            else {
+                const manifest = JSON.parse(await fs.promises.readFile(place, 'utf8'));
+                for (const layer of [manifest.config, ...(manifest.layers || [])]) if (layer?.digest) used.add(layer.digest.replace(':', '-'));
+            }
+        }
+    };
+    if (!fs.existsSync(path.join(folder, 'manifests'))) return;
+    await readManifests(path.join(folder, 'manifests'));
+    const blobs = path.join(folder, 'blobs');
+    let freed = 0;
+    for (const name of await fs.promises.readdir(blobs).catch(() => [])) {
+        if (used.has(name)) continue;
+        const place = path.join(blobs, name);
+        try {
+            freed += (await fs.promises.stat(place)).size;
+            await fs.promises.unlink(place);
+        } catch {
+            continue;
+        }
+    }
+    if (freed) console.log(`Tidied the models folder: ${Math.round(freed / MB)} MB freed.`);
+};
+
+const pulls = new Map();
+
 const answerRequest = async (message) => {
     let sent = 0;
     const reply = (part) => send({ id: message.id, n: sent += 1, ...part });
     if (typeof message.path !== 'string' || !message.path.startsWith('/api/') || message.via) return reply({ type: 'error', code: 'REFUSED' });
     const stop = new AbortController();
     running.set(message.id, stop);
+    if (message.path === '/api/pull') pulls.set(message.id, true);
+    let deleted = false;
     try {
         const answer = await askOllama(message, stop.signal);
         reply({ type: 'head', status: answer.statusCode, headers: { 'content-type': answer.headers['content-type'] || 'application/json' } });
         for await (const chunk of answer) reply({ type: 'chunk', data: Buffer.from(chunk).toString('base64') });
         reply({ type: 'end' });
+        deleted = message.path === '/api/delete' && answer.statusCode === 200;
     } catch (error) {
         if (!stop.signal.aborted) reply({ type: 'error', code: 'OLLAMA_DOWN', message: error.message });
     } finally {
         running.delete(message.id);
+        pulls.delete(message.id);
     }
+    if (deleted) await tidyModels().catch((error) => console.error('The models folder could not be tidied:', error.message));
     return undefined;
 };
 

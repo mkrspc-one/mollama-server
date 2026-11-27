@@ -127,24 +127,22 @@ export const truncateObject = (obj, maxSize) => {
 
     try {
         // Use safe stringification to handle circular references
-        const str = JSON.stringify(obj, function (key, value) {
+        const seen = new WeakSet();
+        const str = JSON.stringify(obj, (key, value) => {
             if (typeof value === 'object' && value !== null) {
-                if (this[key] === value) {
-                    return '[Circular]';
-                }
+                if (seen.has(value)) return '[Circular]';
+                seen.add(value);
             }
             return value;
         });
 
         if (str.length <= maxSize) return obj;
 
-        // If object is too large, create a truncated version
-        return {
-            _truncated: true,
-            _originalSize: str.length,
-            _truncatedAt: maxSize,
-            summary: str.substring(0, maxSize) + '...'
-        };
+        // Too large: keep its start, as much as fits in maxSize once written out
+        const cut = (length) => ({_truncated: true, _originalSize: str.length, summary: str.substring(0, length) + '...'});
+        let length = maxSize - 200;
+        for (let over = JSON.stringify(cut(length)).length - maxSize; over > 0 && length > 0; over = JSON.stringify(cut(length)).length - maxSize) length -= over;
+        return cut(length);
     } catch (error) {
         // Handle any errors in stringification
         return {
