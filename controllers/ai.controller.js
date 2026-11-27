@@ -8786,7 +8786,7 @@ const holdsOf = (rental) => {
 const cardName = (card) => `${card.count > 1 ? `${card.count} x ` : ''}${card.gpu}`;
 
 // Who may rent is App Base's rights: RENT_COMPUTERS, held by owners and admins only for now (the owner's word,
-// 2026-11-27, until pricing is settled in Stage 5H). Test credit is not real money, but a rental spends real money at
+// 2026-11-27, until pricing is settled in Stage 6C). Test credit is not real money, but a rental spends real money at
 // the provider, so with billing in test mode renting is on only where strangers cannot rent: the role new accounts get
 // lacks the right, ADMIN_ONLY keeps everyone but admins and owners out, or it is the test suite.
 export const rentalsSafeHere = () => moneyIsReal() || !hasRight([ROLES.USER], RIGHTS.RENT_COMPUTERS) || process.env.ADMIN_ONLY === 'true' || process.env.NODE_ENV === 'test';

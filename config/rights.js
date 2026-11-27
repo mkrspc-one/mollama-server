@@ -26,7 +26,7 @@ export const RIGHTS = {
     REQUEST_ROLE_ELEVATION: 'REQUEST_ROLE_ELEVATION',
     MANAGE_MODELS: 'MANAGE_MODELS',
     USE_MODELS: 'USE_MODELS',
-    // Renting a graphics card by the hour. Owners and admins only until pricing is settled (Stage 5H); giving it to
+    // Renting a graphics card by the hour. Owners and admins only until pricing is settled (Stage 6C); giving it to
     // more roles is how renting opens to them.
     RENT_COMPUTERS: 'RENT_COMPUTERS'
 };
