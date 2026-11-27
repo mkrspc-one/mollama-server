@@ -594,7 +594,9 @@ const rentalSchema = new mongoose.Schema({
     spent: { type: Number, default: 0 },
     deleteTries: { type: Number, default: 0 },
     // Which of its person's places an open rental takes; taken away when it ends.
-    slot: { type: Number }
+    slot: { type: Number },
+    // More time bought while it ran: each extension that needed more credit set it aside as a hold of its own.
+    extended: { type: [{ _id: false, hours: Number, hold: String, amount: Number, at: Date }], default: [] }
 }, { timestamps: true });
 rentalSchema.index({ service: 1, user: 1, slot: 1 }, { unique: true, partialFilterExpression: { slot: { $type: 'number' } } });
 export const Rental = mongoose.models.Rental || mongoose.model('Rental', rentalSchema);
@@ -607,5 +609,6 @@ export const rentalSchemas = {
         // The price an hour the person saw, in cents: never charged more without being shown it first.
         price: Joi.number().integer().min(0).max(1000000)
     }),
-    compare: Joi.object({ day: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/) })
+    compare: Joi.object({ day: Joi.string().pattern(/^\d{4}-\d{2}-\d{2}$/) }),
+    extend: Joi.object({ hours: Joi.number().integer().min(1).max(12).required() })
 };

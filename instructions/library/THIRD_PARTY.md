@@ -312,3 +312,11 @@ https://github.com/nicobailon/visual-explainer
 1 skills, in `explainer`. Licence: MIT. Copyright (c) 2025 Nico Bailon.
 
 Visual Explainer comes with part of `plugins/visual-explainer`, copied unchanged at commit 9d5f880b7e8e, in `explainer/explainer-visual-explainer`: its reference pages, page templates, and the kit's styles, scripts and drawing defs that a built page holds. Its render and checks run in a sandbox, where the whole folder is.
+
+## JuliusBrussee/caveman
+
+https://github.com/JuliusBrussee/caveman
+
+1 skills, in `caveman`. Licence: Apache License 2.0. Written by Julius Brussee; "Caveman" and its logo are his trademarks.
+
+Caveman is `skills/caveman/SKILL.md`, copied unchanged at commit e74a11ccdb38. It has no files of its own.

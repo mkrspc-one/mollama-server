@@ -26,6 +26,7 @@ router.validRoutes = [
     '/api/v1/rentals/cards',
     '/api/v1/rentals/compare',
     '/api/v1/rentals/:id/end',
+    '/api/v1/rentals/:id/extend',
     '/api/v1/devices/pools/check',
     '/api/v1/devices/:id/pool',
     '/api/v1/devices/:id/pause',
@@ -204,5 +205,6 @@ router.get('/rentals/cards', ...signedIn, aiController.listRentalCards);
 router.get('/rentals/compare', ...signedIn, authMiddleware.checkPermission(RIGHTS.MANAGE_ALL_USERS), validateRequest(rentalSchemas.compare, 'query'), aiController.getRentalComparison);
 router.post('/rentals', ...signedIn, validateRequest(rentalSchemas.start), aiController.startRental);
 router.post('/rentals/:id/end', ...signedIn, validateRequest(rentalSchemas.rentalId, 'params'), aiController.endRental);
+router.post('/rentals/:id/extend', ...signedIn, validateRequest(rentalSchemas.rentalId, 'params'), validateRequest(rentalSchemas.extend), aiController.extendRental);
 
 export default router;

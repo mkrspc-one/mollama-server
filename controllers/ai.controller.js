@@ -2529,7 +2529,8 @@ export const SKILL_SOURCES = {
     taste: { name: 'Taste (Leonxlnx)', repo: 'Leonxlnx/taste-skill' },
     richmd: { name: 'Rich Markdown First', repo: 'xronocode/rich-md-skill' },
     explainer: { name: 'Visual Explainer', repo: 'nicobailon/visual-explainer' },
-    cadsmith: { name: 'CadSmith (Jonathan Fermin)', repo: 'JonFermin/cadsmith' }
+    cadsmith: { name: 'CadSmith (Jonathan Fermin)', repo: 'JonFermin/cadsmith' },
+    caveman: { name: 'Caveman (Julius Brussee)', repo: 'JuliusBrussee/caveman' }
 };
 // The text of one of a skill's files, or null when the skill has no such file. Only a path from the skill's own list
 // is ever read, so nothing outside its folder can be reached.
@@ -8194,7 +8195,9 @@ export const RENTAL_RULES = {
     idleMinutes: 30,
     startMinutes: 20,
     warnMinutes: 5,
-    atOnce: 1,
+    // Rentals one person may have at once (the page asks before a third), and the longest one may run, extended or not.
+    atOnce: 4,
+    longestHours: 24,
     reserve: 200
 };
 const RENTAL_ENDS = {
@@ -8207,6 +8210,12 @@ const RENTAL_ENDS = {
 };
 const MINUTE_MS = 60000;
 const holdOf = (rental) => `rental:${rental.id}`;
+const atMostRentals = () => (RENTAL_RULES.atOnce === 1 ? 'You already have a rented computer. End it before renting another.' : `You already have ${RENTAL_RULES.atOnce} rented computers, the most at once. End one before renting another.`);
+// Every hold a rental has: the one it started with, then one for each extension that needed more credit.
+const holdsOf = (rental) => {
+    const extra = (rental.extended || []).filter((one) => one.hold);
+    return [{ hold: holdOf(rental), amount: rental.limit - extra.reduce((sum, one) => sum + one.amount, 0) }, ...extra.map((one) => ({ hold: one.hold, amount: one.amount }))];
+};
 const cardName = (card) => `${card.count > 1 ? `${card.count} x ` : ''}${card.gpu}`;
 
 // Test credit is not real money, but a rental spends real money at Hyperstack. With billing in test mode, renting
@@ -8235,6 +8244,8 @@ const presentRental = (rental) => {
         limit: rental.limit,
         minutes: rental.minutes,
         idleMinutes: rental.idleMinutes,
+        // How many hours it can still be extended by, at most 12 at a time.
+        moreHours: Math.max(0, Math.min(12, Math.floor((RENTAL_RULES.longestHours * 60 - rental.minutes) / 60))),
         spent,
         startedAt: rental.createdAt,
         readyAt: rental.readyAt,
@@ -8318,7 +8329,7 @@ export const listRentalCards = asyncHandler(async (req, res) => {
             cards: offers.filter((offer) => offer.options.length).map((offer) => ({ ...presentCard(offer.key, offer.shown.card), ...sourceOf(offer) })).sort(byPrice),
             // The rest, greyed out on the page.
             unavailable: offers.filter((offer) => !offer.options.length).map((offer) => ({ ...presentCard(offer.key, offer.shown.card), why: 'Out of stock right now', ...sourceOf(offer) })).sort(byPrice),
-            rules: { limit: RENTAL_RULES.limit, hours: RENTAL_RULES.hours, mostHours: RENTAL_RULES.mostHours, idleMinutes: RENTAL_RULES.idleMinutes, atOnce: RENTAL_RULES.atOnce },
+            rules: { limit: RENTAL_RULES.limit, hours: RENTAL_RULES.hours, mostHours: RENTAL_RULES.mostHours, idleMinutes: RENTAL_RULES.idleMinutes, atOnce: RENTAL_RULES.atOnce, longestHours: RENTAL_RULES.longestHours },
             balance: totals.balance,
             ...(canSeeProviders(req) ? { left: { ...(skippedCards() || {}), failures } } : {})
         });
@@ -8342,9 +8353,7 @@ export const startRental = asyncHandler(async (req, res) => {
     if (!rentalsOn()) return refuseRental(res, 404, 'RENTALS_OFF', 'Renting is not set up');
     const user = req.user.id;
     const open = { service: SERVICE, user, state: { $ne: 'ended' } };
-    if (await Rental.countDocuments(open) >= RENTAL_RULES.atOnce) {
-        return refuseRental(res, 409, 'ALREADY_RENTING', 'You already have a rented computer. End it before renting another.');
-    }
+    if (await Rental.countDocuments(open) >= RENTAL_RULES.atOnce) return refuseRental(res, 409, 'ALREADY_RENTING', atMostRentals());
 
     // The kind of card asked for (or, from older pages, one provider's own name for it), and who can supply it now.
     let offer;
@@ -8411,7 +8420,7 @@ export const startRental = asyncHandler(async (req, res) => {
             return null;
         });
     }
-    if (!rental) return refuseRental(res, 409, 'ALREADY_RENTING', 'You already have a rented computer. End it before renting another.');
+    if (!rental) return refuseRental(res, 409, 'ALREADY_RENTING', atMostRentals());
     const drop = async () => Rental.deleteOne({ _id: rental._id });
     try {
         await setAside(user, limit, holdOf(rental), `${cardName(card)} rented: up to ${money(limit)} set aside`);
@@ -8484,7 +8493,13 @@ const finishRental = async (rental) => {
         return false;
     }
 
-    await settle(rental.user, holdOf(rental), rental.spent, `${cardName(rental.card)} rented: ${money(rental.spent)} used, the rest returned`);
+    // What was used is charged against each hold in turn, and what is left of each comes back.
+    let unpaid = rental.spent;
+    for (const { hold, amount } of holdsOf(rental)) {
+        const used = Math.min(unpaid, amount);
+        unpaid -= used;
+        await settle(rental.user, hold, used, `${cardName(rental.card)} rented: ${money(used)} used of ${money(amount)} set aside, the rest returned`);
+    }
     if (rental.device) {
         await Device.deleteOne({ _id: rental.device, service: SERVICE });
         deviceGateway.disconnect(rental.device);
@@ -8513,6 +8528,56 @@ const beginRentalEnd = async (rental, reason, detail = null) => {
     }
     return finishRental(rental);
 };
+
+// More time for an open rental. When its spending limit would not cover the longer time, the difference is set aside
+// as a hold of its own; Mollama's balance at the provider must cover the extra time, as at the start.
+export const extendRental = asyncHandler(async (req, res) => {
+    if (!rentalsOn()) return refuseRental(res, 404, 'RENTALS_OFF', 'Renting is not set up');
+    const rental = await Rental.findOne({ _id: req.params.id, service: SERVICE, user: req.user.id });
+    if (!rental) return refuseRental(res, 404, 'NO_SUCH_RENTAL', 'Rental not found');
+    if (!['starting', 'running'].includes(rental.state)) return refuseRental(res, 409, 'RENTAL_ENDING', 'This rental has ended or is ending, so it cannot be extended.');
+    const hours = req.body.hours;
+    const minutes = rental.minutes + hours * 60;
+    if (minutes > RENTAL_RULES.longestHours * 60) {
+        return refuseRental(res, 400, 'TOO_LONG', `A rental can run for at most ${RENTAL_RULES.longestHours} hours in all. This one could have ${Math.max(0, Math.floor((RENTAL_RULES.longestHours * 60 - rental.minutes) / 60))} more.`);
+    }
+    const extra = Math.max(0, Math.ceil(minutes * rental.price / 60) - rental.limit);
+    const more = hours === 1 ? 'an hour' : `${hours} hours`;
+    if (extra > 0) {
+        const { balance } = await balanceOf(rental.user);
+        if (balance < extra) return refuseRental(res, 402, 'NOT_ENOUGH_CREDIT', `You have ${money(balance)} of credit and ${more} more sets aside ${money(extra)}. Add credit first.`, { balance, need: extra });
+    }
+    try {
+        const provider = providerOf(rental.provider);
+        const funds = await provider.credit();
+        const others = (await Rental.find({ service: SERVICE, state: { $ne: 'ended' }, _id: { $ne: rental._id } })).filter((one) => (one.provider || 'hyperstack') === rental.provider);
+        const longer = { readyAt: rental.readyAt, cost: rental.cost, price: rental.price, minutes, limit: rental.limit + extra };
+        if (!funds.canCreate || funds.credit - stillOwed([...others, longer]) < RENTAL_RULES.reserve) {
+            tellOwners('rental:funds', `Mollama's balance at ${provider.label} is low (${money(funds.credit)} left), so a rental could not be extended.`);
+            return refuseRental(res, 503, 'RENTALS_PAUSED', 'This rental cannot be extended right now. Nothing was charged. It runs to its present end.');
+        }
+    } catch (error) {
+        logger.warn('[Rental] The provider could not be asked about an extension', { rental: rental.id, reason: error.message });
+        return refuseRental(res, 502, 'PROVIDER_DOWN', 'This rental could not be extended just now. Nothing was charged. Try again in a minute.', canSeeProviders(req) ? { detail: error.message } : {});
+    }
+    const hold = extra > 0 ? `${holdOf(rental)}:more:${rental.extended.length + 1}` : null;
+    if (hold) {
+        try {
+            await setAside(rental.user, extra, hold, `${cardName(rental.card)} rented: ${money(extra)} more set aside for ${more} more`);
+        } catch (error) {
+            if (error instanceof BillingError) return refuseRental(res, error.statusCode, error.code, error.message);
+            throw error;
+        }
+    }
+    rental.extended.push({ hours, hold, amount: extra, at: new Date() });
+    rental.minutes = minutes;
+    rental.limit += extra;
+    // The warnings that it was near its time or spending limit no longer hold.
+    rental.warned = rental.warned.filter((one) => one === 'idle');
+    await rental.save();
+    logger.info('[Rental] Extended', { rental: rental.id, hours, setAside: extra, keep: true });
+    return res.status(200).json({ success: true, rental: presentRental(rental) });
+});
 
 export const endRental = asyncHandler(async (req, res) => {
     const rental = await Rental.findOne({ _id: req.params.id, service: SERVICE, user: req.user.id });
