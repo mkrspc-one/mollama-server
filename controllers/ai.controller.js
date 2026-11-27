@@ -13,7 +13,7 @@ import { hasRight, RIGHTS } from '../config/rights.js';
 import { SERVICE, Device, Setting, PersonalModel, Download, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, chatSchemas, ToolServer, Provider, Skill, Training, Rental } from '../models/ai.model.js';
 import {
     OllamaError, mapOllamaError, UNREADABLE_CALL, memoryNeededMb, createOllamaClient, libraryModels, libraryEntries, loadLibrarySizes, librarySizes, friendlyName, cloudTitle, computerName, detectHardware, appleGpus, readDisk, rankCatalogue, fitModel, fitNotes, fitPool, freeHardware, poolShareMb, poolSplit, GPU_HEADROOM_MB, RAM_RESERVE_MB,
-    GenerationQueue, estimateTokens, extractText, createFilesClient, imageTypeOf, MAX_IMAGE_BYTES, MAX_CHAT_IMAGE_BYTES, runInSandbox, takeFromSandbox, letSandboxGo, sandboxReady, poolGroups, MAX_PROGRAM_SECONDS, MAX_ATTACHMENT_BYTES, fetchRemote, MAX_REMOTE_BYTES,
+    GenerationQueue, estimateTokens, extractText, createFilesClient, imageTypeOf, MAX_IMAGE_BYTES, MAX_CHAT_IMAGE_BYTES, runInSandbox, takeFromSandbox, letSandboxGo, sandboxReady, poolGroups, connectionProblems, MAX_PROGRAM_SECONDS, MAX_ATTACHMENT_BYTES, fetchRemote, MAX_REMOTE_BYTES,
     searchReady, searchWeb, readPage, deviceGateway,
     CLOUD_PROVIDERS, PROVIDER_HEALTH, createCloudClient, ollamaOnlineNames, runsOnline,
     TOOL_HEALTH, TOOL_CATALOGUE, TOOL_LOCAL_CATALOGUE, toolKeyNeeded, listedTool, seal, unseal, accountKeeper, withToolServer, finishToolSignIn, readTools, toolFault, ToolSignInError,
@@ -1001,6 +1001,9 @@ const effectiveHardware = (device) => {
         gpuMemoryMb,
         hasGpu: gpuMemoryMb > 0,
         gpuShared: !overrides.gpuName && /built-in graphics$/.test(gpuName || ''),
+        // Every card, those Ollama cannot use too, so the page can name them; an older app gives only the usable ones.
+        cards: detected.cards?.length ? detected.cards.map(({ name, memoryMb, shared, usable, why }) => ({ name, memoryMb: memoryMb || 0, shared: Boolean(shared), usable: Boolean(usable), why: why || null }))
+            : (detected.gpus || []).map(({ name, memoryMb }) => ({ name, memoryMb, shared: /built-in graphics$/.test(name || ''), usable: true, why: null })),
         cpu: detected.cpu || null,
         cpuThreads: detected.cpuThreads || null,
         diskFreeMb: detected.diskFreeMb ?? null,
@@ -1310,6 +1313,81 @@ const checkReach = async (deviceId) => {
     return undefined;
 };
 
+// Checks between a person's computers, run by Check again and kept in memory: on every network two computers share, each
+// opens a check port for half a minute that answers only this run's code, and each of the others connects to it.
+const linkChecks = new Map();
+const CHECK_OPEN_MS = 5000;
+const CHECK_RUN_MS = 6000;
+const checkLinks = async (userId) => {
+    const computers = (await poolComputers(userId)).filter((one) => one.online && !one.paused);
+    const { groups } = poolGroups(computers);
+    if (groups.length === 0) return linkChecks.delete(String(userId));
+    const token = crypto.randomBytes(16).toString('hex');
+    const ports = new Map();
+    const older = new Set();
+    const ids = [...new Set(groups.flatMap((group) => group.computers.map((one) => one.id)))];
+    await Promise.all(ids.map(async (id) => {
+        const addresses = [...new Set(groups.flatMap((group) => group.computers.filter((one) => one.id === id).flatMap((one) => one.addresses || [one.address])))];
+        try {
+            const answer = await deviceGateway.query(id, { type: 'pool', action: 'listen', token, addresses }, CHECK_OPEN_MS);
+            ports.set(id, new Map((answer?.ports || []).map((one) => [one.address, one.port])));
+        } catch {
+            // A desktop app before 1.0.23 does not know the question and stays silent.
+            older.add(id);
+        }
+    }));
+    const results = [];
+    await Promise.all(groups.flatMap((group) => group.computers.flatMap((from) => group.computers.filter((to) => to.id !== from.id).map(async (to) => {
+        const via = group.via === 'cable' ? 'cable' : from.wired && to.wired ? 'wired' : 'wifi';
+        if (older.has(from.id) || older.has(to.id)) return results.push({ from: from.id, to: to.id, via, ok: null, why: 'update' });
+        for (const address of to.addresses || [to.address]) {
+            const port = ports.get(to.id)?.get(address);
+            if (!port) {
+                results.push({ from: from.id, to: to.id, via, address, ok: false, why: 'noport' });
+                continue;
+            }
+            try {
+                const answer = await deviceGateway.query(from.id, { type: 'pool', action: 'check', address, port, token }, CHECK_RUN_MS);
+                results.push({ from: from.id, to: to.id, via, address, ok: Boolean(answer?.ok), ms: answer?.ok ? Number(answer.ms) || null : null, why: answer?.ok ? null : String(answer?.why || 'silent').slice(0, 40) });
+            } catch {
+                results.push({ from: from.id, to: to.id, via, address, ok: null, why: 'update' });
+            }
+        }
+        return undefined;
+    }))));
+    linkChecks.set(String(userId), { at: new Date(), results });
+    return true;
+};
+// One line per pair of computers and way they are joined: whether each can reach the other (over any of its addresses
+// there; with two bare cables only one address of a computer is on the cable to the other), and in what time.
+const CHECK_WHY = {
+    update: 'Update the Mollama desktop app on both computers to check this connection.',
+    noport: 'It could not open a check port on that network.',
+    silent: 'Nothing answered: a firewall is probably blocking Mollama. On Windows, allow Mollama in Windows Security, Firewall, Allow an app; on a Mac, in System Settings, Network, Firewall, Options.',
+    ECONNREFUSED: 'Its check port was closed. Press Check again.',
+    EHOSTUNREACH: 'It could not be found on this network. Check the cable, or that both are on the same Wi-Fi. On a Mac, also turn on Mollama in System Settings, Privacy & Security, Local Network.',
+    ENETUNREACH: 'There is no way onto that network from here. Check the cable.',
+    EADDRNOTAVAIL: 'This computer has no address on that network any more. Check the cable.'
+};
+export const linkSummary = (record, names) => {
+    if (!record) return null;
+    const best = new Map();
+    for (const result of record.results) {
+        const key = `${result.from}|${result.to}|${result.via}`;
+        const had = best.get(key);
+        if (!had || (result.ok && (!had.ok || (result.ms ?? Infinity) < (had.ms ?? Infinity))) || (had.ok === false && result.ok === null)) best.set(key, result);
+    }
+    const pairs = [];
+    for (const one of best.values()) {
+        if (pairs.some((pair) => pair.b === one.from && pair.a === one.to && pair.via === one.via)) continue;
+        const back = best.get(`${one.to}|${one.from}|${one.via}`) || null;
+        const said = (result) => (result ? { ok: result.ok, ms: result.ms ?? null, why: result.ok ? null : CHECK_WHY[result.why] || `It could not be reached (${result.why}).` } : null);
+        pairs.push({ a: one.from, b: one.to, aName: names.get(one.from) || 'A computer', bName: names.get(one.to) || 'A computer', via: one.via, there: said(one), back: said(back) });
+    }
+    const ORDER = ['cable', 'wired', 'wifi'];
+    return { at: record.at, pairs: pairs.sort((x, y) => ORDER.indexOf(x.via) - ORDER.indexOf(y.via)) };
+};
+
 const presentPools = async (userId) => {
     const computers = await poolComputers(userId);
     const { groups, left } = poolGroups(computers);
@@ -1328,13 +1406,15 @@ const presentPools = async (userId) => {
             lending: Boolean(state?.lending),
             reachable: fresh ? fresh.reachable : null,
             detail: otherBuild ? 'Its desktop app pools a different way from the primary computer. Update the Mollama desktop app on both.' : fresh?.reachable === false ? fresh.detail : state?.detail || null,
-            known: Boolean(state)
+            known: Boolean(state),
+            problems: connectionProblems(computer?.hardware?.network, computer?.hardware?.platform)
         };
     };
     return {
         groups: joinedGroups(groups).map((group) => ({ ...group, computers: group.computers.map((one) => ({ ...one, ...part(one.id) })) })),
-        left: left.map((one) => ({ ...one, role: byId.get(one.id)?.role || 'off' })),
-        main: main?.id || null
+        left: left.map((one) => ({ ...one, role: byId.get(one.id)?.role || 'off', problems: connectionProblems(byId.get(one.id)?.hardware?.network, byId.get(one.id)?.hardware?.platform) })),
+        main: main?.id || null,
+        checks: linkSummary(linkChecks.get(String(userId)), new Map(computers.map((one) => [one.id, one.name])))
     };
 };
 // What the page shows: the computers that can reach each other one way or another (two Macs on a cable and on Wi-Fi,
@@ -1567,7 +1647,7 @@ export const checkPools = asyncHandler(async (req, res) => {
         }
     }));
     await syncPools(req.user.id);
-    await Promise.all(own.map((device) => checkReach(device.id).catch(() => undefined)));
+    await Promise.all([...own.map((device) => checkReach(device.id).catch(() => undefined)), checkLinks(req.user.id).catch((error) => logger.warn('[Pool] The connections could not be checked', { reason: error.message }))]);
     res.status(200).json({ success: true, checkedAt: new Date(), ...await presentPools(req.user.id) });
 });
 
@@ -1649,6 +1729,13 @@ deviceGateway.on('network', async (deviceId, network) => {
         address: String(entry.address).slice(0, 45), prefix: Number(entry.prefix) || 24, interface: String(entry.interface || '').slice(0, 60),
         wired: Boolean(entry.wired), ...(['public', 'private', 'domain'].includes(entry.category) ? { category: entry.category } : {})
     })) };
+    if (Array.isArray(network.adapters)) {
+        clean.adapters = network.adapters.filter((entry) => entry && typeof entry.name === 'string').slice(0, 12).map((entry) => ({
+            name: entry.name.slice(0, 60), kind: ['wifi', 'ethernet', 'thunderbolt'].includes(entry.kind) ? entry.kind : 'ethernet', link: Boolean(entry.link),
+            addresses: (Array.isArray(entry.addresses) ? entry.addresses : []).filter((address) => typeof address === 'string' && /^\d+\.\d+\.\d+\.\d+$/.test(address)).slice(0, 4),
+            internet: Boolean(entry.internet), ...(['public', 'private', 'domain'].includes(entry.category) ? { category: entry.category } : {})
+        }));
+    }
     await Device.updateOne({ _id: deviceId, service: SERVICE, kind: 'companion' }, { $set: { 'hardware.network': clean } }).catch(() => {});
     await syncPoolsOf(deviceId);
     announceDevice(true)(deviceId);

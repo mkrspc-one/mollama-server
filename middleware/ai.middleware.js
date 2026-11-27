@@ -461,7 +461,7 @@ export class DeviceGateway extends EventEmitter {
                 return;
             }
             if (message.type === 'network') {
-                if (message.data && Array.isArray(message.data.addresses)) this.emit('network', deviceId, { addresses: message.data.addresses.slice(0, 16) });
+                if (message.data && Array.isArray(message.data.addresses)) this.emit('network', deviceId, { addresses: message.data.addresses.slice(0, 16), ...(Array.isArray(message.data.adapters) ? { adapters: message.data.adapters.slice(0, 12) } : {}) });
                 return;
             }
             if (message.type === 'pool-state') {
@@ -957,6 +957,33 @@ export const POOL_REASONS = {
     nonetwork: 'It is not on a home network or a direct cable.',
     alone: 'No other computer of yours is on the same network.',
     online: 'This is an online service, not a computer.'
+};
+// What is wrong with a computer's connections, from what its desktop app read of each adapter, in plain words with the
+// fix: a cable plugged in with no address, the internet going through a cable to another computer, a port with no signal
+// (only a note: most computers have a port nothing is plugged into). An app before 1.0.23 reads no adapters: nothing.
+const SELF_ASSIGNED = /^169\.254\./;
+export const connectionProblems = (network, platform) => {
+    const adapters = Array.isArray(network?.adapters) ? network.adapters : [];
+    const wifiUp = adapters.some((adapter) => adapter.kind === 'wifi' && adapter.addresses?.length > 0);
+    const found = [];
+    for (const adapter of adapters) {
+        if (adapter.kind === 'wifi' || /\(en\d+\)$/.test(adapter.name)) continue;
+        const addresses = adapter.addresses || [];
+        if (adapter.link && addresses.length === 0) {
+            found.push({ kind: 'noaddress', level: 'problem', adapter: adapter.name, message: platform === 'darwin'
+                ? `${adapter.name} is plugged in but has no address, so nothing reaches this Mac over it. In System Settings, Network, ${adapter.name}, Details, TCP/IP, set Configure IPv4 to Using DHCP.`
+                : platform === 'win32'
+                    ? `${adapter.name} is plugged in but has no address yet. Windows gives itself one within a minute; if it does not, unplug the cable and plug it in again.`
+                    : `${adapter.name} is plugged in but has no address. Set it to get one automatically (DHCP) in the network settings.` });
+        }
+        if (adapter.internet && addresses.length > 0 && addresses.every((address) => SELF_ASSIGNED.test(address)) && wifiUp) {
+            found.push({ kind: 'route', level: 'problem', adapter: adapter.name, message: platform === 'darwin'
+                ? `The internet goes through ${adapter.name}, a cable to another computer, so it does not reach this Mac. In System Settings, Network, choose the ⋯ button, Set Service Order, and drag Wi-Fi to the top.`
+                : `The internet goes through ${adapter.name}, a cable to another computer, so it does not reach this computer. Make Wi-Fi its first network for the internet.` });
+        }
+        if (adapter.link === false) found.push({ kind: 'nosignal', level: 'note', adapter: adapter.name, message: `${adapter.name}: no cable signal. If a cable is plugged in, check both ends and the port's light, or try another cable.` });
+    }
+    return found;
 };
 // computers: [{ id, name, online, paused, publicAddress, hardware }]. Gives the groups of two or more that can pool,
 // and for each computer left out, why.

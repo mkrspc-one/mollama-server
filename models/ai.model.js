@@ -10,8 +10,13 @@ const gpuSchema = new mongoose.Schema({
 
 // A computer's private network addresses, for pooling: never its public one.
 const networkSchema = new mongoose.Schema({
-    addresses: { type: [new mongoose.Schema({ address: String, prefix: Number, interface: String, wired: Boolean, category: String }, { _id: false })], default: [] }
+    addresses: { type: [new mongoose.Schema({ address: String, prefix: Number, interface: String, wired: Boolean, category: String }, { _id: false })], default: [] },
+    // Each network adapter as the desktop app (1.0.23 on) reads it: its kind, whether it has a link, its addresses,
+    // whether the internet goes through it, and on Windows its network's category.
+    adapters: { type: [new mongoose.Schema({ name: String, kind: String, link: Boolean, addresses: [String], internet: Boolean, category: String }, { _id: false })], default: undefined }
 }, { _id: false });
+// Every graphics card the computer has, and whether Ollama can use it (why not, when it cannot).
+const cardSchema = new mongoose.Schema({ name: String, memoryMb: Number, shared: Boolean, usable: Boolean, why: String }, { _id: false });
 
 const hardwareSchema = new mongoose.Schema({
     hostname: String,
@@ -21,6 +26,7 @@ const hardwareSchema = new mongoose.Schema({
     memoryMb: Number,
     gpus: { type: [gpuSchema], default: [] },
     gpuMemoryMb: Number,
+    cards: { type: [cardSchema], default: undefined },
     diskFreeMb: Number,
     diskTotalMb: Number,
     modelsPath: String,
@@ -118,6 +124,13 @@ export const deviceSchemas = {
                 memoryMb: Joi.number().integer().min(1).max(4194304).required()
             })),
             gpuMemoryMb: Joi.number().integer().min(0).max(4194304).allow(null),
+            cards: Joi.array().max(8).items(Joi.object({
+                name: Joi.string().max(120).required(),
+                memoryMb: Joi.number().integer().min(0).max(4194304),
+                shared: Joi.boolean(),
+                usable: Joi.boolean(),
+                why: Joi.string().max(20)
+            })),
             diskFreeMb: Joi.number().integer().min(0).allow(null),
             diskTotalMb: Joi.number().integer().min(0).allow(null),
             modelsPath: Joi.string().max(500).allow(null, ''),
@@ -128,6 +141,14 @@ export const deviceSchemas = {
                     interface: Joi.string().max(120).allow(''),
                     wired: Joi.boolean(),
                     category: Joi.string().valid('public', 'private', 'domain').allow(null)
+                })),
+                adapters: Joi.array().max(12).items(Joi.object({
+                    name: Joi.string().max(60).required(),
+                    kind: Joi.string().valid('wifi', 'ethernet', 'thunderbolt'),
+                    link: Joi.boolean(),
+                    addresses: Joi.array().max(4).items(Joi.string().ip({ version: ['ipv4'], cidr: 'forbidden' })),
+                    internet: Joi.boolean(),
+                    category: Joi.string().valid('public', 'private', 'domain')
                 }))
             }),
             detectedAt: Joi.date()
