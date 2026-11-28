@@ -54,7 +54,7 @@ Add a reviewer where a mistake would be costly or hard to see: facts, money, law
 
 ## 4. A model for each step
 
-Go through the steps in order and pick for each the model that best fits what the step needs, then check the whole plan for load and cost.
+Go through the steps in order and pick for each the model that best fits what the step needs, from the person's own free models only (their computers and pools), then check the whole plan for load.
 
 | The step needs | Choose |
 |---|---|
@@ -65,13 +65,13 @@ Go through the steps in order and pick for each the model that best fits what th
 | Hard reasoning, planning or judgement | One that *Thinks step by step*, or the largest that fits on a graphics card. |
 | Plain drafting, tidying, summarising | A small fast model on the person's own computer. |
 | Review | A **different** model from the one that made the work, from another family where possible, so the two do not share blind spots. |
-| Manager | The most reliable model the person has, often an online one. |
+| Manager | The most reliable of the person's own models. |
 
 Then check:
 
 - **Fit.** Avoid *Too large*. *Processor only* is slow: keep it for short steps.
 - **Load.** Steps on one computer take turns. A pool uses every computer in it, so nothing else runs on those computers at the same time. Spread steps that run together across computers.
-- **Cost.** Online models cost credit for every token. Use them where they make the difference (the manager, hard steps, final review) and the person's own computers for the rest. Say roughly what the online steps will cost when it is more than a few cents.
+- **Free models only.** Online services cost credit for every token, so never put one in a plan, even where it would do better: plan with the person's own computers and pools. The person may move a step to an online model themselves; when they do, say roughly what it will cost from its price, and whether a free model could do the step.
 - **Online.** A computer that is offline or paused cannot run a step. Say so and choose another.
 
 ## 5. Skills and tools for each step
@@ -104,7 +104,7 @@ After drawing, reply briefly:
 
 1. One line per step: the step, its model and computer, and the reason in a few words.
 2. What runs at the same time.
-3. Anything the person should know: a step on a slow or costly model, a model that is offline, a tool that changes things.
+3. Anything the person should know: a step on a slow model, a model that is offline, a tool that changes things, a step the person moved to a paid model.
 
 Then stop. The person changes what they want on the canvas or asks you to.
 
