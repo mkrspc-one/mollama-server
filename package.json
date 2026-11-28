@@ -5,7 +5,8 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "dev": "nodemon index.js"
+    "dev": "nodemon index.js",
+    "index-skills": "node -e \"import('./controllers/ai.controller.js').then(async (ai) => { console.log(await ai.writeSkillIndex()); process.exit(0); })\""
   },
   "keywords": [],
   "author": "",
@@ -13,6 +14,7 @@
   "type": "module",
   "dependencies": {
     "@anthropic-ai/sdk": "^1.10.0",
+    "@huggingface/transformers": "^4.3.2",
     "@modelcontextprotocol/client": "^2.4.0",
     "@renderinc/sdk": "^1.9.0",
     "axios": "^1.21.1",

@@ -460,6 +460,7 @@ skillSchema.index({ service: 1, owner: 1, address: 1 }, { unique: true });
 
 export const Skill = mongoose.models.Skill || mongoose.model('Skill', skillSchema);
 
+
 export const skillSchemas = {
     skillId: Joi.object({ id: Joi.string().pattern(/^[a-z0-9-]{1,60}$/).required() }),
     file: Joi.object({ path: Joi.string().trim().max(200).pattern(/^[\w./ -]+$/).required() }),

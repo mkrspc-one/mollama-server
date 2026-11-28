@@ -151,6 +151,11 @@ class Server {
             }
         }
 
+        // Optional. SKILL_SEARCH=off turns search before sending off (skills are then matched by words alone).
+        if (process.env.SKILL_SEARCH && !['on', 'off'].includes(process.env.SKILL_SEARCH)) {
+            throw new Error('SKILL_SEARCH must be on or off');
+        }
+
         // Optional. Rented computers come from RunPod (RUNPOD_API_KEY) first and Hyperstack (its three settings, all or
         // none) as the fallback; either needs this server's address and label (and billing on).
         const hyperstackVars = ['HYPERSTACK_API_KEY', 'HYPERSTACK_ENVIRONMENT', 'HYPERSTACK_KEY_NAME', 'RENTAL_SERVER_URL', 'RENTAL_LABEL'];
@@ -283,6 +288,13 @@ class Server {
             const {downloads, recoverReplies} = await import('./controllers/ai.controller.js');
             await downloads.recover();
             if (process.env.NODE_ENV !== 'test') setInterval(() => recoverReplies().catch(() => {}), 60000).unref();
+            // Search before sending: the skill library is indexed in the background once the server is up.
+            const {loadSkillIndex, skillSearchOn, readySkillSearch} = await import('./controllers/ai.controller.js');
+            if (process.env.NODE_ENV !== 'test' && skillSearchOn()) {
+                loadSkillIndex();
+                // The model is loaded ahead, so the first chat does not wait for it.
+                setTimeout(() => readySkillSearch().catch(() => {}), 15000).unref();
+            }
             const {watchRentals} = await import('./controllers/ai.controller.js');
             if (process.env.NODE_ENV !== 'test') setInterval(() => watchRentals().catch((error) => logger.error('[Rental] The watch failed:', error)), 60000).unref();
 
