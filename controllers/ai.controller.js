@@ -6172,12 +6172,23 @@ let searchOn = process.env.NODE_ENV !== 'test' && process.env.SKILL_SEARCH !== '
 let embedder = null;
 let embedderLoading = null;
 let embedderFailed = false;
+// A request's numbers, kept for the few searches of one reply (the chat's skills, its earlier messages).
+const askedCache = new Map();
+const embedQuery = async (embed, text) => {
+    const key = queryText(text);
+    if (askedCache.has(key)) return askedCache.get(key);
+    const [asked] = await embed([key], { query: true });
+    askedCache.set(key, asked);
+    if (askedCache.size > 32) askedCache.delete(askedCache.keys().next().value);
+    return asked;
+};
 // For the suite: turn search on or off and give it a stand-in embedding model (texts, { query }) => number[][].
 export const setSkillSearch = ({ on, embed } = {}) => {
     if (on !== undefined) searchOn = on;
     if (embed !== undefined) {
         embedder = embed;
         embedderFailed = false;
+        askedCache.clear();
         piecesBySkill.clear();
         vectors.clear();
         indexState = { ready: false, pieces: 0, done: 0, at: null };
@@ -6326,7 +6337,7 @@ export const searchSkills = async (skills, request, { limit = SEARCH_RULES.limit
         const unseen = pieces.filter((piece) => !vectors.has(piece.hash));
         if (unseen.length > 0 && unseen.length <= 48) await embedPieces(unseen).catch(() => {});
         try {
-            const [asked] = await embed([queryText(text)], { query: true });
+            const asked = await embedQuery(embed, text);
             const closeness = (piece) => {
                 const vector = vectors.get(piece.hash);
                 let dot = 0;
@@ -6393,6 +6404,217 @@ const matchChat = async (chat) => {
         return null;
     }
 };
+
+// Search of a long chat's earlier messages (Stage 5H): the messages folded into the memory are cut into short pieces and
+// searched like skills (words and meaning, fused), so the passages that bear on a request are sent word for word beside
+// the memory, and `find_earlier` lets a model look itself. A piece is no longer than the part of a request the model
+// reads, which keeps the server's memory where it was measured. Their numbers are worked out after a reply, one chat at
+// a time, and kept on the chat as bytes (`recall`, never loaded with it).
+// A passage is sent when its closeness reaches `floor` and stands `lift` above the middle of the chat's own pieces, or
+// its words match very strongly. Set from D:\projects\model-trial\earlier-eval.mjs on the real model (three long chats,
+// 32 questions, 15 greetings and new requests): answers reach 0.598 and stand at least 0.100 above the middle;
+// greetings stay under 0.58, though some stand 0.11 above it.
+const EARLIER_CHARS = QUERY_CHARS * 2;
+const EARLIER_MESSAGE_CHARS = 16000;
+export const EARLIER_RULES = { lift: 0.09, floor: 0.59, words: 8, pieces: 4, share: 0.08, known: 8, most: 1200 };
+const cutText = (text, size) => {
+    const pieces = [];
+    let held = '';
+    const put = (part) => {
+        if (held && held.length + part.length + 2 > size) {
+            pieces.push(held);
+            held = '';
+        }
+        held = held ? `${held}\n\n${part}` : part;
+    };
+    for (const paragraph of String(text).split(/\n\s*\n/).map((one) => one.trim()).filter(Boolean)) {
+        if (paragraph.length <= size) {
+            put(paragraph);
+            continue;
+        }
+        for (const sentence of paragraph.split(/(?<=[.!?:;])\s+|\n/)) {
+            let rest = sentence.trim();
+            while (rest.length > size) {
+                const cut = rest.lastIndexOf(' ', size) > size / 2 ? rest.lastIndexOf(' ', size) : size;
+                put(rest.slice(0, cut));
+                rest = rest.slice(cut).trim();
+            }
+            if (rest) put(rest);
+        }
+    }
+    if (held) pieces.push(held);
+    return pieces;
+};
+export const earlierPieces = (chat) => chat.messages.slice(0, memoryStart(chat)).flatMap((message, index) => {
+    if (!message.content) return [];
+    return cutText(message.role === 'assistant' ? shortenPages(message.content) : message.content, EARLIER_CHARS).map((text, at) => {
+        const words = searchWords(text);
+        const counts = new Map();
+        for (const word of words) counts.set(word, (counts.get(word) || 0) + 1);
+        return { key: `${index}:${at}`, index, at, role: message.role, text, hash: hashOf(text), counts, length: words.length };
+    });
+});
+// Kept as one signed byte a number (the numbers are each between -1 and 1), a quarter of the room of 32-bit floats.
+const packNumbers = (numbers) => Buffer.from(Int8Array.from(numbers, (value) => Math.max(-127, Math.min(127, Math.round(value * 127)))).buffer);
+export const unpackNumbers = (stored) => {
+    const bytes = Buffer.isBuffer(stored) ? stored : Buffer.from(stored.buffer);
+    return new Int8Array(bytes.buffer, bytes.byteOffset, bytes.length);
+};
+// Pieces' numbers worked out one at a time (12 a second at 0.5 CPU, faster than two at once), packed; null while the
+// embedding model cannot be had.
+export const earlierNumbers = async (texts) => {
+    const embed = await loadEmbedder();
+    if (!embed) return null;
+    const out = [];
+    for (const text of texts) {
+        out.push(packNumbers((await embed([text]))[0]));
+        await new Promise((resolve) => setImmediate(resolve));
+    }
+    return out;
+};
+export const earlierVectors = async (chat) => {
+    const found = await Chat.findById(chat._id).select('recall').lean().catch(() => null);
+    return new Map((found?.recall || []).map((one) => [one.hash, unpackNumbers(one.numbers)]));
+};
+// The earlier passages that match a request, best first. With `nearest`, the best ones are given even when none
+// matches (for a model that asked).
+export const searchEarlier = async (chat, request, { limit = EARLIER_RULES.pieces, nearest = false, vectors = null } = {}) => {
+    const text = String(request || '').trim();
+    const pieces = earlierPieces(chat);
+    if (!text || pieces.length === 0) return [];
+    const scoreWords = bm25Of(pieces, [...new Set(searchWords(text))]);
+    const byWords = pieces.map((piece) => ({ piece, score: scoreWords(piece) })).filter((hit) => hit.score > 0).sort((a, b) => b.score - a.score);
+    let byMeaning = [];
+    let middle = null;
+    const embed = searchOn ? await loadEmbedder().catch(() => null) : null;
+    if (embed) {
+        try {
+            const held = vectors || (await earlierVectors(chat));
+            const known = pieces.filter((piece) => held.has(piece.hash));
+            if (known.length > 0) {
+                const asked = await embedQuery(embed, text);
+                byMeaning = known.map((piece) => {
+                    const vector = held.get(piece.hash);
+                    let dot = 0;
+                    for (let at = 0; at < vector.length; at += 1) dot += vector[at] * asked[at];
+                    return { piece, score: dot / 127 };
+                }).sort((a, b) => b.score - a.score);
+                if (known.length >= EARLIER_RULES.known) middle = byMeaning[Math.floor(byMeaning.length / 2)].score;
+            }
+        } catch (error) {
+            logger.warn('[Search] Earlier messages could not be searched by meaning; words are used alone', { reason: error.message });
+        }
+    }
+    const fused = new Map();
+    const add = (list, kind) => list.forEach((hit, rank) => {
+        const entry = fused.get(hit.piece.key) || { piece: hit.piece, fused: 0, words: 0, meaning: 0 };
+        entry.fused += 1 / (FUSION_K + rank + 1);
+        entry[kind] = Math.max(entry[kind], hit.score);
+        fused.set(hit.piece.key, entry);
+    });
+    add(byWords, 'words');
+    add(byMeaning, 'meaning');
+    return [...fused.values()]
+        .map((entry) => ({ ...entry, lift: middle !== null && entry.meaning ? entry.meaning - middle : 0 }))
+        .map((entry) => ({ ...entry, matches: (middle !== null ? entry.meaning >= EARLIER_RULES.floor && entry.lift >= EARLIER_RULES.lift : entry.words >= EARLIER_RULES.words) || entry.words >= EARLIER_RULES.words * 2 }))
+        .sort((a, b) => b.fused - a.fused)
+        .filter((entry) => entry.matches || nearest)
+        .slice(0, limit)
+        .map((entry) => ({ index: entry.piece.index, at: entry.piece.at, role: entry.piece.role, text: entry.piece.text, words: entry.words, meaning: entry.meaning, lift: entry.lift, matches: entry.matches }));
+};
+// One chat's pieces worked out at a time, after its reply, so a long chat never holds up another or the server's memory.
+let earlierWork = Promise.resolve();
+const earlierWaiting = new Set();
+export const indexEarlier = (chatId) => {
+    const id = String(chatId);
+    if (!searchOn || earlierWaiting.has(id)) return earlierWork;
+    earlierWaiting.add(id);
+    earlierWork = earlierWork.then(async () => {
+        earlierWaiting.delete(id);
+        const chat = await Chat.findById(id).select('messages memory memoryThrough recall').lean();
+        if (!chat) return;
+        const pieces = earlierPieces(chat).slice(-EARLIER_RULES.most);
+        const held = new Map((chat.recall || []).map((one) => [one.hash, Buffer.isBuffer(one.numbers) ? one.numbers : Buffer.from(one.numbers.buffer)]));
+        const wanted = new Map(pieces.map((piece) => [piece.hash, piece.text]));
+        const left = [...wanted].filter(([hash]) => !held.has(hash));
+        if (left.length === 0 && held.size === wanted.size) return;
+        const made = left.length > 0 ? await earlierNumbers(left.map(([, text]) => text)) : [];
+        if (!made) return;
+        left.forEach(([hash], index) => held.set(hash, made[index]));
+        const recall = [...held].filter(([hash]) => wanted.has(hash)).map(([hash, numbers]) => ({ hash, numbers }));
+        await Chat.updateOne({ _id: id }, { $set: { recall } });
+    }).catch((error) => logger.warn('[Search] A chat\'s earlier messages could not be indexed', { chatId: id, reason: error.message }));
+    return earlierWork;
+};
+// The passages sent with a reply, found once per reply and kept within a share of the model's room.
+const chatRecall = new WeakMap();
+const recallChat = async (chat, capacity) => {
+    chatRecall.delete(chat);
+    if (!searchOn || memoryStart(chat) === 0) return [];
+    try {
+        let room = Math.floor(capacity * EARLIER_RULES.share) * 4;
+        const kept = [];
+        for (const hit of await searchEarlier(chat, requestOf(chat))) {
+            if (hit.text.length > room) break;
+            room -= hit.text.length;
+            kept.push(hit);
+        }
+        if (kept.length > 0) chatRecall.set(chat, kept);
+        return kept;
+    } catch (error) {
+        logger.warn('[Search] A chat\'s earlier messages could not be searched', { reason: error.message });
+        return [];
+    }
+};
+const passagesText = (found) => {
+    const ordered = [...found].sort((a, b) => a.index - b.index || a.at - b.at);
+    const blocks = [];
+    for (const hit of ordered) {
+        const last = blocks.at(-1);
+        if (last && last.index === hit.index && last.at + 1 === hit.at) {
+            last.text = `${last.text}\n\n${hit.text}`;
+            last.at = hit.at;
+        } else blocks.push({ ...hit });
+    }
+    return blocks.map((block) => `[Message ${block.index + 1}, ${block.role === 'user' ? 'from the user' : 'your reply'}]\n${block.text}`).join('\n\n');
+};
+const recallText = (chat) => {
+    const found = (chatRecall.get(chat) || []).filter((hit) => hit.index < memoryStart(chat));
+    return found.length > 0 ? `Passages from those earlier messages that bear on the newest message, word for word:\n${passagesText(found)}` : '';
+};
+const EARLIER_STEP = 'Earlier messages';
+const earlierTool = (chat) => ({
+    fn: 'find_earlier',
+    label: EARLIER_STEP,
+    doing: 'Looking through earlier messages…',
+    changes: false,
+    shown: (input) => (input?.message ? `message ${input.message}` : clip(String(input?.query ?? ''), 80)),
+    definition: {
+        type: 'function',
+        function: {
+            name: 'find_earlier',
+            description: `Search the earlier part of this conversation for what was said word for word. Messages 1 to ${memoryStart(chat)} are folded into the memory and not repeated in full: use this when the memory lacks an exact number, name, decision, code or list from them. Returns the passages that match, each with its message number. With message, returns that whole message instead.`,
+            parameters: { type: 'object', properties: { query: { type: 'string', description: 'What to look for, in a few words' }, message: { type: 'integer', description: `A message number from 1 to ${memoryStart(chat)}, to read that message whole` } } }
+        }
+    },
+    run: async (input) => {
+        const through = memoryStart(chat);
+        if (through === 0) return { content: 'No earlier messages are folded: the whole conversation is in front of you.' };
+        if (input?.message !== undefined && input?.message !== null && input?.message !== '') {
+            const number = Number(input.message);
+            if (!Number.isInteger(number) || number < 1 || number > through) return { content: `Message ${input.message} is not one of the folded messages (1 to ${through}). The messages after ${through} are in front of you in full.`, failed: 'failed' };
+            const message = chat.messages[number - 1];
+            const content = message.role === 'assistant' ? shortenPages(message.content || '') : message.content || '';
+            return { content: `[Message ${number}, ${message.role === 'user' ? 'from the user' : 'your reply'}]\n${clip(content, EARLIER_MESSAGE_CHARS)}${content.length > EARLIER_MESSAGE_CHARS ? '\n[Cut here: the message is longer.]' : ''}` };
+        }
+        const query = String(input?.query ?? '').trim();
+        if (!query) return { content: 'Give a query, or a message number to read.', failed: 'failed' };
+        const found = await searchEarlier(chat, query, { limit: 5, nearest: true });
+        if (found.length === 0) return { content: 'Nothing in the earlier messages matches. Answer from the memory, or ask the user.' };
+        const close = found.filter((hit) => hit.matches);
+        return { content: [close.length === 0 && 'Nothing matched closely. The nearest passages:', passagesText(close.length > 0 ? close : found.slice(0, 3)), 'Call again with message to read one whole.'].filter(Boolean).join('\n\n') };
+    }
+});
 
 const findSkillTool = (others) => ({
     fn: 'find_skill',
@@ -6793,7 +7015,7 @@ const buildMessages = (chat, listing = false, seeing = false, capacity = Infinit
     const active = matched ? sorted.filter((skill) => skill.source === 'mollama' || matched.skills.has(skill.id)) : sorted;
     const resting = matched ? sorted.filter((skill) => !active.includes(skill)) : [];
     const through = memoryStart(chat);
-    const system = [...active.map((skill) => (skill.id === 'components' && !listing ? `${skill.text}\n\n${COMPONENT_VALUES_PAGE}` : skill.text)), resting.length > 0 && `Also turned on, but not needed for this request: ${resting.map((skill) => skill.name).join(', ')}.`, systemText(chat), chat.summary && `Summary of the earlier conversation:\n${chat.summary}`, through > 0 && `Memory of the earlier part of this conversation (those messages are not repeated below):\n${chat.memory}`, notesText(chat), todayLine(), closingOf(chat)].filter(Boolean).join('\n\n');
+    const system = [...active.map((skill) => (skill.id === 'components' && !listing ? `${skill.text}\n\n${COMPONENT_VALUES_PAGE}` : skill.text)), resting.length > 0 && `Also turned on, but not needed for this request: ${resting.map((skill) => skill.name).join(', ')}.`, systemText(chat), chat.summary && `Summary of the earlier conversation:\n${chat.summary}`, through > 0 && `Memory of the earlier part of this conversation (those messages are not repeated below):\n${chat.memory}`, through > 0 && recallText(chat), notesText(chat), todayLine(), closingOf(chat)].filter(Boolean).join('\n\n');
     if (system) out.push({ role: 'system', content: system });
     for (const message of chat.messages.slice(through)) {
         if (!message.content) continue;
@@ -7120,6 +7342,14 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
                 prompt = buildMessages(chat, facts.capabilities.includes('tools'), facts.capabilities.includes('vision'), capacityFor(chat, facts));
             }
         }
+        // Passages of the folded messages that bear on the request go with the memory, while they fit.
+        if ((await recallChat(chat, capacityFor(chat, facts))).length > 0) {
+            prompt = buildMessages(chat, facts.capabilities.includes('tools'), facts.capabilities.includes('vision'), capacityFor(chat, facts));
+            if (promptTokens(prompt) + REPLY_RESERVE > capacityFor(chat, facts)) {
+                chatRecall.delete(chat);
+                prompt = buildMessages(chat, facts.capabilities.includes('tools'), facts.capabilities.includes('vision'), capacityFor(chat, facts));
+            }
+        }
         const needed = promptTokens(prompt) + REPLY_RESERVE;
         if (needed > capacityFor(chat, facts)) {
             const lastUser = chat.messages[chat.messages.length - 1];
@@ -7215,7 +7445,7 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
         // A skill that is only on by default offers its files once the model has opened it.
         const withFiles = facts.capabilities.includes('tools') ? skillsOf(chat).filter((skill) => (skill.files || []).length > 0 && (Array.isArray(chat.skills) || skill.default !== 'tools' || !listed.includes(skill))) : [];
         const light = facts.capabilities.includes('tools') && capacityFor(chat, facts) < LIGHT_ROOM;
-        const chatTools = facts.capabilities.includes('tools') ? [...(draws ? [openComponentTool()] : []), ...(withFiles.length > 0 ? [skillFileTool(withFiles)] : []), ...skillFunctionsFor(chat), ...(listed.length > 0 ? [openSkillTool(listed, others, capacityFor(chat, facts), light, chatMatches.get(chat))] : []), ...(others.length > 0 ? [findSkillTool(others)] : []), askUserTool(), noteTool(chat), compressTool(), ...(process.env.FILESYSTEM_ONE_URL ? [listFilesTool(), readFileTool(), saveToFilesTool()] : []), ...(await toolsForChat(chat, userId)).filter((tool) => !(searching && tool.fn === 'read_web_page'))] : [];
+        const chatTools = facts.capabilities.includes('tools') ? [...(draws ? [openComponentTool()] : []), ...(withFiles.length > 0 ? [skillFileTool(withFiles)] : []), ...skillFunctionsFor(chat), ...(listed.length > 0 ? [openSkillTool(listed, others, capacityFor(chat, facts), light, chatMatches.get(chat))] : []), ...(others.length > 0 ? [findSkillTool(others)] : []), askUserTool(), noteTool(chat), ...(searchOn && memoryStart(chat) > 0 ? [earlierTool(chat)] : []), compressTool(), ...(process.env.FILESYSTEM_ONE_URL ? [listFilesTool(), readFileTool(), saveToFilesTool()] : []), ...(await toolsForChat(chat, userId)).filter((tool) => !(searching && tool.fn === 'read_web_page'))] : [];
         const capacity = capacityFor(chat, facts);
         // What is offered now: everything, or with little room only what belongs to the skills opened so far. A
         // function that is not offered yet still runs if it is called.
@@ -7798,6 +8028,7 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
         context: contextUse(chat, facts)
     });
     if (reply.content && !reply.stopped && !reply.errorCode) foldMemory({ chat, facts, ollama, settings, userId });
+    if (memoryStart(chat) > 0) indexEarlier(chat._id);
 };
 
 const MEMORY_ASK = 'Rewrite the memory of this conversation so that it can go on without the messages it covers. Keep the user\'s goals, wishes and constraints, the facts that were established, the decisions and conclusions reached, what each reply delivered (figures, tables, files, pages, and what they showed), and the questions still open. Leave out greetings, filler and anything later replaced. Write short bullet points, newest last. Add nothing that was not said.';
@@ -7838,6 +8069,7 @@ const foldMemory = async ({ chat, facts, ollama, settings, userId, now = false }
             { _id: chat._id, memoryThrough: chat.memoryThrough || 0, $expr: { $gte: [{ $size: '$messages' }, to] } },
             { $set: { memory: clip(memory, MAX_MEMORY_CHARS), memoryThrough: to } }
         );
+        indexEarlier(chat._id);
         return null;
     } catch (error) {
         logger.warn('[Chat] The memory could not be updated', { chatId: chat.id, code: mapOllamaError(error).code });
