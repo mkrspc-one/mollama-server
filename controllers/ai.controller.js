@@ -11,7 +11,7 @@ import logger from '../utils/app.logger.js';
 import { asyncHandler, getNotificationService } from '../middleware/app.middleware.js';
 import { hasRight, RIGHTS, ROLES, RIGHT_ASSIGNMENT } from '../config/rights.js';
 import User from '../models/user.model.js';
-import { SERVICE, Device, Setting, PersonalModel, Download, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, chatSchemas, ToolServer, Provider, Skill, SkillPiece, Training, Rental } from '../models/ai.model.js';
+import { SERVICE, Device, Setting, PersonalModel, Download, Chat, Prompt, Guide, GUIDE_STEPS, MANAGER_GUIDE_STEPS, chatSchemas, ToolServer, Provider, Skill, Training, Rental } from '../models/ai.model.js';
 import {
     OllamaError, mapOllamaError, UNREADABLE_CALL, memoryNeededMb, createOllamaClient, libraryModels, libraryEntries, loadLibrarySizes, librarySizes, friendlyName, cloudTitle, computerName, detectHardware, appleGpus, readDisk, rankCatalogue, fitModel, fitNotes, fitPool, freeHardware, poolShareMb, poolSplit, GPU_HEADROOM_MB, RAM_RESERVE_MB,
     GenerationQueue, estimateTokens, extractText, createFilesClient, imageTypeOf, MAX_IMAGE_BYTES, MAX_CHAT_IMAGE_BYTES, runInSandbox, takeFromSandbox, letSandboxGo, sandboxReady, poolGroups, connectionProblems, privateKind, subnetOf, MAX_PROGRAM_SECONDS, MAX_ATTACHMENT_BYTES, fetchRemote, MAX_REMOTE_BYTES,
@@ -3612,20 +3612,7 @@ export const nearSkill = (list, given) => {
     const near = list.filter((skill) => skill.id.split('-').includes(wanted) || skill.name.toLowerCase().split(/\s+/).includes(words) || skill.name.toLowerCase().includes(words) || skill.id.endsWith(`-${wanted}`));
     return near.length === 1 ? near[0] : null;
 };
-const openSkillTool = (listedAll, others = [], capacity = Infinity, light = false, matched = null) => {
-    // With search before sending, the skills that match this request come first and are named; the others stay on and
-    // can still be opened, but the model is not asked to weigh each of them.
-    const hits = matched?.skills || null;
-    const listed = hits ? [...listedAll.filter((skill) => hits.has(skill.id)), ...listedAll.filter((skill) => !hits.has(skill.id))] : listedAll;
-    const guidance = !hits
-        ? 'The user turned these skills on, so the list itself says what kind of help they expect: before you answer, weigh every skill on it against the request and open each one that bears on it, not only the first that fits.'
-        : hits.size === 0
-            ? 'The user turned these skills on. None of them matches this request, so answer without opening one unless the request clearly calls for it.'
-            : `The user turned these skills on. These match this request, so open them before you answer: ${listed.filter((skill) => hits.has(skill.id)).map((skill) => skill.name).join(', ')}. Open any other only if the request needs it.`;
-    const partsHint = (skill) => {
-        const parts = hits?.get(skill.id)?.parts || [];
-        return parts.length ? `\n\nThe parts of this skill that match this request: ${parts.map((part) => `${part.part}. ${part.title}`).join('; ')}. Open those first.` : '';
-    };
+const openSkillTool = (listed, others = [], capacity = Infinity, light = false) => {
     const find = (input) => nearSkill(listed, input?.skill);
     return {
         fn: 'open_skill',
@@ -3638,7 +3625,7 @@ const openSkillTool = (listedAll, others = [], capacity = Infinity, light = fals
             type: 'function',
             function: {
                 name: 'open_skill',
-                description: `Open one of this chat's skills and get its full instructions. ${guidance} The instructions are written for you and the user does not see them: do what they say in your reply, and do not repeat them back.${light ? ' A skill\'s own functions and files are given to you when you open it.' : ''}\n${listed.map((skill) => `- ${skill.name}: ${skill.description}`).join('\n')}`,
+                description: `Open one of this chat's skills and get its full instructions. The user turned these skills on, so the list itself says what kind of help they expect: before you answer, weigh every skill on it against the request and open each one that bears on it, not only the first that fits. The instructions are written for you and the user does not see them: do what they say in your reply, and do not repeat them back.${light ? ' A skill\'s own functions and files are given to you when you open it.' : ''}\n${listed.map((skill) => `- ${skill.name}: ${skill.description}`).join('\n')}`,
                 parameters: { type: 'object', properties: { skill: { type: 'string', enum: listed.map((skill) => skill.name), description: 'The name of the skill to open' }, part: { type: 'string', description: 'Only for a long skill you have opened: the number of one of its parts' } }, required: ['skill'] }
             }
         },
@@ -3646,7 +3633,7 @@ const openSkillTool = (listedAll, others = [], capacity = Infinity, light = fals
             const skill = find(input);
             if (skill && isLong(skill, capacity)) {
                 const answer = skillInParts(skill, capacity, input?.part);
-                return String(input?.part ?? '').trim() ? answer : { ...answer, content: `${answer.content}${partsHint(skill)}${firstPages(skill, capacity, kept)}${companionsOf(skill, others)}` };
+                return String(input?.part ?? '').trim() ? answer : { ...answer, content: `${answer.content}${firstPages(skill, capacity, kept)}${companionsOf(skill, others)}` };
             }
             return skill ? { content: `${skill.text}${firstPages(skill, capacity, kept)}${companionsOf(skill, others)}` } : { content: `There is no skill by that name in this chat. The skills are: ${listed.map((one) => one.name).join(', ')}.`, failed: 'failed' };
         }
@@ -6136,254 +6123,6 @@ export const rankSkills = (skills, query) => {
         .slice(0, 5)
         .map((hit) => hit.skill);
 };
-// ===== Search before sending (Stage 5H) =====
-// Skills are found by meaning as well as by their words. Every skill is cut into pieces (its name and description, its
-// opening, and each `## ` section), each labelled with the skill's name and the section's heading so it is never read
-// out of context, and turned into numbers by a small embedding model run on this server (Snowflake arctic-embed-s,
-// 34 MB, Apache-2.0, through @huggingface/transformers; chosen on 2026-11-27 against ten others for retrieval quality,
-// size and licence). The numbers are kept in `SkillPiece` by each piece's text, so only new or changed pieces are
-// worked out again. A request is ranked both ways, by BM25 over the pieces' words and by closeness of meaning, and the
-// two rankings are fused (reciprocal rank fusion, as hybrid search engines do). Until the model is ready, or when it
-// fails, word matching alone is used, so skills always work; nothing is ever withheld, only ordered and narrowed.
-export const SEARCH_MODEL = 'Snowflake/snowflake-arctic-embed-s';
-const SEARCH_QUERY_PREFIX = 'Represent this sentence for searching relevant passages: ';
-const PIECE_CHARS = 1800;
-// Pieces worked out at once: few, so the memory a batch takes stays small on a small server.
-const SEARCH_BATCH = 2;
-const FUSION_K = 60;
-// A skill matches a request when its closeness of meaning stands `lift` above the library's middle for that request
-// (raw closeness does not separate: small talk reaches 0.61 and right answers start at 0.59); below `floor` a piece is
-// not ranked by meaning at all. Set from D:\projects\model-trial\skill-search-eval.mjs on the real model: small talk
-// stands at most 0.08 above the middle, 28 of 32 right answers 0.09 or more.
-// With fewer than `known` skills' numbers worked out (while the library is still being indexed) there is no middle to
-// judge by, and words alone say what matches.
-export const SEARCH_RULES = { lift: 0.09, floor: 0.3, words: 6, limit: 5, known: 20 };
-let searchOn = process.env.NODE_ENV !== 'test';
-let embedder = null;
-let embedderLoading = null;
-let embedderFailed = false;
-let keepVectors = true;
-// For the suite: turn search on or off, give it a stand-in embedding model (texts, { query }) => number[][], and say
-// whether its numbers are kept in the database (`keep`).
-export const setSkillSearch = ({ on, embed, keep } = {}) => {
-    if (on !== undefined) searchOn = on;
-    if (keep !== undefined) keepVectors = keep;
-    if (embed !== undefined) {
-        embedder = embed;
-        embedderFailed = false;
-        piecesBySkill.clear();
-        vectors.clear();
-        indexState = { ready: false, pieces: 0, done: 0, at: null };
-    }
-};
-export const skillSearchOn = () => searchOn;
-
-const loadEmbedder = async () => {
-    if (embedder || embedderFailed) return embedder;
-    if (!embedderLoading) {
-        embedderLoading = (async () => {
-            const { pipeline } = await import('@huggingface/transformers');
-            // The runtime's memory pool is off: it grows to the largest batch seen and is never given back, which took
-            // a server from 360 MB to 1.3 GB while indexing the library.
-            const extract = await pipeline('feature-extraction', SEARCH_MODEL, { dtype: 'q8', session_options: { enableCpuMemArena: false, enableMemPattern: false, intraOpNumThreads: 1, interOpNumThreads: 1 } });
-            embedder = async (texts, { query = false } = {}) => {
-                const output = await extract(texts.map((text) => (query ? `${SEARCH_QUERY_PREFIX}${text}` : text)), { pooling: 'cls', normalize: true });
-                return output.tolist();
-            };
-            logger.info('[Search] The embedding model is ready', { model: SEARCH_MODEL });
-            return embedder;
-        })().catch((error) => {
-            embedderFailed = true;
-            logger.warn('[Search] The embedding model could not be loaded; word matching is used alone', { reason: error.message });
-            return null;
-        });
-    }
-    return embedderLoading;
-};
-
-// Words as both sides of BM25 read them: lower case, letters and digits, without the commonest words.
-const SEARCH_STOP = new Set([...FILLER_WORDS, 'are', 'was', 'were', 'has', 'have', 'had', 'its', 'not', 'but', 'from', 'into', 'than', 'then', 'them', 'they', 'what', 'when', 'which', 'will', 'would', 'should', 'could', 'there', 'their', 'each', 'any', 'all', 'one', 'out', 'use', 'using', 'used', 'more', 'most', 'some', 'such', 'only', 'also', 'very', 'just', 'like', 'please', 'thanks', 'thank']);
-const searchWords = (text) => (String(text || '').toLowerCase().match(/[a-z0-9][a-z0-9+#.-]*[a-z0-9+#]|[a-z0-9]{2,}/g) || []).filter((word) => word.length >= 2 && !SEARCH_STOP.has(word));
-const hashOf = (text) => crypto.createHash('sha1').update(`${SEARCH_MODEL}\n${text}`).digest('hex');
-
-// A skill's pieces, worked out once per version of its text.
-const piecesBySkill = new Map();
-const piecesOf = (skill) => {
-    const version = hashOf(`${skill.id}\n${skill.name}\n${skill.description}\n${skill.text}`);
-    const held = piecesBySkill.get(skill.id);
-    if (held?.version === version) return held.pieces;
-    const { start, parts } = skillParts(skill.text);
-    const label = (title) => `${skill.name}${title ? ` — ${title}` : ''}`;
-    const raw = [
-        { part: null, title: null, text: `${skill.name}\n${skill.description || ''}` },
-        ...(start ? [{ part: null, title: null, text: `${label(null)}\n${start}` }] : []),
-        ...parts.map((part, at) => ({ part: at + 1, title: part.title, text: `${label(part.title)}\n${part.text}` }))
-    ];
-    const pieces = raw.map((piece) => {
-        const text = piece.text.slice(0, PIECE_CHARS);
-        const words = searchWords(text);
-        const counts = new Map();
-        for (const word of words) counts.set(word, (counts.get(word) || 0) + 1);
-        return { ...piece, skill, text, hash: hashOf(text), counts, length: words.length };
-    });
-    piecesBySkill.set(skill.id, { version, pieces });
-    return pieces;
-};
-
-// The numbers of every piece of the skill library, loaded from the database and worked out where missing, in the
-// background, a batch at a time, so the server keeps answering meanwhile.
-const vectors = new Map();
-let indexState = { ready: false, pieces: 0, done: 0, at: null };
-export const skillSearchState = () => ({ on: searchOn, model: SEARCH_MODEL, embedder: embedder ? 'ready' : embedderFailed ? 'failed' : 'loading', ...indexState });
-// A piece's numbers as they are kept: packed 32-bit floats, read back from a Buffer or the driver's Binary.
-const packVector = (numbers) => Buffer.from(Float32Array.from(numbers).buffer);
-const unpackVector = (kept) => {
-    const bytes = kept?.buffer instanceof Uint8Array ? kept.buffer : kept;
-    if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0 || bytes.byteLength % 4 !== 0) return null;
-    return new Float32Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength));
-};
-const embedPieces = async (pieces) => {
-    const missing = pieces.filter((piece) => !vectors.has(piece.hash));
-    if (missing.length === 0) return;
-    // Kept numbers are read from the database when it is connected (an offline check works without it).
-    const stored = keepVectors && mongoose.connection.readyState === 1;
-    const kept = stored ? await SkillPiece.find({ service: SERVICE, model: SEARCH_MODEL, hash: { $in: missing.map((piece) => piece.hash) } }).lean() : [];
-    for (const row of kept) {
-        const vector = unpackVector(row.vector);
-        if (vector) vectors.set(row.hash, vector);
-    }
-    const left = missing.filter((piece) => !vectors.has(piece.hash));
-    const embed = await loadEmbedder();
-    if (!embed) return;
-    let unsaved = [];
-    const save = async () => {
-        const rows = unsaved;
-        unsaved = [];
-        if (stored && rows.length > 0) await SkillPiece.bulkWrite(rows.map(({ hash, vector }) => ({ updateOne: { filter: { service: SERVICE, model: SEARCH_MODEL, hash }, update: { $set: { vector }, $setOnInsert: { service: SERVICE, model: SEARCH_MODEL, hash } }, upsert: true } })), { ordered: false }).catch(() => {});
-    };
-    for (let at = 0; at < left.length; at += SEARCH_BATCH) {
-        const batch = left.slice(at, at + SEARCH_BATCH);
-        const made = await embed(batch.map((piece) => piece.text));
-        batch.forEach((piece, index) => {
-            vectors.set(piece.hash, Float32Array.from(made[index]));
-            unsaved.push({ hash: piece.hash, vector: packVector(made[index]) });
-        });
-        if (unsaved.length >= 256) await save();
-        indexState.done = Math.min(indexState.pieces, indexState.done + batch.length);
-        await new Promise((resolve) => setImmediate(resolve));
-    }
-    await save();
-};
-export const indexSkills = async (skills = SKILLS) => {
-    const pieces = skills.flatMap(piecesOf);
-    indexState = { ready: false, pieces: pieces.length, done: pieces.filter((piece) => vectors.has(piece.hash)).length, at: null };
-    try {
-        await embedPieces(pieces);
-        indexState = { ...indexState, ready: Boolean(embedder), done: pieces.filter((piece) => vectors.has(piece.hash)).length, at: new Date() };
-        if (embedder) logger.info('[Search] The skill library is indexed', { pieces: pieces.length });
-    } catch (error) {
-        logger.warn('[Search] The skill library could not be indexed; word matching is used alone', { reason: error.message });
-    }
-    return indexState;
-};
-
-// How often each word appears across the pieces searched, for BM25's weighting of rare words above common ones.
-const bm25Of = (pieces, words) => {
-    const average = pieces.reduce((sum, piece) => sum + piece.length, 0) / Math.max(1, pieces.length);
-    const seen = new Map(words.map((word) => [word, pieces.reduce((sum, piece) => sum + (piece.counts.has(word) ? 1 : 0), 0)]));
-    return (piece) => words.reduce((sum, word) => {
-        const count = piece.counts.get(word) || 0;
-        if (!count) return sum;
-        const rare = Math.log(1 + (pieces.length - seen.get(word) + 0.5) / (seen.get(word) + 0.5));
-        return sum + rare * ((count * 2.2) / (count + 1.2 * (0.25 + 0.75 * (piece.length / Math.max(1, average)))));
-    }, 0);
-};
-
-// The skills that match a request, best first: each with how it matched, whether it is a real match, and the parts of
-// it that match (for a long skill). Word matching alone until the embedding model is ready.
-export const searchSkills = async (skills, request, { limit = SEARCH_RULES.limit } = {}) => {
-    const text = String(request || '').trim();
-    if (!text || skills.length === 0) return [];
-    const pieces = skills.flatMap(piecesOf);
-    const words = [...new Set(searchWords(text))];
-    const scoreWords = bm25Of(pieces, words);
-    const byWords = pieces.map((piece) => ({ piece, score: scoreWords(piece) })).filter((hit) => hit.score > 0).sort((a, b) => b.score - a.score);
-    let byMeaning = [];
-    let middle = null;
-    const embed = await loadEmbedder().catch(() => null);
-    if (embed) {
-        // A person's own skill not yet indexed is worked out now, when it is small enough to wait for.
-        const unseen = pieces.filter((piece) => !vectors.has(piece.hash));
-        if (unseen.length > 0 && unseen.length <= 48) await embedPieces(unseen).catch(() => {});
-        try {
-            const [asked] = await embed([text.slice(0, PIECE_CHARS)], { query: true });
-            const closeness = (piece) => {
-                const vector = vectors.get(piece.hash);
-                let dot = 0;
-                for (let at = 0; at < vector.length; at += 1) dot += vector[at] * asked[at];
-                return dot;
-            };
-            const scored = pieces.filter((piece) => vectors.has(piece.hash)).map((piece) => ({ piece, score: closeness(piece) }));
-            // The middle of the library for this request: each skill's closest piece, the library's and the searched ones'.
-            const best = new Map();
-            const keep = (piece, score) => best.set(piece.skill.id, Math.max(best.get(piece.skill.id) ?? -1, score));
-            for (const hit of scored) keep(hit.piece, hit.score);
-            for (const skill of SKILLS) if (skill.source !== 'mollama' && !best.has(skill.id)) for (const piece of piecesOf(skill)) if (vectors.has(piece.hash)) keep(piece, closeness(piece));
-            const sorted = [...best.values()].sort((a, b) => a - b);
-            middle = sorted.length >= SEARCH_RULES.known ? sorted[Math.floor(sorted.length / 2)] : null;
-            byMeaning = scored.filter((hit) => hit.score >= SEARCH_RULES.floor).sort((a, b) => b.score - a.score);
-        } catch (error) {
-            logger.warn('[Search] A request could not be embedded; word matching is used alone', { reason: error.message });
-        }
-    }
-    const fused = new Map();
-    const add = (list, kind) => list.forEach((hit, rank) => {
-        const entry = fused.get(hit.piece.hash) || { piece: hit.piece, fused: 0, words: 0, meaning: 0 };
-        entry.fused += 1 / (FUSION_K + rank + 1);
-        entry[kind] = Math.max(entry[kind], hit.score);
-        fused.set(hit.piece.hash, entry);
-    });
-    add(byWords, 'words');
-    add(byMeaning, 'meaning');
-    const bySkill = new Map();
-    for (const entry of fused.values()) {
-        const held = bySkill.get(entry.piece.skill.id) || { skill: entry.piece.skill, score: 0, words: 0, meaning: 0, parts: [] };
-        held.score = Math.max(held.score, entry.fused);
-        held.words = Math.max(held.words, entry.words);
-        held.meaning = Math.max(held.meaning, entry.meaning);
-        if (entry.piece.part && ((middle !== null && entry.meaning > 0 && entry.meaning - middle >= SEARCH_RULES.lift) || entry.words >= SEARCH_RULES.words)) held.parts.push({ part: entry.piece.part, title: entry.piece.title, score: entry.fused });
-        bySkill.set(entry.piece.skill.id, held);
-    }
-    // A real match: standing out from the library in meaning, or, while meaning is not known, a strong match by words.
-    const meaningKnown = middle !== null && byMeaning.length > 0;
-    return [...bySkill.values()]
-        .map((hit) => ({ ...hit, lift: middle !== null && hit.meaning > 0 ? hit.meaning - middle : 0, parts: hit.parts.sort((a, b) => b.score - a.score).slice(0, 4) }))
-        .map((hit) => ({ ...hit, matches: (meaningKnown ? hit.meaning > 0 && hit.lift >= SEARCH_RULES.lift : hit.words >= SEARCH_RULES.words) || hit.words >= SEARCH_RULES.words * 2 }))
-        .sort((a, b) => b.score - a.score)
-        .slice(0, limit);
-};
-
-// The request a reply answers: the newest message from the person.
-const requestOf = (chat) => [...(chat.messages || [])].reverse().find((message) => message.role === 'user')?.content || '';
-// The skills turned on in a chat that match its newest request, worked out once per reply and read wherever the prompt
-// and the functions are built. Absent when search is off or nothing could be searched.
-const chatMatches = new WeakMap();
-const matchChat = async (chat) => {
-    chatMatches.delete(chat);
-    if (!searchOn) return null;
-    const on = skillsOf(chat).filter((skill) => skill.source !== 'mollama');
-    if (on.length === 0) return null;
-    try {
-        const found = await searchSkills(on, requestOf(chat), { limit: on.length });
-        const matched = { at: new Date(), skills: new Map(found.filter((hit) => hit.matches).map((hit) => [hit.skill.id, hit])) };
-        chatMatches.set(chat, matched);
-        return matched;
-    } catch (error) {
-        logger.warn('[Search] The chat\'s skills could not be matched', { reason: error.message });
-        return null;
-    }
-};
-
 const findSkillTool = (others) => ({
     fn: 'find_skill',
     label: LIBRARY_STEP,
@@ -6398,8 +6137,7 @@ const findSkillTool = (others) => ({
         }
     },
     run: async (input) => {
-        const searched = searchOn ? (await searchSkills(others, input?.query, { limit: 5 })).filter((hit) => hit.matches).map((hit) => hit.skill) : [];
-        const found = searched.length > 0 ? searched : rankSkills(others, input?.query);
+        const found = rankSkills(others, input?.query);
         // What a skill cannot do, a tool the person connects may: the ones made by the app's own maker are named as well.
         const words = [...new Set(String(input?.query ?? '').toLowerCase().match(/[a-z0-9]{3,}/g) || [])].filter((word) => !FILLER_WORDS.has(word));
         const tools = TOOL_CATALOGUE.map((entry) => ({ entry, hits: words.filter((word) => wordIn(`${entry.name} ${entry.does}`, word)).length })).filter((one) => one.hits > 0 && one.hits * 2 >= words.length).sort((a, b) => b.hits - a.hits).slice(0, 2).map((one) => one.entry);
@@ -6778,12 +6516,9 @@ const memoryStart = (chat) => (chat.memory && chat.memoryThrough > 0 && chat.mem
 const notesText = (chat) => ((chat.notes || []).length > 0 ? `Notes saved in this chat with save_note:\n${chat.notes.map((note) => `- ${note.key}: ${note.text}`).join('\n')}` : '');
 const buildMessages = (chat, listing = false, seeing = false, capacity = Infinity) => {
     const out = [];
-    const sorted = sortSkills(chat, listing, capacity).full;
-    const matched = !listing ? chatMatches.get(chat) : null;
-    const active = matched ? sorted.filter((skill) => skill.source === 'mollama' || matched.skills.has(skill.id)) : sorted;
-    const resting = matched ? sorted.filter((skill) => !active.includes(skill)) : [];
+    const active = sortSkills(chat, listing, capacity).full;
     const through = memoryStart(chat);
-    const system = [...active.map((skill) => (skill.id === 'components' && !listing ? `${skill.text}\n\n${COMPONENT_VALUES_PAGE}` : skill.text)), resting.length > 0 && `Also turned on, but not needed for this request: ${resting.map((skill) => skill.name).join(', ')}.`, systemText(chat), chat.summary && `Summary of the earlier conversation:\n${chat.summary}`, through > 0 && `Memory of the earlier part of this conversation (those messages are not repeated below):\n${chat.memory}`, notesText(chat), todayLine(), closingOf(chat)].filter(Boolean).join('\n\n');
+    const system = [...active.map((skill) => (skill.id === 'components' && !listing ? `${skill.text}\n\n${COMPONENT_VALUES_PAGE}` : skill.text)), systemText(chat), chat.summary && `Summary of the earlier conversation:\n${chat.summary}`, through > 0 && `Memory of the earlier part of this conversation (those messages are not repeated below):\n${chat.memory}`, notesText(chat), todayLine(), closingOf(chat)].filter(Boolean).join('\n\n');
     if (system) out.push({ role: 'system', content: system });
     for (const message of chat.messages.slice(through)) {
         if (!message.content) continue;
@@ -7094,7 +6829,6 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
         if (!chat.model) chat.model = await chooseModel(ollama, userId);
         live.model = chat.model;
         facts = await modelFacts(ollama, chat.model);
-        await matchChat(chat);
         if (!facts.online) {
             const cost = await loadCost(ollama, chat.model, { sending: true, anyway: body.anyway === true }).catch(() => null);
             if (cost?.tight && !body.anyway) throw Object.assign(memoryRefusal(chat.model, cost), { loaded: await inTheWay(chat.model).catch(() => []), fitsEmpty: cost.fitsEmpty });
@@ -7205,7 +6939,7 @@ const runTurn = async ({ chat, body, userId, res, live }) => {
         // A skill that is only on by default offers its files once the model has opened it.
         const withFiles = facts.capabilities.includes('tools') ? skillsOf(chat).filter((skill) => (skill.files || []).length > 0 && (Array.isArray(chat.skills) || skill.default !== 'tools' || !listed.includes(skill))) : [];
         const light = facts.capabilities.includes('tools') && capacityFor(chat, facts) < LIGHT_ROOM;
-        const chatTools = facts.capabilities.includes('tools') ? [...(draws ? [openComponentTool()] : []), ...(withFiles.length > 0 ? [skillFileTool(withFiles)] : []), ...skillFunctionsFor(chat), ...(listed.length > 0 ? [openSkillTool(listed, others, capacityFor(chat, facts), light, chatMatches.get(chat))] : []), ...(others.length > 0 ? [findSkillTool(others)] : []), askUserTool(), noteTool(chat), compressTool(), ...(process.env.FILESYSTEM_ONE_URL ? [listFilesTool(), readFileTool(), saveToFilesTool()] : []), ...(await toolsForChat(chat, userId)).filter((tool) => !(searching && tool.fn === 'read_web_page'))] : [];
+        const chatTools = facts.capabilities.includes('tools') ? [...(draws ? [openComponentTool()] : []), ...(withFiles.length > 0 ? [skillFileTool(withFiles)] : []), ...skillFunctionsFor(chat), ...(listed.length > 0 ? [openSkillTool(listed, others, capacityFor(chat, facts), light)] : []), ...(others.length > 0 ? [findSkillTool(others)] : []), askUserTool(), noteTool(chat), compressTool(), ...(process.env.FILESYSTEM_ONE_URL ? [listFilesTool(), readFileTool(), saveToFilesTool()] : []), ...(await toolsForChat(chat, userId)).filter((tool) => !(searching && tool.fn === 'read_web_page'))] : [];
         const capacity = capacityFor(chat, facts);
         // What is offered now: everything, or with little room only what belongs to the skills opened so far. A
         // function that is not offered yet still runs if it is called.

@@ -460,20 +460,6 @@ skillSchema.index({ service: 1, owner: 1, address: 1 }, { unique: true });
 
 export const Skill = mongoose.models.Skill || mongoose.model('Skill', skillSchema);
 
-// Search before sending: the numbers (embedding) worked out for one piece of a skill, kept by the piece's text and the
-// model that made them, so only new or changed pieces are worked out again after a restart. Mollama's own collection.
-// The numbers are packed as 32-bit floats (4 bytes each, about 1.5 KB a piece) rather than a list of numbers (about 13
-// bytes each in the database), so the whole library takes about 4.5 MB.
-const skillPieceSchema = new mongoose.Schema({
-    service: { type: String, default: SERVICE, immutable: true },
-    model: { type: String, required: true },
-    hash: { type: String, required: true },
-    vector: { type: Buffer, required: true }
-});
-skillPieceSchema.index({ service: 1, model: 1, hash: 1 }, { unique: true });
-
-export const SkillPiece = mongoose.models.SkillPiece || mongoose.model('SkillPiece', skillPieceSchema);
-
 export const skillSchemas = {
     skillId: Joi.object({ id: Joi.string().pattern(/^[a-z0-9-]{1,60}$/).required() }),
     file: Joi.object({ path: Joi.string().trim().max(200).pattern(/^[\w./ -]+$/).required() }),

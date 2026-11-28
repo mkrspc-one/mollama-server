@@ -283,9 +283,6 @@ class Server {
             const {downloads, recoverReplies} = await import('./controllers/ai.controller.js');
             await downloads.recover();
             if (process.env.NODE_ENV !== 'test') setInterval(() => recoverReplies().catch(() => {}), 60000).unref();
-            // Search before sending: the skill library is indexed in the background once the server is up.
-            const {indexSkills} = await import('./controllers/ai.controller.js');
-            if (process.env.NODE_ENV !== 'test') setTimeout(() => indexSkills().catch(() => {}), 15000).unref();
             const {watchRentals} = await import('./controllers/ai.controller.js');
             if (process.env.NODE_ENV !== 'test') setInterval(() => watchRentals().catch((error) => logger.error('[Rental] The watch failed:', error)), 60000).unref();
 
